@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const configuredDatabasePath = process.env.PAPER_DB_PATH?.trim();
 const configuredHealthAge = Number(process.env.PAPER_HEALTH_MAX_AGE_MS);
@@ -25,6 +25,16 @@ export const HEALTH_CONFIG = Object.freeze({
   maxAgeMs: Number.isFinite(configuredHealthAge) && configuredHealthAge >= 5 * 60 * 1000
     ? configuredHealthAge
     : 15 * 60 * 1000
+});
+
+export const TELEGRAM_CONFIG = Object.freeze({
+  botToken: process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "",
+  chatId: process.env.TELEGRAM_CHAT_ID?.trim() ?? "",
+  apiBaseUrl: "https://api.telegram.org",
+  timeoutMs: 10_000,
+  dailySummaryHour: 23,
+  dailySummaryMinute: 55,
+  stateDirectory: join(dirname(PAPER_CONFIG.databasePath), "notification-state")
 });
 
 export const PAPER_ASSUMPTIONS = Object.freeze({

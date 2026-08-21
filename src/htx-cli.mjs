@@ -46,7 +46,9 @@ const SECRET_NAMES = [
   "HUOBI_API_KEY",
   "HUOBI_SECRET_KEY",
   "ACCESS_KEY",
-  "SECRET_KEY"
+  "SECRET_KEY",
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_CHAT_ID"
 ];
 
 export function scrubEnvironment(source = process.env) {

@@ -35,7 +35,9 @@ test("removes exchange credentials from the child environment", () => {
     HTX_API_KEY: "secret",
     HTX_SECRET_KEY: "secret",
     HUOBI_API_KEY: "secret",
-    HUOBI_SECRET_KEY: "secret"
+    HUOBI_SECRET_KEY: "secret",
+    TELEGRAM_BOT_TOKEN: "never-forward-to-htx",
+    TELEGRAM_CHAT_ID: "123"
   });
   assert.deepEqual(clean, { PATH: "safe" });
 });

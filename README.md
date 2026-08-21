@@ -14,6 +14,7 @@
 - 开仓和平仓各模拟 `0.05%` taker 手续费；Funding 按公开费率模拟结算。
 - 同一可观察 K 线同时触及 SL/TP 时按 SL；开仓 K 线不用于高低点触发。
 - 输出总交易次数、胜率、Profit Factor、Expectancy、最大回撤及累计收益。
+- Telegram 通知模拟开多/开空、TP/SL、风控暂停、健康失败/恢复和每日绩效；`WAIT` 不通知。
 
 ## 本机命令
 
@@ -24,11 +25,44 @@ npm run monitor
 npm run status
 npm run health
 npm run report
+npm run telegram:test
 npm test
 npm run check:safety
 ```
 
 `npm run health` 只读本地 SQLite，不请求 HTX。最近 monitor 不是 `OK`、15 分钟内没有成功更新、SQLite 不可用或尚无快照时，它会返回非零退出码。
+
+## Telegram 通知
+
+项目使用 Telegram 官方 Bot API 的 HTTPS `sendMessage`。只有以下两个环境变量都存在时才启用：
+
+```text
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+```
+
+Bot Token 只能从环境变量读取，不允许写入源码、README、Git 或命令参数。请在 Telegram 的 `@BotFather` 创建 Bot，先从目标私聊向 Bot 发送 `/start`，再取得对应 Chat ID。Telegram 官方说明 Bot 不能主动开始与用户的对话，Token 应按密码保管：[Bot 教程](https://core.telegram.org/bots/tutorial)、[Bot API](https://core.telegram.org/bots/api)。
+
+Windows 当前终端测试：
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "从 BotFather 取得的 Token"
+$env:TELEGRAM_CHAT_ID = "目标 Chat ID"
+npm run telegram:test
+```
+
+关闭该 PowerShell 窗口后临时环境变量即消失。不要把真实值写进 `.env.example`。
+
+通知规则：
+
+- 模拟开多、开空、止盈和止损：每个实际 Paper Trading 事件通知一次。
+- 风控暂停：同一上海自然日只通知一次。
+- health 失败：状态首次变为不健康时通知；恢复后通知一次。
+- 每日绩效：上海时间 `23:55` 后的首个 monitor 周期发送一次。
+- `WAIT` 本身、普通行情快照和 Funding 结算不通知，避免刷屏。
+- 发送超时、HTTP 错误或 Telegram API 拒绝会写入应用日志，不会回滚模拟成交或让 monitor 崩溃。
+
+通知去重状态保存在 SQLite 同目录的 `notification-state/`，VPS 默认位于 `/var/lib/btc-htx-paper/notification-state/`。
 
 ## Ubuntu VPS 生产部署
 
@@ -117,14 +151,16 @@ sudo systemd-analyze verify \
 sudo logrotate --debug /etc/logrotate.d/btc-htx-paper
 ```
 
-生产环境文件只包含：
+生产环境文件包含部署路径和 Telegram 配置：
 
 ```text
 PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite
 PAPER_HEALTH_MAX_AGE_MS=900000
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-不要向该文件加入 HTX/Huobi API Key、Secret 或任何交易凭据。
+用 `sudoedit /etc/btc-htx-paper.env` 填写 Telegram 两项真实值。该文件权限为 `0640 root:btc-htx`，不会进入 Git。不要加入 HTX/Huobi API Key、Secret 或任何交易凭据。
 
 ### 6. 启动并设置开机自启
 
@@ -164,6 +200,14 @@ sudo systemctl start btc-htx-paper-health.service
 sudo systemctl status btc-htx-paper-health.service --no-pager
 ```
 
+从 `/etc/btc-htx-paper.env` 安全加载 Telegram 配置并发送测试消息，Token 不会出现在命令行参数中：
+
+```bash
+cd /opt/btc-htx-paper
+sudo -u btc-htx /bin/bash -c \
+  'set -a; . /etc/btc-htx-paper.env; set +a; exec /usr/bin/node src/telegram-test.mjs'
+```
+
 health 成功时退出码为 0；不健康时为非零。`systemctl status` 查看进程状态，应用日志位于 `/var/log/btc-htx-paper/monitor.log`，systemd 生命周期日志可用下面命令查看：
 
 ```bash
@@ -173,6 +217,7 @@ sudo journalctl -u btc-htx-paper.service -u btc-htx-paper-health.service --since
 ### 8. 持久化与日志轮转
 
 - SQLite 固定存放在 `/var/lib/btc-htx-paper/paper-trading.sqlite`，不在 Git 目录内，更新代码不会覆盖历史记录。
+- Telegram 去重状态位于 `/var/lib/btc-htx-paper/notification-state/`，同样随 systemd StateDirectory 持久化。
 - systemd 的 `StateDirectory` 自动创建并授权 `/var/lib/btc-htx-paper`。
 - 日志位于 `/var/log/btc-htx-paper/monitor.log`。
 - logrotate 每日检查，文件达到 10MB 也会提前轮转，保留 14 份并压缩。
@@ -238,16 +283,41 @@ sudo systemctl status btc-htx-paper.service --no-pager
 - 直接运行 `/usr/bin/node src/monitor.mjs`：信号直接送达 Node，不经过 npm 包装进程。
 - `ProtectSystem=strict`、`NoNewPrivileges`、独立非登录用户等限制缩小进程权限。
 - 仅 `/var/lib/btc-htx-paper` 和 `/var/log/btc-htx-paper` 可写；项目代码在生产服务中只读。
-- 健康检查仅允许本地 Unix/SQLite 访问，不连接 HTX。
+- 健康检查只读取本地 SQLite；仅在健康状态变化时通过 HTTPS 连接 Telegram，不连接 HTX。
 
 ## 不可弱化的安全边界
 
 - 只允许 `futures-market`、`funding-rate`、`oi-tracker`、`elite-positioning`、`liquidation-stream`、`mark-price` 六类公开命令。
 - 命令、子命令、参数和值使用白名单，交易对只允许 `BTC-USDT`。
-- 子进程环境主动移除 HTX/Huobi 凭据变量。
+- HTX CLI 子进程环境主动移除 HTX/Huobi 凭据以及 Telegram Token/Chat ID。
 - V0/V1 的高周期 RSI、衍生品挤压与拥挤度 Risk Gate 保持不变。
 - 本地开仓和平仓只修改 SQLite；程序没有交易所写入模块。
+- Telegram Token 只从进程环境读取；安全检查会拒绝疑似 Bot Token 被提交到源码或部署文件。
 - 每次 systemd 启动前自动执行源码安全检查，检查失败时监控不会启动。
+
+## 已部署 VPS 的最少更新步骤
+
+```bash
+sudo systemctl stop btc-htx-paper.service
+sudo git -C /opt/btc-htx-paper pull --ff-only
+
+cd /opt/btc-htx-paper
+sudo install -m 0644 deploy/systemd/btc-htx-paper.service \
+  /etc/systemd/system/btc-htx-paper.service
+sudo install -m 0644 deploy/systemd/btc-htx-paper-health.service \
+  /etc/systemd/system/btc-htx-paper-health.service
+
+sudoedit /etc/btc-htx-paper.env
+sudo systemctl daemon-reload
+
+sudo -u btc-htx /bin/bash -c \
+  'set -a; . /etc/btc-htx-paper.env; set +a; cd /opt/btc-htx-paper; exec /usr/bin/node src/telegram-test.mjs'
+
+sudo systemctl restart btc-htx-paper.service
+sudo systemctl restart btc-htx-paper-health.timer
+```
+
+在 `sudoedit` 中只需补上 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID`，其他 Paper Trading 参数保持原值。
 
 ## 数据限制
 

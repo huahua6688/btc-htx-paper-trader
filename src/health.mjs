@@ -2,39 +2,44 @@ import { existsSync } from "node:fs";
 import { PAPER_CONFIG } from "./config.mjs";
 import { openPaperDatabase } from "./db.mjs";
 import { evaluateHealth, formatHealth } from "./health-check.mjs";
+import { TelegramNotifier } from "./telegram-notifier.mjs";
 
 const json = process.argv.includes("--json");
 
-if (!existsSync(PAPER_CONFIG.databasePath)) {
-  const result = {
-    healthy: false,
-    checkedAt: new Date().toISOString(),
-    failures: [`SQLite 文件不存在：${PAPER_CONFIG.databasePath}`],
-    monitor: null,
-    snapshot: null,
-    account: null
-  };
-  process.stdout.write(json ? `${JSON.stringify(result)}\n` : `${formatHealth(result)}\n`);
-  process.exitCode = 1;
-} else {
+async function main() {
+  let result;
   let db;
-  try {
-    db = openPaperDatabase(PAPER_CONFIG.databasePath, PAPER_CONFIG, { readOnly: true });
-    const result = evaluateHealth(db);
-    process.stdout.write(json ? `${JSON.stringify(result)}\n` : `${formatHealth(result)}\n`);
-    if (!result.healthy) process.exitCode = 1;
-  } catch (error) {
-    const result = {
+  if (!existsSync(PAPER_CONFIG.databasePath)) {
+    result = {
       healthy: false,
       checkedAt: new Date().toISOString(),
-      failures: [`SQLite health 检查失败：${error.message}`],
+      failures: [`SQLite 文件不存在：${PAPER_CONFIG.databasePath}`],
       monitor: null,
       snapshot: null,
       account: null
     };
-    process.stdout.write(json ? `${JSON.stringify(result)}\n` : `${formatHealth(result)}\n`);
-    process.exitCode = 1;
-  } finally {
-    db?.close();
+  } else {
+    try {
+      db = openPaperDatabase(PAPER_CONFIG.databasePath, PAPER_CONFIG, { readOnly: true });
+      result = evaluateHealth(db);
+    } catch (error) {
+      result = {
+        healthy: false,
+        checkedAt: new Date().toISOString(),
+        failures: [`SQLite health 检查失败：${error.message}`],
+        monitor: null,
+        snapshot: null,
+        account: null
+      };
+    } finally {
+      db?.close();
+    }
   }
+
+  process.stdout.write(json ? `${JSON.stringify(result)}\n` : `${formatHealth(result)}\n`);
+  const telegram = new TelegramNotifier();
+  await telegram.notifyHealthResult(result);
+  if (!result.healthy) process.exitCode = 1;
 }
+
+await main();

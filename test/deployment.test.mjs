@@ -26,6 +26,7 @@ test("health timer and logrotate are bounded and enabled", () => {
   assert.match(timer, /Persistent=true/);
   assert.match(timer, /WantedBy=timers\.target/);
   assert.match(health, /src\/health\.mjs/);
+  assert.match(health, /RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6/);
   assert.match(logrotate, /daily/);
   assert.match(logrotate, /maxsize 10M/);
   assert.match(logrotate, /rotate 14/);
@@ -37,6 +38,8 @@ test("production environment points SQLite at persistent systemd state", () => {
   const environment = read("deploy/systemd/btc-htx-paper.env.example");
   assert.match(environment, /PAPER_DB_PATH=\/var\/lib\/btc-htx-paper\/paper-trading\.sqlite/);
   assert.match(environment, /PAPER_HEALTH_MAX_AGE_MS=900000/);
+  assert.match(environment, /^TELEGRAM_BOT_TOKEN=$/m);
+  assert.match(environment, /^TELEGRAM_CHAT_ID=$/m);
   assert.doesNotMatch(environment, /HTX_API_KEY|HTX_SECRET_KEY|HUOBI_API_KEY|HUOBI_SECRET_KEY/);
 });
 

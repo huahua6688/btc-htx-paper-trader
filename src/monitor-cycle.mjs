@@ -33,7 +33,7 @@ export async function runMonitorCycle(db, {
         position = db.openPosition(gate.candidate, snapshotId);
         actions.push({ type: "OPEN", position });
       } else {
-        actions.push({ type: "NO_ENTRY", reasons: gate.reasons });
+        actions.push({ type: "NO_ENTRY", reasons: gate.reasons, dailyRisk: gate.dailyRisk });
       }
     }
 

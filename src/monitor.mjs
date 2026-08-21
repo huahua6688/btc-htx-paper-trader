@@ -2,9 +2,11 @@ import { openPaperDatabase } from "./db.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
 import { formatCycle } from "./paper-format.mjs";
 import { runMonitorCycle } from "./monitor-cycle.mjs";
+import { TelegramNotifier } from "./telegram-notifier.mjs";
 
 const once = process.argv.includes("--once");
 const db = openPaperDatabase();
+const telegram = new TelegramNotifier();
 let stopped = false;
 let running = false;
 let timer = null;
@@ -14,6 +16,7 @@ async function cycle() {
   try {
     const result = await runMonitorCycle(db);
     process.stdout.write(`${formatCycle(result)}\n`);
+    await telegram.notifyMonitorResult(result, db);
   } catch (error) {
     process.stderr.write(`V1 monitor failed safely: ${error.message}\n`);
     if (once) process.exitCode = 1;

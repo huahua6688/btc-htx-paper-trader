@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { HEALTH_CONFIG, PAPER_CONFIG } from "../src/config.mjs";
+import { HEALTH_CONFIG, PAPER_CONFIG, TELEGRAM_CONFIG } from "../src/config.mjs";
 import { resolveCliPath } from "../src/htx-cli.mjs";
 
 test("V1 risk and scheduling defaults match the paper trading specification", () => {
@@ -13,6 +13,9 @@ test("V1 risk and scheduling defaults match the paper trading specification", ()
   assert.equal(PAPER_CONFIG.maxConsecutiveLosses, 3);
   assert.equal(PAPER_CONFIG.minimumRiskReward, 2);
   assert.equal(HEALTH_CONFIG.maxAgeMs, 15 * 60 * 1000);
+  assert.equal(TELEGRAM_CONFIG.apiBaseUrl, "https://api.telegram.org");
+  assert.equal(TELEGRAM_CONFIG.dailySummaryHour, 23);
+  assert.equal(TELEGRAM_CONFIG.dailySummaryMinute, 55);
   assert.equal(Object.isFrozen(PAPER_CONFIG), true);
 });
 
@@ -22,6 +25,7 @@ test("npm exposes monitor, status, report, tests, and the safety check", () => {
   assert.equal(packageJson.scripts.status, "node src/status.mjs");
   assert.equal(packageJson.scripts.health, "node src/health.mjs");
   assert.equal(packageJson.scripts.report, "node src/report.mjs");
+  assert.equal(packageJson.scripts["telegram:test"], "node src/telegram-test.mjs");
   assert.ok(packageJson.scripts.test);
   assert.ok(packageJson.scripts["check:safety"]);
 });
