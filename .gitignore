@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+latest-analysis.json
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+vendor/htx-cli-linux-x64

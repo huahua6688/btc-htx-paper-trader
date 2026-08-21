@@ -1,0 +1,21 @@
+{
+  "name": "btc-htx-paper-v1",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTX BTC/USDT perpetual read-only analysis with local paper trading",
+  "type": "module",
+  "scripts": {
+    "analyze": "node src/analyze.mjs",
+    "analyze:json": "node src/analyze.mjs --json",
+    "monitor": "node src/monitor.mjs",
+    "status": "node src/status.mjs",
+    "health": "node src/health.mjs",
+    "report": "node src/report.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "check:safety": "node scripts/check-safety.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "UNLICENSED"
+}
