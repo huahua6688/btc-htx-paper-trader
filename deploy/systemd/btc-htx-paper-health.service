@@ -1,0 +1,27 @@
+[Unit]
+Description=Health check for HTX BTC/USDT V1 paper monitor
+After=btc-htx-paper.service
+
+[Service]
+Type=oneshot
+User=btc-htx
+Group=btc-htx
+WorkingDirectory=/opt/btc-htx-paper
+Environment=NODE_ENV=production
+Environment=TZ=Asia/Shanghai
+EnvironmentFile=/etc/btc-htx-paper.env
+StateDirectory=btc-htx-paper
+StateDirectoryMode=0750
+ExecStart=/usr/bin/node /opt/btc-htx-paper/src/health.mjs
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/btc-htx-paper

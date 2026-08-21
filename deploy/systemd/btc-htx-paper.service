@@ -1,0 +1,54 @@
+[Unit]
+Description=HTX BTC/USDT V1 read-only paper trading monitor
+Documentation=https://github.com/htx-exchange/htx-skills-hub
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=btc-htx
+Group=btc-htx
+WorkingDirectory=/opt/btc-htx-paper
+Environment=NODE_ENV=production
+Environment=TZ=Asia/Shanghai
+EnvironmentFile=/etc/btc-htx-paper.env
+
+StateDirectory=btc-htx-paper
+StateDirectoryMode=0750
+LogsDirectory=btc-htx-paper
+LogsDirectoryMode=0750
+
+ExecStartPre=/usr/bin/test -x /opt/btc-htx-paper/vendor/htx-cli-linux-x64
+ExecStartPre=/usr/bin/node /opt/btc-htx-paper/scripts/check-safety.mjs
+ExecStart=/usr/bin/node /opt/btc-htx-paper/src/monitor.mjs
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=150s
+KillSignal=SIGTERM
+
+StandardOutput=append:/var/log/btc-htx-paper/monitor.log
+StandardError=append:/var/log/btc-htx-paper/monitor.log
+SyslogIdentifier=btc-htx-paper
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/btc-htx-paper /var/log/btc-htx-paper
+
+[Install]
+WantedBy=multi-user.target

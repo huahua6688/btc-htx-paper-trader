@@ -1,0 +1,12 @@
+[Unit]
+Description=Run HTX BTC/USDT V1 paper health check every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=btc-htx-paper-health.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+/var/log/btc-htx-paper/monitor.log {
+    daily
+    maxsize 10M
+    rotate 14
+    compress
+    delaycompress
+    dateext
+    missingok
+    notifempty
+    copytruncate
+    su btc-htx btc-htx
+}
