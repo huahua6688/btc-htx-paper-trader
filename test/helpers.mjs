@@ -1,7 +1,27 @@
 export function paperReport(overrides = {}) {
   const generatedAt = overrides.generatedAt ?? "2026-08-21T01:00:00.000Z";
+  const completedBarTs = new Date(generatedAt).getTime() - 15 * 60 * 1000;
+  const setupProposal = {
+    side: "LONG",
+    type: "BREAKOUT_CONTINUATION",
+    createdAt: generatedAt,
+    expiresAt: new Date(new Date(generatedAt).getTime() + 6 * 60 * 60 * 1000).toISOString(),
+    basisBarTs: completedBarTs,
+    entryZone: [99, 101],
+    triggerPrice: 100,
+    invalidationPrice: 95,
+    stopLoss: 95,
+    takeProfit: [111, 114],
+    riskReward: [2.2, 2.8],
+    riskPct: 0.01,
+    riskTier: "NORMAL",
+    armImmediately: true,
+    triggeredNow: true,
+    reasons: ["测试突破计划"],
+    warnings: []
+  };
   return {
-    version: "V1",
+    version: "V1.1",
     mode: "READ_ONLY_PUBLIC_DATA_PAPER_ONLY",
     symbol: "BTC-USDT",
     generatedAt,
@@ -12,11 +32,19 @@ export function paperReport(overrides = {}) {
     finalScore: 45,
     currentPrice: 100,
     latest15mBar: {
-      timestamp: new Date(generatedAt).getTime() - 15 * 60 * 1000,
+      timestamp: completedBarTs,
       open: 99,
       high: 101,
       low: 98,
       close: 100
+    },
+    completed15mBar: {
+      timestamp: completedBarTs,
+      open: 99,
+      high: 101,
+      low: 98,
+      close: 100,
+      volumeRatio: 1.2
     },
     plan: {
       entryZone: [99, 101],
@@ -27,9 +55,33 @@ export function paperReport(overrides = {}) {
     },
     scores: { technical: 50, derivativesDirectional: 30, derivativesPressure: 20 },
     derivatives: { fundingRatePct: 0.01, oiUsd: 1_000_000, pressureScore: 20 },
+    strategy: {
+      version: "V1.1",
+      marketRegime: "TRENDING",
+      trendSide: "LONG",
+      bias: "LONG",
+      state: "TRIGGERED",
+      riskPct: 0.01,
+      riskTier: "NORMAL",
+      hardBlocks: [],
+      softWarnings: [],
+      setupProposal
+    },
     bullishReasons: ["4h 趋势偏多", "回踩后量能恢复"],
     bearishReasons: ["Funding 为正"],
-    ...overrides
+    ...overrides,
+    strategy: overrides.strategy ?? {
+      version: "V1.1",
+      marketRegime: "TRENDING",
+      trendSide: "LONG",
+      bias: "LONG",
+      state: "TRIGGERED",
+      riskPct: 0.01,
+      riskTier: "NORMAL",
+      hardBlocks: [],
+      softWarnings: [],
+      setupProposal
+    }
   };
 }
 

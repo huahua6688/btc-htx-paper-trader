@@ -8,6 +8,12 @@ const parseJson = (value, fallback = null) => {
   if (value === null || value === undefined) return fallback;
   try { return JSON.parse(value); } catch { return fallback; }
 };
+const hydrateSetup = (row) => row ? {
+  ...row,
+  plan: parseJson(row.plan_json, {}),
+  reasons: parseJson(row.reasons_json, []),
+  warnings: parseJson(row.warnings_json, [])
+} : null;
 
 export class PaperDatabase {
   constructor(path = PAPER_CONFIG.databasePath, config = PAPER_CONFIG, { readOnly = false } = {}) {
@@ -77,6 +83,29 @@ export class PaperDatabase {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_position_idx ON positions(status) WHERE status = 'OPEN';
       CREATE INDEX IF NOT EXISTS positions_closed_at_idx ON positions(closed_at);
+
+      CREATE TABLE IF NOT EXISTS trade_setups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+        setup_type TEXT NOT NULL CHECK (setup_type IN ('TREND_PULLBACK', 'BREAKOUT_CONTINUATION')),
+        status TEXT NOT NULL CHECK (status IN ('WATCHING', 'ARMED', 'TRIGGERED', 'INVALIDATED', 'EXPIRED', 'BLOCKED', 'CANCELLED')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        armed_at TEXT,
+        armed_bar_ts INTEGER,
+        finished_at TEXT,
+        finish_reason TEXT,
+        risk_pct REAL NOT NULL,
+        plan_json TEXT NOT NULL,
+        reasons_json TEXT NOT NULL,
+        warnings_json TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS one_active_setup_idx
+        ON trade_setups((1)) WHERE status IN ('WATCHING', 'ARMED');
+      CREATE INDEX IF NOT EXISTS trade_setups_created_at_idx ON trade_setups(created_at);
 
       CREATE TABLE IF NOT EXISTS account_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +178,29 @@ export class PaperDatabase {
     return Number(result.lastInsertRowid);
   }
 
+  updateSnapshotReport(id, report) {
+    this.db.prepare(`
+      UPDATE snapshots SET
+        captured_at = ?, price = ?, decision = ?, candidate_decision = ?, confidence_pct = ?,
+        final_score = ?, funding_rate_pct = ?, oi_usd = ?, pressure_score = ?,
+        risk_gates_json = ?, report_json = ?
+      WHERE id = ?
+    `).run(
+      report.generatedAt,
+      report.currentPrice,
+      report.decision,
+      report.candidateDecision,
+      report.confidencePct,
+      report.finalScore,
+      report.derivatives?.fundingRatePct,
+      report.derivatives?.oiUsd,
+      report.derivatives?.pressureScore,
+      json(report.riskGates),
+      json(report),
+      id
+    );
+  }
+
   getLatestSnapshot() {
     const row = this.db.prepare("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").get();
     return row ? { ...row, riskGates: parseJson(row.risk_gates_json, []), report: parseJson(row.report_json) } : null;
@@ -156,6 +208,83 @@ export class PaperDatabase {
 
   countSnapshots() {
     return Number(this.db.prepare("SELECT COUNT(*) AS count FROM snapshots").get().count);
+  }
+
+  getSnapshots({ since = null } = {}) {
+    const rows = since
+      ? this.db.prepare("SELECT * FROM snapshots WHERE captured_at >= ? ORDER BY id").all(since)
+      : this.db.prepare("SELECT * FROM snapshots ORDER BY id").all();
+    return rows.map((row) => ({
+      ...row,
+      riskGates: parseJson(row.risk_gates_json, []),
+      report: parseJson(row.report_json, {})
+    }));
+  }
+
+  createSetup(proposal, snapshotId) {
+    return this.transaction(() => {
+      if (this.getActiveSetup()) throw new Error("Paper setup already active");
+      const status = proposal.armImmediately ? "ARMED" : "WATCHING";
+      const result = this.db.prepare(`
+        INSERT INTO trade_setups(
+          snapshot_id, symbol, side, setup_type, status, created_at, updated_at,
+          expires_at, armed_at, armed_bar_ts, risk_pct, plan_json, reasons_json, warnings_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshotId,
+        this.config.symbol,
+        proposal.side,
+        proposal.type,
+        status,
+        proposal.createdAt,
+        proposal.createdAt,
+        proposal.expiresAt,
+        proposal.armImmediately ? proposal.createdAt : null,
+        proposal.armImmediately ? proposal.basisBarTs : null,
+        proposal.riskPct,
+        json(proposal),
+        json(proposal.reasons),
+        json(proposal.warnings)
+      );
+      return this.getSetup(Number(result.lastInsertRowid));
+    });
+  }
+
+  getSetup(id) {
+    return hydrateSetup(this.db.prepare("SELECT * FROM trade_setups WHERE id = ?").get(id));
+  }
+
+  getActiveSetup() {
+    return hydrateSetup(this.db.prepare(`
+      SELECT * FROM trade_setups WHERE status IN ('WATCHING', 'ARMED') ORDER BY id DESC LIMIT 1
+    `).get());
+  }
+
+  armSetup(id, armedAt, armedBarTs) {
+    this.db.prepare(`
+      UPDATE trade_setups
+      SET status = 'ARMED', armed_at = ?, armed_bar_ts = ?, updated_at = ?
+      WHERE id = ? AND status = 'WATCHING'
+    `).run(armedAt, armedBarTs, armedAt, id);
+    return this.getSetup(id);
+  }
+
+  finishSetup(id, status, finishedAt, reason) {
+    const allowed = new Set(["TRIGGERED", "INVALIDATED", "EXPIRED", "BLOCKED", "CANCELLED"]);
+    if (!allowed.has(status)) throw new Error(`Invalid terminal setup status: ${status}`);
+    this.db.prepare(`
+      UPDATE trade_setups
+      SET status = ?, finished_at = ?, finish_reason = ?, updated_at = ?
+      WHERE id = ? AND status IN ('WATCHING', 'ARMED')
+    `).run(status, finishedAt, reason, finishedAt, id);
+    return this.getSetup(id);
+  }
+
+  getSetups({ since = null } = {}) {
+    const rows = since
+      ? this.db.prepare("SELECT * FROM trade_setups WHERE created_at >= ? ORDER BY id").all(since)
+      : this.db.prepare("SELECT * FROM trade_setups ORDER BY id").all();
+    return rows.map(hydrateSetup);
   }
 
   getOpenPosition() {

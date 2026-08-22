@@ -28,6 +28,20 @@ test("candidate sizing respects 1% risk and requires net RR of at least 2", () =
   assert.equal(rejected, null);
 });
 
+test("soft market warnings reduce position risk to 0.5% without weakening the 1% ceiling", () => {
+  const account = { cash_cny: 1_000 };
+  const reduced = buildPaperCandidate(paperReport({
+    strategy: { riskPct: 0.005, setupType: "TREND_PULLBACK" }
+  }), account);
+  assert.ok(reduced);
+  assert.equal(reduced.riskPct, 0.005);
+  assert.ok(reduced.riskCny <= 5);
+
+  const capped = buildPaperCandidate(paperReport({ strategy: { riskPct: 0.5 } }), account);
+  assert.equal(capped.riskPct, 0.01);
+  assert.ok(capped.riskCny <= 10);
+});
+
 test("WAIT, existing risk gates, and an existing position block entry", () => {
   const db = new PaperDatabase(":memory:");
   try {

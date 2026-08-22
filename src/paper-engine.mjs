@@ -61,7 +61,12 @@ export function buildPaperCandidate(report, account, config = PAPER_CONFIG) {
 
   const cashCny = Number(account.cash_cny);
   if (!(cashCny > 0)) return null;
-  const riskBudgetCny = cashCny * config.maxRiskPerTradePct;
+  const requestedRiskPct = finite(report.strategy?.riskPct)
+    ? Number(report.strategy.riskPct)
+    : config.maxRiskPerTradePct;
+  const riskPct = Math.min(config.maxRiskPerTradePct, Math.max(0, requestedRiskPct));
+  if (!(riskPct > 0)) return null;
+  const riskBudgetCny = cashCny * riskPct;
   const riskPerBtcCny = target.riskUsdt * config.usdtCnyRate;
   const quantityByRisk = riskBudgetCny / riskPerBtcCny;
   const quantityByCash = cashCny * config.maxNotionalMultiple / (entry * config.usdtCnyRate);
@@ -84,12 +89,14 @@ export function buildPaperCandidate(report, account, config = PAPER_CONFIG) {
     rr: round(target.rr, 3),
     quantityBtc: round(quantityBtc, 8),
     riskCny: round(riskCny, 4),
+    riskPct: round(riskPct, 6),
     riskBudgetCny: round(riskBudgetCny, 4),
     notionalCny: round(notionalCny, 4),
     entryFeeCny: round(entryFeeCny, 4),
     openingReasons: [
+      ...(report.strategy?.setupType ? [`V1.1 ${report.strategy.setupType} 待触发计划已确认`] : []),
       ...directionReasons.slice(0, 5),
-      `Risk Gate 通过：净 RR ${round(target.rr, 2)}，单笔风险 ${round(riskCny, 2)} CNY`
+      `Risk Gate 通过：净 RR ${round(target.rr, 2)}，风险档位 ${round(riskPct * 100, 2)}%，单笔风险 ${round(riskCny, 2)} CNY`
     ]
   };
 }

@@ -1,14 +1,18 @@
-# BTC/USDT 永续 V1 Paper Trading
+# BTC/USDT 永续 V1.1 Paper Trading
 
-基于 HTX 公开行情的 BTC/USDT 本地模拟交易系统。程序每 5 分钟分析一次，把行情快照、`LONG / SHORT / WAIT`、资金事件和模拟仓位保存到 SQLite。
+基于 HTX 公开行情的 BTC/USDT 本地模拟交易系统。程序每 5 分钟分析一次，把行情快照、待触发计划、`LONG / SHORT / WAIT`、资金事件和模拟仓位保存到 SQLite。
 
-本项目没有真实交易能力：不读取 API Key、不调用私有接口、不包含交易所写操作。Linux 部署只增加运行、持久化、日志和健康检查，不修改分析或 Risk Gate 逻辑。
+本项目没有真实交易能力：不读取 API Key、不调用私有接口、不包含交易所写操作。V1.1 以 `4h 方向 → 1h 结构 → 15m 确认` 取代 V1 的高周期单次打分入场；旧版快照只用于统计，不再控制新入场。
 
 ## 功能与风控
 
 - 公开数据：15m/1h/4h/1d K 线和成交量、Order Book、Funding、OI、精英多空比、最近清算样本、Mark Price、Premium、Basis。
 - 初始模拟资金 `1000 CNY`，固定按 `1 USDT = 7.20 CNY` 换算。
-- 单笔风险不超过 `1%`，上海自然日损失达到 `3%` 后暂停新交易。
+- 交易计划持久化为 `WATCHING / ARMED / TRIGGERED / INVALIDATED / EXPIRED / BLOCKED / CANCELLED`，重启不会忘记仍有效的观察条件。
+- 第一阶段启用趋势回踩和突破延续；4h 决定方向、1h 建立计划、已完成的 15m K 线负责确认。
+- 单笔风险不超过 `1%`；高周期 RSI 过热/超卖、一般衍生品拥挤或数据分项不足时降为 `0.5%`，不再由 RSI 单项一票否决。
+- 只有极端拥挤、同方向 squeeze 和足够的公开清算样本同时出现，市场 Risk Gate 才硬性禁止新仓。
+- 上海自然日损失达到 `3%` 后暂停新交易。
 - 当日连续亏损 3 笔后暂停，次日恢复评估。
 - 净 RR 小于 2 禁止交易；同一时间最多一个模拟仓位，名义敞口不超过现金 1 倍。
 - 开仓和平仓各模拟 `0.05%` taker 手续费；Funding 按公开费率模拟结算。
@@ -25,12 +29,33 @@ npm run monitor
 npm run status
 npm run health
 npm run report
+npm run gate:report
 npm run telegram:test
 npm test
 npm run check:safety
 ```
 
 `npm run health` 只读本地 SQLite，不请求 HTX。最近 monitor 不是 `OK`、15 分钟内没有成功更新、SQLite 不可用或尚无快照时，它会返回非零退出码。
+
+`npm run gate:report` 默认统计最近 24 小时的方向偏好、最终决策、硬拦截、0.5% 风险降级和待触发计划状态。指定时间范围：
+
+```powershell
+npm run gate:report -- --hours=168
+```
+
+## V1.1 决策流程
+
+```text
+公开行情健康
+  → 4h 判断 LONG / SHORT 方向
+  → 1h 生成趋势回踩或突破延续计划
+  → SQLite 保存计划及触发价、失效价、有效期
+  → 已完成的 15m K线确认
+  → 账户硬风控与净 RR 审核
+  → 创建本地模拟仓位
+```
+
+日线只提供背景和风险降级，不再直接决定短线入场。`WAIT` 可能代表没有方向，也可能代表已有 `WATCHING/ARMED` 计划；使用 `npm run status` 可查看下一触发价和失效价。计划默认 6 小时到期。
 
 ## Telegram 通知
 
@@ -196,6 +221,10 @@ sudo -u btc-htx /usr/bin/env \
   PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite \
   /usr/bin/node src/report.mjs
 
+sudo -u btc-htx /usr/bin/env \
+  PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite \
+  /usr/bin/node src/gate-report.mjs --hours=24
+
 sudo systemctl start btc-htx-paper-health.service
 sudo systemctl status btc-htx-paper-health.service --no-pager
 ```
@@ -270,6 +299,11 @@ cd /opt/btc-htx-paper
 sudo -u btc-htx /usr/bin/node --test "test/*.test.mjs"
 sudo -u btc-htx /usr/bin/node scripts/check-safety.mjs
 
+# 首次运行新代码会创建 trade_setups 表；不会删除旧快照和交易
+sudo -u btc-htx /usr/bin/env \
+  PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite \
+  /usr/bin/node src/status.mjs
+
 sudo systemctl start btc-htx-paper.service
 sudo systemctl status btc-htx-paper.service --no-pager
 ```
@@ -290,15 +324,20 @@ sudo systemctl status btc-htx-paper.service --no-pager
 - 只允许 `futures-market`、`funding-rate`、`oi-tracker`、`elite-positioning`、`liquidation-stream`、`mark-price` 六类公开命令。
 - 命令、子命令、参数和值使用白名单，交易对只允许 `BTC-USDT`。
 - HTX CLI 子进程环境主动移除 HTX/Huobi 凭据以及 Telegram Token/Chat ID。
-- V0/V1 的高周期 RSI、衍生品挤压与拥挤度 Risk Gate 保持不变。
+- V1.1 将高周期 RSI 和一般拥挤度改为 0.5% 风险降级；极端拥挤与有充分样本的同方向 squeeze 组合仍是硬性市场闸门。
+- 单笔 1%、日损失 3%、连亏 3 笔、净 RR ≥ 2、单持仓和名义敞口限制不可弱化。
 - 本地开仓和平仓只修改 SQLite；程序没有交易所写入模块。
 - Telegram Token 只从进程环境读取；安全检查会拒绝疑似 Bot Token 被提交到源码或部署文件。
 - 每次 systemd 启动前自动执行源码安全检查，检查失败时监控不会启动。
 
 ## 已部署 VPS 的最少更新步骤
 
+升级前先备份现有 SQLite。V1.1 使用兼容迁移保留旧快照、账户、仓位和绩效记录。
+
 ```bash
 sudo systemctl stop btc-htx-paper.service
+sudo mkdir -p /var/backups/btc-htx-paper
+sudo cp -a /var/lib/btc-htx-paper/paper-trading.sqlite* /var/backups/btc-htx-paper/
 sudo git -C /opt/btc-htx-paper pull --ff-only
 
 cd /opt/btc-htx-paper
@@ -310,6 +349,12 @@ sudo install -m 0644 deploy/systemd/btc-htx-paper-health.service \
 sudoedit /etc/btc-htx-paper.env
 sudo systemctl daemon-reload
 
+sudo -u btc-htx /usr/bin/node --test "test/*.test.mjs"
+sudo -u btc-htx /usr/bin/node scripts/check-safety.mjs
+sudo -u btc-htx /usr/bin/env \
+  PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite \
+  /usr/bin/node src/status.mjs
+
 sudo -u btc-htx /bin/bash -c \
   'set -a; . /etc/btc-htx-paper.env; set +a; cd /opt/btc-htx-paper; exec /usr/bin/node src/telegram-test.mjs'
 
@@ -317,7 +362,7 @@ sudo systemctl restart btc-htx-paper.service
 sudo systemctl restart btc-htx-paper-health.timer
 ```
 
-在 `sudoedit` 中只需补上 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID`，其他 Paper Trading 参数保持原值。
+如果 Telegram 已经配置，不需要修改 Token 或 Chat ID；不得把 `/etc/btc-htx-paper.env` 上传 Git。启动后运行一次 `gate:report`，即可分别看到旧版拦截记录和 V1.1 新计划状态。
 
 ## 数据限制
 

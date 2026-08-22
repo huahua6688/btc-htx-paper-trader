@@ -1,6 +1,6 @@
 {
-  "name": "btc-htx-paper-v1",
-  "version": "1.0.0",
+  "name": "btc-htx-paper-v1-1",
+  "version": "1.1.0",
   "private": true,
   "description": "HTX BTC/USDT perpetual read-only analysis with local paper trading",
   "type": "module",
@@ -11,6 +11,7 @@
     "status": "node src/status.mjs",
     "health": "node src/health.mjs",
     "report": "node src/report.mjs",
+    "gate:report": "node src/gate-report.mjs",
     "telegram:test": "node src/telegram-test.mjs",
     "test": "node --test \"test/*.test.mjs\"",
     "check:safety": "node scripts/check-safety.mjs"

@@ -45,3 +45,26 @@ test("SQLite enforces one open paper position", () => {
     db.close();
   }
 });
+
+test("SQLite persists one active V1.1 setup and its terminal lifecycle", () => {
+  const db = new PaperDatabase(":memory:");
+  try {
+    const report = paperReport();
+    const snapshotId = db.insertSnapshot(report);
+    const setup = db.createSetup({
+      ...report.strategy.setupProposal,
+      armImmediately: false,
+      triggeredNow: false
+    }, snapshotId);
+    assert.equal(setup.status, "WATCHING");
+    assert.equal(db.getActiveSetup().plan.triggerPrice, 100);
+    assert.throws(() => db.createSetup(report.strategy.setupProposal, snapshotId), /already active/);
+    const armed = db.armSetup(setup.id, report.generatedAt, report.completed15mBar.timestamp);
+    assert.equal(armed.status, "ARMED");
+    const finished = db.finishSetup(setup.id, "TRIGGERED", report.generatedAt, "test");
+    assert.equal(finished.status, "TRIGGERED");
+    assert.equal(db.getActiveSetup(), null);
+  } finally {
+    db.close();
+  }
+});

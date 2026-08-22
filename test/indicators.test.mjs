@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ema, percentChange, percentileRank, rsi } from "../src/indicators.mjs";
+import { adx, ema, percentChange, percentileRank, rsi } from "../src/indicators.mjs";
 
 test("percentChange handles a normal move", () => {
   assert.equal(percentChange(110, 100), 10);
@@ -19,4 +19,14 @@ test("RSI is high for a persistent uptrend", () => {
 
 test("percentile rank is bounded", () => {
   assert.equal(percentileRank([1, 2, 3, 4], 3), 75);
+});
+
+test("ADX detects a persistent directional trend", () => {
+  const candles = Array.from({ length: 80 }, (_, index) => ({
+    open: 100 + index,
+    high: 102 + index,
+    low: 99 + index,
+    close: 101.5 + index
+  }));
+  assert.ok(adx(candles, 14) > 50);
 });

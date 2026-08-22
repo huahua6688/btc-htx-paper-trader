@@ -55,6 +55,48 @@ export function atr(candles, period = 14) {
   return ema(ranges, period).at(-1);
 }
 
+export function adx(candles, period = 14) {
+  if (candles.length < period * 2 + 1) return null;
+  const trueRanges = [];
+  const plusMoves = [];
+  const minusMoves = [];
+  for (let index = 1; index < candles.length; index += 1) {
+    const current = candles[index];
+    const previous = candles[index - 1];
+    const upMove = current.high - previous.high;
+    const downMove = previous.low - current.low;
+    trueRanges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    ));
+    plusMoves.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusMoves.push(downMove > upMove && downMove > 0 ? downMove : 0);
+  }
+
+  let smoothedTr = trueRanges.slice(0, period).reduce((sum, value) => sum + value, 0);
+  let smoothedPlus = plusMoves.slice(0, period).reduce((sum, value) => sum + value, 0);
+  let smoothedMinus = minusMoves.slice(0, period).reduce((sum, value) => sum + value, 0);
+  const dxValues = [];
+  for (let index = period - 1; index < trueRanges.length; index += 1) {
+    if (index >= period) {
+      smoothedTr = smoothedTr - smoothedTr / period + trueRanges[index];
+      smoothedPlus = smoothedPlus - smoothedPlus / period + plusMoves[index];
+      smoothedMinus = smoothedMinus - smoothedMinus / period + minusMoves[index];
+    }
+    const plusDi = smoothedTr ? smoothedPlus / smoothedTr * 100 : 0;
+    const minusDi = smoothedTr ? smoothedMinus / smoothedTr * 100 : 0;
+    const denominator = plusDi + minusDi;
+    dxValues.push(denominator ? Math.abs(plusDi - minusDi) / denominator * 100 : 0);
+  }
+  if (dxValues.length < period) return null;
+  let value = dxValues.slice(0, period).reduce((sum, item) => sum + item, 0) / period;
+  for (let index = period; index < dxValues.length; index += 1) {
+    value = (value * (period - 1) + dxValues[index]) / period;
+  }
+  return value;
+}
+
 export function macd(values, fast = 12, slow = 26, signal = 9) {
   if (values.length < slow + signal) return null;
   const fastLine = ema(values, fast);

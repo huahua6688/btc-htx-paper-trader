@@ -13,7 +13,8 @@ test("monitor cycle stores decisions, opens a paper position, then closes it at 
       analyze: (value) => value,
       now: () => "2026-08-21T01:00:01.000Z"
     });
-    assert.equal(first.actions[0].type, "OPEN");
+    assert.equal(first.actions[0].type, "SETUP_CREATED");
+    assert.ok(first.actions.some((action) => action.type === "OPEN"));
     assert.equal(db.getOpenPosition().status, "OPEN");
 
     const secondReport = paperReport({

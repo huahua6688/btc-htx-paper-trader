@@ -7,6 +7,6 @@ try {
   const report = analyzeSnapshot(snapshot);
   process.stdout.write(process.argv.includes("--json") ? `${JSON.stringify(report, null, 2)}\n` : `${formatChinese(report)}\n`);
 } catch (error) {
-  process.stderr.write(`V1 analysis failed safely: ${error.message}\n`);
+  process.stderr.write(`V1.1 analysis failed safely: ${error.message}\n`);
   process.exitCode = 1;
 }

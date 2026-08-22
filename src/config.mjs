@@ -5,17 +5,23 @@ const configuredDatabasePath = process.env.PAPER_DB_PATH?.trim();
 const configuredHealthAge = Number(process.env.PAPER_HEALTH_MAX_AGE_MS);
 
 export const PAPER_CONFIG = Object.freeze({
-  version: "V1",
+  version: "V1.1",
   symbol: "BTC-USDT",
   monitorIntervalMs: 5 * 60 * 1000,
+  setupExpiryMs: 6 * 60 * 60 * 1000,
   initialCapitalCny: 1_000,
   usdtCnyRate: 7.2,
   maxRiskPerTradePct: 0.01,
+  reducedRiskPerTradePct: 0.005,
   maxDailyLossPct: 0.03,
   maxConsecutiveLosses: 3,
   minimumRiskReward: 2,
   feeRatePerSide: 0.0005,
   maxNotionalMultiple: 1,
+  crowdedPressureMin: 56,
+  extremePressureMin: 76,
+  minimumLiquidationEvidenceCount: 3,
+  breakoutVolumeRatio: 1.05,
   databasePath: configuredDatabasePath
     ? resolve(configuredDatabasePath)
     : fileURLToPath(new URL("../data/paper-trading.sqlite", import.meta.url))

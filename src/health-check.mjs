@@ -51,7 +51,7 @@ export function evaluateHealth(db, {
 
 export function formatHealth(result) {
   const lines = [
-    `BTC/USDT V1 health：${result.healthy ? "HEALTHY" : "UNHEALTHY"}`,
+    `BTC/USDT V1.1 health：${result.healthy ? "HEALTHY" : "UNHEALTHY"}`,
     `检查时间：${result.checkedAt}`
   ];
   if (result.monitor) lines.push(`最近 monitor：${result.monitor.status} / ${result.monitor.finishedAt} / ${result.monitor.ageSeconds}s 前`);
