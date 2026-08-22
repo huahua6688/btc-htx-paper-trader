@@ -1,6 +1,6 @@
 {
-  "name": "btc-htx-paper-v1-1",
-  "version": "1.1.0",
+  "name": "btc-htx-paper-v1-2",
+  "version": "1.2.0",
   "private": true,
   "description": "HTX BTC/USDT perpetual read-only analysis with local paper trading",
   "type": "module",

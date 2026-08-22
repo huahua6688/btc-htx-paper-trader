@@ -5,7 +5,8 @@ import { basename } from "node:path";
 import { HEALTH_CONFIG, PAPER_CONFIG, TELEGRAM_CONFIG } from "../src/config.mjs";
 import { resolveCliPath } from "../src/htx-cli.mjs";
 
-test("V1 risk and scheduling defaults match the paper trading specification", () => {
+test("V1.2 risk, scheduling and dynamic opportunity defaults match the specification", () => {
+  assert.equal(PAPER_CONFIG.version, "V1.2");
   assert.equal(PAPER_CONFIG.monitorIntervalMs, 5 * 60 * 1000);
   assert.equal(PAPER_CONFIG.initialCapitalCny, 1_000);
   assert.equal(PAPER_CONFIG.maxRiskPerTradePct, 0.01);
@@ -13,8 +14,10 @@ test("V1 risk and scheduling defaults match the paper trading specification", ()
   assert.equal(PAPER_CONFIG.maxDailyLossPct, 0.03);
   assert.equal(PAPER_CONFIG.maxConsecutiveLosses, 3);
   assert.equal(PAPER_CONFIG.minimumRiskReward, 2);
-  assert.equal(PAPER_CONFIG.setupExpiryMs, 6 * 60 * 60 * 1000);
   assert.equal(PAPER_CONFIG.extremePressureMin, 76);
+  assert.equal(PAPER_CONFIG.minimumBiasScore, 60);
+  assert.equal(PAPER_CONFIG.minimumImmediateEntryScore, 67);
+  assert.equal(PAPER_CONFIG.minimumDirectionalGap, 7);
   assert.equal(HEALTH_CONFIG.maxAgeMs, 15 * 60 * 1000);
   assert.equal(TELEGRAM_CONFIG.apiBaseUrl, "https://api.telegram.org");
   assert.equal(TELEGRAM_CONFIG.dailySummaryHour, 23);

@@ -263,149 +263,202 @@ function completedBar(timeframe) {
   };
 }
 
-export function deriveMarketContext(timeframes, finalScore) {
+export function deriveMarketRegime(timeframes) {
   const tf4h = timeframes["4h"];
-  const bullish = tf4h.ema20 > tf4h.ema50 && tf4h.close > tf4h.ema20 && tf4h.ema20SlopePct > 0;
-  const bearish = tf4h.ema20 < tf4h.ema50 && tf4h.close < tf4h.ema20 && tf4h.ema20SlopePct < 0;
-  const trendSide = bullish ? "LONG" : bearish ? "SHORT" : "WAIT";
-  const bias = trendSide === "LONG" && finalScore > -24
-    ? "LONG"
-    : trendSide === "SHORT" && finalScore < 24
-      ? "SHORT"
-      : "WAIT";
-  const marketRegime = trendSide !== "WAIT" && tf4h.adx14 >= 20
-    ? "TRENDING"
-    : tf4h.adx14 < 18
-      ? "RANGE"
-      : "TRANSITION";
-  return { bias, marketRegime, trendSide };
+  if (tf4h.adx14 >= 22 && Math.abs(tf4h.score) >= 15) return "TRENDING";
+  if (tf4h.adx14 < 18) return "RANGE";
+  return "TRANSITION";
 }
 
-function assessMarketRisk(side, timeframes, derivatives, config) {
-  if (!['LONG', 'SHORT'].includes(side)) return {
-    riskPct: 0,
-    riskTier: "NONE",
-    hardBlocks: [],
-    softWarnings: []
-  };
-  const hardBlocks = [];
-  const softWarnings = [];
-  const long = side === "LONG";
-  const overheated4h = long ? timeframes["4h"].rsi14 >= 78 : timeframes["4h"].rsi14 <= 22;
-  const overheated1d = long ? timeframes["1d"].rsi14 >= 78 : timeframes["1d"].rsi14 <= 22;
-  if (overheated4h) softWarnings.push(`4h RSI ${long ? "过热" : "超卖"}，风险降至 0.5%`);
-  if (overheated1d) softWarnings.push(`日线 RSI ${long ? "过热" : "超卖"}，风险降至 0.5%`);
+function dataQualityFailures(timeframes, derivatives, now) {
+  const failures = [];
+  const availableNumber = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
+  const latest15mTs = Number(timeframes["15m"].candles.at(-1)?.timestamp);
+  if (!Number.isFinite(latest15mTs) || now - latest15mTs > 30 * 60 * 1000) failures.push("15分钟K线已过期");
+  if (!availableNumber(derivatives.orderBook?.bestBid) || !availableNumber(derivatives.orderBook?.bestAsk)) {
+    failures.push("Order Book 不完整");
+  }
+  if (!availableNumber(derivatives.fundingRatePct)) failures.push("Funding 数据不可用");
+  if (!availableNumber(derivatives.oiUsd)) failures.push("Open Interest 数据不可用");
+  if (!availableNumber(derivatives.eliteAccountRatio) || !availableNumber(derivatives.elitePositionRatio)) {
+    failures.push("精英多空持仓数据不可用");
+  }
+  if (!availableNumber(derivatives.markPrice) || !availableNumber(derivatives.basisPct)) {
+    failures.push("Mark Price / Basis 数据不可用");
+  }
+  if (derivatives.pressureComponentsAvailable < 3) failures.push("衍生品拥挤度有效分项不足");
+  return failures;
+}
 
-  const pressure = Number(derivatives.pressureScore);
-  if (Number.isFinite(pressure) && pressure >= config.crowdedPressureMin) {
-    softWarnings.push(`衍生品拥挤度 ${pressure}，风险降至 0.5%`);
+function timingRead(side, timeframes, derivatives, currentPrice, confirmed15m, config) {
+  const direction = side === "LONG" ? 1 : -1;
+  const support = [];
+  const against = [];
+  let raw = 0;
+  const add = (value, label) => {
+    raw += value;
+    (value >= 0 ? support : against).push({ weight: Math.abs(value), label });
+  };
+  const tf15m = timeframes["15m"];
+  const tf1h = timeframes["1h"];
+  add(direction * (tf15m.close >= tf15m.ema20 ? 10 : -10), `15m 价格${tf15m.close >= tf15m.ema20 ? "站上" : "跌破"} EMA20`);
+  add(direction * (tf15m.ema20SlopePct >= 0 ? 8 : -8), `15m EMA20 斜率${tf15m.ema20SlopePct >= 0 ? "向上" : "向下"}`);
+  add(direction * (tf15m.macdHistogram >= 0 ? 10 : -10), `15m MACD 柱${tf15m.macdHistogram >= 0 ? "为正" : "为负"}`);
+  add(direction * (tf1h.close >= tf1h.ema20 ? 8 : -8), `1h 价格${tf1h.close >= tf1h.ema20 ? "站上" : "跌破"} EMA20`);
+  add(direction * (tf1h.ema20SlopePct >= 0 ? 8 : -8), `1h EMA20 斜率${tf1h.ema20SlopePct >= 0 ? "向上" : "向下"}`);
+  add(direction * (tf1h.macdHistogram >= 0 ? 8 : -8), `1h MACD 柱${tf1h.macdHistogram >= 0 ? "为正" : "为负"}`);
+
+  const candleDirection = confirmed15m.close >= confirmed15m.open ? 1 : -1;
+  add(direction * candleDirection * 6, `最近完成的15m K线${candleDirection > 0 ? "收阳" : "收阴"}`);
+  if (Number(confirmed15m.volumeRatio) >= 1.15) {
+    add(direction * candleDirection * 7, `15m 成交量为近期均量的 ${confirmed15m.volumeRatio} 倍`);
   }
-  if (derivatives.pressureComponentsAvailable < 3) {
-    softWarnings.push("衍生品压力有效分项不足 3 个，风险降至 0.5%");
+  const bookContribution = clamp(direction * Number(derivatives.orderBook.top20ImbalancePct) / 4, -8, 8);
+  add(bookContribution, `Order Book 前20档不平衡 ${derivatives.orderBook.top20ImbalancePct}%`);
+
+  const prior15m = tf15m.candles.slice(-22, -2);
+  const priorHigh = Math.max(...prior15m.map((item) => item.high));
+  const priorLow = Math.min(...prior15m.map((item) => item.low));
+  const breakoutNow = side === "LONG" ? confirmed15m.close > priorHigh : confirmed15m.close < priorLow;
+  if (breakoutNow) {
+    const value = Number(confirmed15m.volumeRatio) >= config.breakoutVolumeRatio ? 9 : 3;
+    add(value, `${side === "LONG" ? "向上" : "向下"}突破近期15m区间${value === 9 ? "并有量能配合" : "但量能一般"}`);
   }
-  if (derivatives.rawSqueezeRisk !== "none" && !derivatives.squeezeEvidenceSufficient) {
-    softWarnings.push("出现挤压方向提示，但公开清算样本不足，仅作降级警告");
-  }
-  const matchingSqueeze = derivatives.squeezeRisk === (long ? "long_squeeze" : "short_squeeze");
-  if (Number.isFinite(pressure) && pressure >= config.extremePressureMin && matchingSqueeze) {
-    hardBlocks.push("极端衍生品拥挤与同方向 squeeze 同时出现，禁止新仓");
-  }
-  const reduced = softWarnings.length > 0;
+
+  const latest1h = tf1h.candles.at(-1);
+  const touchedMean = latest1h.low <= tf1h.ema20 + tf1h.atr14 * 0.25
+    && latest1h.high >= tf1h.ema20 - tf1h.atr14 * 0.25;
+  const recoveryNow = touchedMean && (side === "LONG"
+    ? confirmed15m.close > tf15m.ema20 && candleDirection > 0
+    : confirmed15m.close < tf15m.ema20 && candleDirection < 0);
+  if (recoveryNow) add(7, `价格靠近1h均线后出现${side === "LONG" ? "转强" : "转弱"}迹象`);
+
+  const directedDistance = direction * (currentPrice - tf1h.ema20) / tf1h.atr14;
+  if (directedDistance > 1.5) add(-10, `价格沿${side === "LONG" ? "多" : "空"}方向离1h EMA20过远`);
+  else if (directedDistance >= 0 && directedDistance <= 0.7) add(4, "价格与1h均线距离合理");
+  else if (directedDistance < -1.2) add(-8, `当前价格明显逆向偏离1h均线`);
+
+  return {
+    score: round(clamp(50 + raw, 0, 100), 1),
+    support: support.sort((a, b) => b.weight - a.weight),
+    against: against.sort((a, b) => b.weight - a.weight),
+    breakoutNow,
+    recoveryNow,
+    directedDistance: round(directedDistance, 2)
+  };
+}
+
+function evaluateOpportunity(side, timeframes, derivatives, currentPrice, confirmed15m, allSignals, config) {
+  const direction = side === "LONG" ? 1 : -1;
+  const technicalSigned = Object.entries(timeframes)
+    .reduce((sum, [key, value]) => sum + value.score * TIMEFRAME_WEIGHTS[key], 0);
+  const technicalScore = clamp(50 + direction * technicalSigned / 2, 0, 100);
+  const derivativesScore = clamp(50 + direction * derivatives.directionalScore / 2, 0, 100);
+  const directionalScore = technicalScore * 0.75 + derivativesScore * 0.25;
+  const timing = timingRead(side, timeframes, derivatives, currentPrice, confirmed15m, config);
+  let adjustment = Number(derivatives.pressureScore) >= config.extremePressureMin
+    ? -6
+    : Number(derivatives.pressureScore) >= config.crowdedPressureMin
+      ? -3
+      : 0;
+  const matchingSqueeze = derivatives.squeezeRisk === (side === "LONG" ? "long_squeeze" : "short_squeeze");
+  const oppositeSqueeze = derivatives.squeezeRisk === (side === "LONG" ? "short_squeeze" : "long_squeeze");
+  if (matchingSqueeze) adjustment -= 6;
+  if (oppositeSqueeze) adjustment += 3;
+  const score = clamp(directionalScore * 0.6 + timing.score * 0.4 + adjustment, 0, 100);
+
+  const directionalSupport = allSignals
+    .map((item) => ({ weight: direction * item.score, label: item.label }))
+    .filter((item) => item.weight > 0)
+    .sort((a, b) => b.weight - a.weight);
+  const directionalAgainst = allSignals
+    .map((item) => ({ weight: direction * item.score, label: item.label }))
+    .filter((item) => item.weight < 0)
+    .map((item) => ({ ...item, weight: Math.abs(item.weight) }))
+    .sort((a, b) => b.weight - a.weight);
+  return {
+    side,
+    score: round(score, 1),
+    directionalScore: round(directionalScore, 1),
+    timingScore: timing.score,
+    supportingReasons: [...timing.support, ...directionalSupport]
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 5)
+      .map((item) => item.label),
+    opposingReasons: [...timing.against, ...directionalAgainst]
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 5)
+      .map((item) => item.label),
+    breakoutNow: timing.breakoutNow,
+    recoveryNow: timing.recoveryNow,
+    directedDistance: timing.directedDistance
+  };
+}
+
+function assessRisk(side, opportunity, timeframes, derivatives, config) {
+  if (!['LONG', 'SHORT'].includes(side)) return { riskPct: 0, riskTier: "NONE", warnings: [] };
+  const long = side === "LONG";
+  const warnings = [];
+  const highTimeframeExtreme = long
+    ? timeframes["4h"].rsi14 >= 78 && timeframes["1d"].rsi14 >= 78
+    : timeframes["4h"].rsi14 <= 22 && timeframes["1d"].rsi14 <= 22;
+  if (highTimeframeExtreme) warnings.push("4h与日线动量同时处于极端区域");
+  if (Number(derivatives.pressureScore) >= config.crowdedPressureMin) warnings.push(`衍生品拥挤度为 ${derivatives.pressureScore}`);
+  if (derivatives.squeezeRisk === (long ? "long_squeeze" : "short_squeeze")) warnings.push("衍生品出现同方向挤压风险组合");
+  if (opportunity.timingScore < 65) warnings.push("短周期入场质量一般");
+  if (opportunity.score < 75) warnings.push("综合机会尚未达到A级质量");
+  const reduced = warnings.length > 0;
   return {
     riskPct: reduced ? config.reducedRiskPerTradePct : config.maxRiskPerTradePct,
     riskTier: reduced ? "REDUCED" : "NORMAL",
-    hardBlocks,
-    softWarnings
+    warnings
   };
 }
 
-function buildSetupProposal(side, timeframes, currentPrice, generatedAt, risk, config) {
-  if (!['LONG', 'SHORT'].includes(side) || risk.hardBlocks.length) return null;
-  const long = side === "LONG";
-  const tf1h = timeframes["1h"];
-  const tf15m = timeframes["15m"];
-  const latest1h = tf1h.candles.at(-1);
-  const live15m = tf15m.candles.at(-1);
-  const confirmed15m = completedBar(tf15m);
-  const prior15m = tf15m.candles.slice(-10, -2);
-  const atr1h = tf1h.atr14;
-  const atr15m = tf15m.atr14;
-  const pullbackZone = [tf1h.ema20 - atr1h * 0.35, tf1h.ema20 + atr1h * 0.35];
-  const touchedPullback = latest1h.low <= pullbackZone[1] && latest1h.high >= pullbackZone[0];
-  const distanceFromMean = Math.abs(currentPrice - tf1h.ema20) / atr1h;
-  const type = touchedPullback || distanceFromMean <= 0.8 ? "TREND_PULLBACK" : "BREAKOUT_CONTINUATION";
-  const priorHigh = Math.max(...prior15m.map((item) => item.high));
-  const priorLow = Math.min(...prior15m.map((item) => item.low));
-  const triggerPrice = long
-    ? priorHigh + atr15m * (type === "TREND_PULLBACK" ? 0.03 : 0.08)
-    : priorLow - atr15m * (type === "TREND_PULLBACK" ? 0.03 : 0.08);
-  const recentStructure = type === "TREND_PULLBACK" ? tf1h.candles.slice(-5) : tf15m.candles.slice(-10, -1);
-  const structureStop = long
-    ? Math.min(...recentStructure.map((item) => item.low)) - (type === "TREND_PULLBACK" ? atr1h : atr15m) * 0.1
-    : Math.max(...recentStructure.map((item) => item.high)) + (type === "TREND_PULLBACK" ? atr1h : atr15m) * 0.1;
-  const minimumStop = long ? triggerPrice - atr1h * 0.8 : triggerPrice + atr1h * 0.8;
-  const stopLoss = long ? Math.min(structureStop, minimumStop) : Math.max(structureStop, minimumStop);
-  const riskDistance = Math.abs(triggerPrice - stopLoss);
-  const takeProfit = long
-    ? [triggerPrice + riskDistance * 2.2, triggerPrice + riskDistance * 2.8]
-    : [triggerPrice - riskDistance * 2.2, triggerPrice - riskDistance * 2.8];
-  const entryZone = type === "TREND_PULLBACK"
-    ? pullbackZone
-    : [triggerPrice - atr15m * 0.12, triggerPrice + atr15m * 0.12];
-  const bullishConfirmation = confirmed15m.close >= triggerPrice && confirmed15m.close > confirmed15m.open;
-  const bearishConfirmation = confirmed15m.close <= triggerPrice && confirmed15m.close < confirmed15m.open;
-  const directionConfirmed = long ? bullishConfirmation : bearishConfirmation;
-  const volumeConfirmed = type !== "BREAKOUT_CONTINUATION"
-    || Number(confirmed15m.volumeRatio) >= config.breakoutVolumeRatio;
-  const armImmediately = type === "BREAKOUT_CONTINUATION"
-    || (live15m.low <= pullbackZone[1] && live15m.high >= pullbackZone[0]);
+function chooseEntryMethod(candidate, opportunity, timeframes, confirmed15m, enterNow) {
+  if (candidate === "WAIT") return { code: "NO_CLEAR_EDGE", label: "当前多空优势不清晰" };
+  if (enterNow) {
+    if (opportunity.breakoutNow) return { code: "BREAKOUT_NOW", label: "当前突破质量允许直接入场" };
+    if (opportunity.recoveryNow) return { code: "RECOVERY_NOW", label: "当前回落后的重新走强/走弱允许入场" };
+    return { code: "DIRECT_NOW", label: "当前综合条件允许直接入场" };
+  }
+  if (opportunity.directedDistance > 1.3) return { code: "PREFER_PULLBACK", label: "方向成立，但稍微回落后的价格更合理" };
+  const prior15m = timeframes["15m"].candles.slice(-22, -2);
+  const high = Math.max(...prior15m.map((item) => item.high));
+  const low = Math.min(...prior15m.map((item) => item.low));
+  const rangePosition = high > low ? (confirmed15m.close - low) / (high - low) : 0.5;
+  const nearEdge = candidate === "LONG" ? rangePosition >= 0.8 : rangePosition <= 0.2;
+  if (nearEdge && Number(confirmed15m.volumeRatio) < 1.05) {
+    return { code: "PREFER_BREAKOUT_CONFIRMATION", label: "方向成立，但等待有效突破更合适" };
+  }
+  if (opportunity.timingScore < 58) {
+    return { code: "PREFER_STRENGTH_CONFIRMATION", label: `方向成立，但等待短周期重新${candidate === "LONG" ? "走强" : "走弱"}更合适` };
+  }
+  return { code: "WAIT_BETTER_ALIGNMENT", label: "方向有优势，但当前入场质量仍不够好" };
+}
 
+function buildImmediatePlan(side, currentPrice, timeframes) {
+  if (!['LONG', 'SHORT'].includes(side)) return null;
+  const long = side === "LONG";
+  const tf15m = timeframes["15m"];
+  const tf1h = timeframes["1h"];
+  const recent15m = tf15m.candles.slice(-10, -1);
+  const structuralStop = long
+    ? Math.min(...recent15m.map((item) => item.low)) - tf15m.atr14 * 0.1
+    : Math.max(...recent15m.map((item) => item.high)) + tf15m.atr14 * 0.1;
+  const volatilityDistance = Math.max(tf15m.atr14 * 1.1, tf1h.atr14 * 0.55);
+  const volatilityStop = long ? currentPrice - volatilityDistance : currentPrice + volatilityDistance;
+  const stopLoss = long ? Math.min(structuralStop, volatilityStop) : Math.max(structuralStop, volatilityStop);
+  const riskDistance = Math.abs(currentPrice - stopLoss);
+  if (!(riskDistance > 0)) return null;
+  const takeProfit = long
+    ? [currentPrice + riskDistance * 2.2, currentPrice + riskDistance * 2.8]
+    : [currentPrice - riskDistance * 2.2, currentPrice - riskDistance * 2.8];
   return {
-    side,
-    type,
-    createdAt: generatedAt,
-    expiresAt: new Date(new Date(generatedAt).getTime() + config.setupExpiryMs).toISOString(),
-    basisBarTs: confirmed15m.timestamp,
-    entryZone: entryZone.map((value) => round(value, 1)),
-    triggerPrice: round(triggerPrice, 1),
-    invalidationPrice: round(stopLoss, 1),
+    entryPrice: round(currentPrice, 1),
     stopLoss: round(stopLoss, 1),
     takeProfit: takeProfit.map((value) => round(value, 1)),
-    riskReward: [2.2, 2.8],
-    riskPct: risk.riskPct,
-    riskTier: risk.riskTier,
-    armImmediately,
-    triggeredNow: armImmediately && directionConfirmed && volumeConfirmed,
-    reasons: [
-      `4h ${side === "LONG" ? "多头" : "空头"}方向有效`,
-      type === "TREND_PULLBACK" ? "1h 进入趋势回踩结构" : "等待 15m 突破延续",
-      `15m 触发价 ${round(triggerPrice, 1)}`
-    ],
-    warnings: risk.softWarnings
-  };
-}
-
-function buildLevels(decision, setup) {
-  if (!setup) return {
-    entryZone: null,
-    stopLoss: null,
-    takeProfit: null,
-    riskReward: null,
-    waitTriggers: null
-  };
-  return {
-    entryZone: setup.entryZone,
-    stopLoss: setup.stopLoss,
-    takeProfit: setup.takeProfit,
-    riskReward: setup.riskReward,
-    waitTriggers: decision === "WAIT" ? {
-      side: setup.side,
-      type: setup.type,
-      entryZone: setup.entryZone,
-      triggerPrice: setup.triggerPrice,
-      invalidationPrice: setup.invalidationPrice,
-      expiresAt: setup.expiresAt
-    } : null
+    riskReward: [2.2, 2.8]
   };
 }
 
@@ -423,30 +476,56 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
   const technicalScore = Object.entries(timeframes)
     .reduce((sum, [key, value]) => sum + value.score * TIMEFRAME_WEIGHTS[key], 0);
   const derivatives = buildDerivativeRead(data, timeframes, now, config);
-  const finalScore = clamp(technicalScore * 0.75 + derivatives.directionalScore * 0.25, -100, 100);
-  const context = deriveMarketContext(timeframes, finalScore);
-  const candidateDecision = context.bias;
-  const marketRisk = assessMarketRisk(candidateDecision, timeframes, derivatives, config);
-  const setupProposal = buildSetupProposal(candidateDecision, timeframes, currentPrice, new Date(now).toISOString(), marketRisk, config);
-  const riskGates = marketRisk.hardBlocks;
-  const decision = setupProposal?.triggeredNow && !riskGates.length ? candidateDecision : "WAIT";
-
-  const weightedPositive = Object.entries(timeframes).reduce((sum, [key, value]) => sum + (value.score > 0 ? TIMEFRAME_WEIGHTS[key] : 0), 0);
-  const weightedNegative = Object.entries(timeframes).reduce((sum, [key, value]) => sum + (value.score < 0 ? TIMEFRAME_WEIGHTS[key] : 0), 0);
-  const agreement = Math.max(weightedPositive, weightedNegative);
-  const confidence = decision === "WAIT"
-    ? riskGates.length
-      ? clamp(68 + riskGates.length * 3 + derivatives.pressureScore * 0.05, 68, 86)
-      : clamp(58 + (24 - Math.abs(finalScore)) * 0.8 + (1 - agreement) * 12, 55, 82)
-    : clamp(52 + Math.abs(finalScore) * 0.45 + agreement * 8, 55, 90);
-
+  const confirmed15m = completedBar(timeframes["15m"]);
   const allSignals = [
     ...Object.values(timeframes).flatMap((item) => item.signals),
     ...derivatives.signals
   ];
-  const bullishReasons = allSignals.filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, 6).map((item) => item.label);
-  const bearishReasons = allSignals.filter((item) => item.score < 0).sort((a, b) => a.score - b.score).slice(0, 6).map((item) => item.label);
-  const levels = buildLevels(decision, setupProposal);
+  const longOpportunity = evaluateOpportunity("LONG", timeframes, derivatives, currentPrice, confirmed15m, allSignals, config);
+  const shortOpportunity = evaluateOpportunity("SHORT", timeframes, derivatives, currentPrice, confirmed15m, allSignals, config);
+  const winner = longOpportunity.score >= shortOpportunity.score ? longOpportunity : shortOpportunity;
+  const scoreGap = Math.abs(longOpportunity.score - shortOpportunity.score);
+  const dataFailures = dataQualityFailures(timeframes, derivatives, now);
+  const candidateDecision = winner.score >= config.minimumBiasScore && scoreGap >= config.minimumDirectionalGap
+    ? winner.side
+    : "WAIT";
+  const enterNow = dataFailures.length === 0
+    && candidateDecision !== "WAIT"
+    && winner.score >= config.minimumImmediateEntryScore;
+  const marketRisk = assessRisk(candidateDecision, winner, timeframes, derivatives, config);
+  const method = chooseEntryMethod(candidateDecision, winner, timeframes, confirmed15m, enterNow);
+  const levels = enterNow ? buildImmediatePlan(candidateDecision, currentPrice, timeframes) : null;
+  const decision = enterNow && levels ? candidateDecision : "WAIT";
+  const riskGates = dataFailures;
+  const missingConditions = dataFailures.length
+    ? dataFailures
+    : candidateDecision === "WAIT"
+      ? [
+          `多头机会 ${longOpportunity.score}，空头机会 ${shortOpportunity.score}`,
+          `领先方向分差 ${round(scoreGap, 1)}，当前优势不够清晰`,
+          "等待下一轮市场数据形成更明确的综合优势"
+        ]
+      : decision === "WAIT"
+        ? [
+            method.label,
+            `当前${candidateDecision === "LONG" ? "做多" : "做空"}机会质量 ${winner.score}，尚未达到立即入场质量`,
+            ...winner.opposingReasons.slice(0, 2)
+          ]
+        : [];
+  const decisionReasons = decision !== "WAIT"
+    ? winner.supportingReasons.slice(0, 5)
+    : candidateDecision !== "WAIT"
+      ? [method.label, ...winner.supportingReasons.slice(0, 3)]
+      : [
+          `多头综合分 ${longOpportunity.score}`,
+          `空头综合分 ${shortOpportunity.score}`,
+          "当前多空证据没有形成足够清晰的入场优势"
+        ];
+  const confidence = decision !== "WAIT"
+    ? clamp(55 + (winner.score - config.minimumBiasScore) + scoreGap * 0.5, 55, 90)
+    : clamp(55 + Math.max(0, config.minimumImmediateEntryScore - winner.score) * 0.5, 55, 85);
+  const finalScore = longOpportunity.score - shortOpportunity.score;
+  const marketRegime = deriveMarketRegime(timeframes);
 
   const publicCapabilities = [
     "15m/1h/4h/1d K线与成交量",
@@ -459,7 +538,7 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
   ];
 
   return {
-    version: "V1.1",
+    version: "V1.2",
     mode: "READ_ONLY_PUBLIC_DATA_PAPER_ONLY",
     symbol: "BTC-USDT",
     generatedAt: new Date(now).toISOString(),
@@ -476,24 +555,43 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
       low: round(timeframes["15m"].candles.at(-1).low, 1),
       close: round(timeframes["15m"].candles.at(-1).close, 1)
     },
-    completed15mBar: completedBar(timeframes["15m"]),
-    plan: levels,
+    completed15mBar: confirmed15m,
+    plan: levels ?? {
+      entryPrice: null,
+      stopLoss: null,
+      takeProfit: null,
+      riskReward: null
+    },
+    entryAssessment: {
+      enterNow: decision !== "WAIT",
+      method: method.code,
+      methodLabel: method.label,
+      reasons: decisionReasons,
+      missingConditions,
+      riskPct: decision !== "WAIT" ? marketRisk.riskPct : 0
+    },
+    opportunities: {
+      LONG: longOpportunity,
+      SHORT: shortOpportunity
+    },
     strategy: {
-      version: "V1.1",
-      marketRegime: context.marketRegime,
-      trendSide: context.trendSide,
-      bias: context.bias,
-      state: riskGates.length ? "BLOCKED" : setupProposal?.triggeredNow ? "TRIGGERED" : setupProposal ? "WATCHING" : "SCANNING",
-      riskPct: marketRisk.riskPct,
+      version: "V1.2",
+      marketRegime,
+      bias: candidateDecision,
+      state: decision === "WAIT" ? "WAIT" : "ENTER_NOW",
+      riskPct: decision !== "WAIT" ? marketRisk.riskPct : 0,
       riskTier: marketRisk.riskTier,
-      hardBlocks: marketRisk.hardBlocks,
-      softWarnings: marketRisk.softWarnings,
-      setupProposal
+      hardBlocks: dataFailures,
+      softWarnings: marketRisk.warnings,
+      entryMethod: method.code
     },
     scores: {
       technical: round(technicalScore, 1),
       derivativesDirectional: derivatives.directionalScore,
-      derivativesPressure: derivatives.pressureScore
+      derivativesPressure: derivatives.pressureScore,
+      longOpportunity: longOpportunity.score,
+      shortOpportunity: shortOpportunity.score,
+      scoreGap: round(scoreGap, 1)
     },
     timeframes: Object.fromEntries(Object.entries(timeframes).map(([key, value]) => [key, {
       score: value.score,
@@ -509,8 +607,12 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
       volumeRatio: value.volumeRatio
     }])),
     derivatives,
-    bullishReasons,
-    bearishReasons,
+    bullishReasons: longOpportunity.supportingReasons,
+    bearishReasons: shortOpportunity.supportingReasons,
+    dataQuality: {
+      validForEntry: dataFailures.length === 0,
+      failures: dataFailures
+    },
     dataCoverage: {
       available: publicCapabilities,
       limitations: [
@@ -518,7 +620,7 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
         "仅有 HTX 精英交易者比率，没有等价的全体散户比率",
         "HTX 未提供独立 Taker 主动买卖量接口",
         "衍生品压力缺少 30 日清算均值，清算方向仅作为带样本质量标记的辅助证据",
-        "V1.1 会把有效结构保存为待触发计划，由后续 monitor 周期继续检查"
+        "每轮都使用最新数据重新比较多空与入场质量，不沿用上一轮固定方向或价格"
       ]
     },
     safety: {
@@ -528,6 +630,6 @@ export function analyzeSnapshot(data, config = PAPER_CONFIG) {
       tradingModulePresent: false,
       paperTradingOnly: true
     },
-    disclaimer: "机械规则研究输出，不构成投资建议；V1.1 只在本地 SQLite 中模拟交易，不具备任何真实交易能力。"
+    disclaimer: "机械规则研究输出，不构成投资建议；V1.2 只在本地 SQLite 中模拟交易，不具备任何真实交易能力。"
   };
 }

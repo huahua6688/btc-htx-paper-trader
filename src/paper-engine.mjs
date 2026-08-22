@@ -94,7 +94,7 @@ export function buildPaperCandidate(report, account, config = PAPER_CONFIG) {
     notionalCny: round(notionalCny, 4),
     entryFeeCny: round(entryFeeCny, 4),
     openingReasons: [
-      ...(report.strategy?.setupType ? [`V1.1 ${report.strategy.setupType} 待触发计划已确认`] : []),
+      ...(report.entryAssessment?.methodLabel ? [`V1.2 动态入场：${report.entryAssessment.methodLabel}`] : []),
       ...directionReasons.slice(0, 5),
       `Risk Gate 通过：净 RR ${round(target.rr, 2)}，风险档位 ${round(riskPct * 100, 2)}%，单笔风险 ${round(riskCny, 2)} CNY`
     ]

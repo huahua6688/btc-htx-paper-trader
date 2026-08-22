@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assertAllowedCommand, scrubEnvironment } from "../src/htx-cli.mjs";
+import { existsSync, readFileSync } from "node:fs";
+import { assertAllowedCommand, publicCommandRules, scrubEnvironment } from "../src/htx-cli.mjs";
 
 test("permits a public BTC futures kline", () => {
   assert.equal(assertAllowedCommand("futures-market", "kline", {
@@ -40,4 +41,20 @@ test("removes exchange credentials from the child environment", () => {
     TELEGRAM_CHAT_ID: "123"
   });
   assert.deepEqual(clean, { PATH: "safe" });
+});
+
+test("V1.2 runtime has no fixed setup engine and exposes only public HTX skill families", () => {
+  assert.equal(existsSync(new URL("../src/setup-engine.mjs", import.meta.url)), false);
+  const analysis = readFileSync(new URL("../src/analysis-engine.mjs", import.meta.url), "utf8");
+  const monitor = readFileSync(new URL("../src/monitor-cycle.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(analysis, /setupProposal|triggerPrice|expiresAt/);
+  assert.doesNotMatch(monitor, /createSetup|armSetup|setup-engine/);
+  assert.deepEqual(Object.keys(publicCommandRules).sort(), [
+    "elite-positioning",
+    "funding-rate",
+    "futures-market",
+    "liquidation-stream",
+    "mark-price",
+    "oi-tracker"
+  ]);
 });

@@ -1,5 +1,5 @@
 [Unit]
-Description=HTX BTC/USDT V1.1 read-only paper trading monitor
+Description=HTX BTC/USDT V1.2 dynamic read-only paper trading monitor
 Documentation=https://github.com/htx-exchange/htx-skills-hub
 Wants=network-online.target
 After=network-online.target

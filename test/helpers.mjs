@@ -1,27 +1,8 @@
 export function paperReport(overrides = {}) {
   const generatedAt = overrides.generatedAt ?? "2026-08-21T01:00:00.000Z";
   const completedBarTs = new Date(generatedAt).getTime() - 15 * 60 * 1000;
-  const setupProposal = {
-    side: "LONG",
-    type: "BREAKOUT_CONTINUATION",
-    createdAt: generatedAt,
-    expiresAt: new Date(new Date(generatedAt).getTime() + 6 * 60 * 60 * 1000).toISOString(),
-    basisBarTs: completedBarTs,
-    entryZone: [99, 101],
-    triggerPrice: 100,
-    invalidationPrice: 95,
-    stopLoss: 95,
-    takeProfit: [111, 114],
-    riskReward: [2.2, 2.8],
-    riskPct: 0.01,
-    riskTier: "NORMAL",
-    armImmediately: true,
-    triggeredNow: true,
-    reasons: ["测试突破计划"],
-    warnings: []
-  };
-  return {
-    version: "V1.1",
+  const base = {
+    version: "V1.2",
     mode: "READ_ONLY_PUBLIC_DATA_PAPER_ONLY",
     symbol: "BTC-USDT",
     generatedAt,
@@ -29,7 +10,7 @@ export function paperReport(overrides = {}) {
     candidateDecision: "LONG",
     riskGates: [],
     confidencePct: 75,
-    finalScore: 45,
+    finalScore: 40,
     currentPrice: 100,
     latest15mBar: {
       timestamp: completedBarTs,
@@ -47,41 +28,46 @@ export function paperReport(overrides = {}) {
       volumeRatio: 1.2
     },
     plan: {
-      entryZone: [99, 101],
+      entryPrice: 100,
       stopLoss: 95,
-      takeProfit: [109, 111],
-      riskReward: [1.8, 2.5],
-      waitTriggers: null
+      takeProfit: [111, 114],
+      riskReward: [2.2, 2.8]
     },
-    scores: { technical: 50, derivativesDirectional: 30, derivativesPressure: 20 },
+    entryAssessment: {
+      enterNow: true,
+      method: "DIRECT_NOW",
+      methodLabel: "当前综合条件允许直接入场",
+      reasons: ["多周期趋势与短线时机同向", "衍生品没有否定当前方向"],
+      missingConditions: [],
+      riskPct: 0.01
+    },
+    opportunities: {
+      LONG: { side: "LONG", score: 75, directionalScore: 76, timingScore: 74, supportingReasons: ["多周期趋势偏多"], opposingReasons: ["Funding 为正"] },
+      SHORT: { side: "SHORT", score: 35, directionalScore: 34, timingScore: 36, supportingReasons: ["Funding 为正"], opposingReasons: ["多周期趋势偏多"] }
+    },
+    scores: { technical: 50, derivativesDirectional: 30, derivativesPressure: 20, longOpportunity: 75, shortOpportunity: 35, scoreGap: 40 },
     derivatives: { fundingRatePct: 0.01, oiUsd: 1_000_000, pressureScore: 20 },
     strategy: {
-      version: "V1.1",
+      version: "V1.2",
       marketRegime: "TRENDING",
-      trendSide: "LONG",
       bias: "LONG",
-      state: "TRIGGERED",
+      state: "ENTER_NOW",
       riskPct: 0.01,
       riskTier: "NORMAL",
       hardBlocks: [],
       softWarnings: [],
-      setupProposal
+      entryMethod: "DIRECT_NOW"
     },
-    bullishReasons: ["4h 趋势偏多", "回踩后量能恢复"],
-    bearishReasons: ["Funding 为正"],
+    dataQuality: { validForEntry: true, failures: [] },
+    bullishReasons: ["4h 趋势偏多", "短周期重新走强"],
+    bearishReasons: ["Funding 为正"]
+  };
+  return {
+    ...base,
     ...overrides,
-    strategy: overrides.strategy ?? {
-      version: "V1.1",
-      marketRegime: "TRENDING",
-      trendSide: "LONG",
-      bias: "LONG",
-      state: "TRIGGERED",
-      riskPct: 0.01,
-      riskTier: "NORMAL",
-      hardBlocks: [],
-      softWarnings: [],
-      setupProposal
-    }
+    entryAssessment: overrides.entryAssessment ?? base.entryAssessment,
+    opportunities: overrides.opportunities ?? base.opportunities,
+    strategy: overrides.strategy ?? base.strategy
   };
 }
 

@@ -18,7 +18,7 @@ async function cycle() {
     process.stdout.write(`${formatCycle(result)}\n`);
     await telegram.notifyMonitorResult(result, db);
   } catch (error) {
-    process.stderr.write(`V1.1 monitor failed safely: ${error.message}\n`);
+    process.stderr.write(`V1.2 monitor failed safely: ${error.message}\n`);
     if (once) process.exitCode = 1;
   }
 }
@@ -34,7 +34,7 @@ async function main() {
     if (databaseClosed) return;
     databaseClosed = true;
     db.close();
-    process.stdout.write("V1.1 monitor 已停止。\n");
+    process.stdout.write("V1.2 monitor 已停止。\n");
     process.exit(0);
   };
 

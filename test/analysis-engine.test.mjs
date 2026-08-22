@@ -1,96 +1,105 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzeSnapshot, deriveMarketContext } from "../src/analysis-engine.mjs";
+import { analyzeSnapshot, deriveMarketRegime } from "../src/analysis-engine.mjs";
 
-function risingKlines(stepSeconds, start = 50_000) {
+const NOW_SECONDS = 1_780_000_000;
+
+function trendKlines(stepSeconds, direction = 1, move = 20) {
+  const count = 200;
   return {
-    data: Array.from({ length: 200 }, (_, index) => {
-      const open = start + index * 100;
+    data: Array.from({ length: count }, (_, index) => {
+      const distance = count - 1 - index;
+      const close = 70_000 - direction * distance * move;
+      const open = close - direction * move * 0.7;
       return {
-        id: 1_700_000_000 + index * stepSeconds,
+        id: NOW_SECONDS - distance * stepSeconds,
         open,
-        high: open + 140,
-        low: open - 40,
-        close: open + 100,
-        amount: 100 + index
+        high: Math.max(open, close) + move * 0.35,
+        low: Math.min(open, close) - move * 0.35,
+        close,
+        amount: 100 + index * 0.5
       };
     })
   };
 }
 
-test("4h trend remains the bias during an ordinary lower-timeframe pullback", () => {
-  const bullish4h = { ema20: 70_000, ema50: 68_000, close: 71_000, ema20SlopePct: 0.5, adx14: 35 };
-  assert.equal(deriveMarketContext({ "4h": bullish4h }, -3.8).bias, "LONG");
-  assert.equal(deriveMarketContext({ "4h": bullish4h }, -24).bias, "WAIT");
-
-  const bearish4h = { ema20: 68_000, ema50: 70_000, close: 67_000, ema20SlopePct: -0.5, adx14: 35 };
-  assert.equal(deriveMarketContext({ "4h": bearish4h }, 3.8).bias, "SHORT");
-  assert.equal(deriveMarketContext({ "4h": bearish4h }, 24).bias, "WAIT");
-});
-
-test("overheated bullish setup becomes a half-risk pending plan instead of a hard RSI veto", () => {
-  const hourly = risingKlines(3600);
-  const now = hourly.data.at(-1).id * 1000;
-  const snapshot = {
-    ticker: { ts: now, tick: { close: hourly.data.at(-1).close } },
-    kline15m: risingKlines(900),
-    kline1h: hourly,
-    kline4h: risingKlines(14_400),
-    kline1d: risingKlines(86_400),
-    depth: { tick: { bids: [[69_900, 500], [69_800, 400]], asks: [[70_000, 100], [70_100, 100]] } },
-    fundingCurrent: { data: { funding_rate: "0.001" } },
-    fundingHistory: { data: { data: Array.from({ length: 30 }, () => ({ funding_rate: "0.0001" })) } },
-    oiCurrent: { data: [{ value: 1_200_000_000 }] },
-    oiHistory: { data: { tick: [{ ts: now - 86_400_000, value: 1_000_000_000 }, { ts: now, value: 1_200_000_000 }] } },
-    eliteAccount: { data: { list: [{ ts: now, buy_ratio: 0.7, sell_ratio: 0.3 }] } },
-    elitePosition: { data: { list: [{ ts: now, buy_ratio: 0.65, sell_ratio: 0.35 }] } },
-    liquidations: { data: [{ created_at: now, direction: "sell", trade_turnover: 1_000_000 }] },
-    markPrice: { data: [{ close: 70_000 }] },
-    premium: { data: [{ close: 0.001 }] },
-    basis: { data: Array.from({ length: 24 }, (_, index) => ({ basis_rate: index / 100_000 })) }
-  };
-
-  const report = analyzeSnapshot(snapshot);
-  assert.equal(report.candidateDecision, "LONG");
-  assert.equal(report.decision, "WAIT");
-  assert.equal(report.riskGates.length, 0);
-  assert.equal(report.strategy.riskPct, 0.005);
-  assert.ok(report.strategy.softWarnings.some((item) => item.includes("RSI")));
-  assert.ok(report.strategy.setupProposal);
-  assert.ok(report.plan.entryZone);
-});
-
-test("only extreme pressure plus a confirmed same-direction squeeze remains a hard market gate", () => {
-  const hourly = risingKlines(3600);
-  const now = hourly.data.at(-1).id * 1000;
-  const snapshot = {
-    ticker: { ts: now, tick: { close: hourly.data.at(-1).close } },
-    kline15m: risingKlines(900),
-    kline1h: hourly,
-    kline4h: risingKlines(14_400),
-    kline1d: risingKlines(86_400),
-    depth: { tick: { bids: [[69_900, 900]], asks: [[70_000, 100]] } },
-    fundingCurrent: { data: { funding_rate: "0.001" } },
-    fundingHistory: { data: { data: Array.from({ length: 30 }, () => ({ funding_rate: "0.0001" })) } },
-    oiCurrent: { data: [{ value: 1_300_000_000 }] },
-    oiHistory: { data: { tick: [{ ts: now - 86_400_000, value: 1_000_000_000 }, { ts: now, value: 1_300_000_000 }] } },
-    eliteAccount: { data: { list: [{ ts: now, buy_ratio: 0.8, sell_ratio: 0.2 }] } },
-    elitePosition: { data: { list: [{ ts: now, buy_ratio: 0.2, sell_ratio: 0.8 }] } },
-    liquidations: { data: Array.from({ length: 3 }, (_, index) => ({
-      created_at: now - index * 1000,
-      direction: "sell",
+function marketSnapshot({ direction = 1, extremeCrowding = false } = {}) {
+  const now = NOW_SECONDS * 1000;
+  const fundingRate = extremeCrowding ? "0.001" : direction > 0 ? "0.00008" : "-0.00008";
+  const buyRatio = extremeCrowding ? 0.8 : direction > 0 ? 0.58 : 0.42;
+  const sellRatio = 1 - buyRatio;
+  return {
+    ticker: { ts: now, tick: { close: 70_000 } },
+    kline15m: trendKlines(900, direction, 12),
+    kline1h: trendKlines(3_600, direction, 24),
+    kline4h: trendKlines(14_400, direction, 55),
+    kline1d: trendKlines(86_400, direction, 80),
+    depth: { tick: direction > 0
+      ? { bids: [[69_990, 650], [69_980, 400]], asks: [[70_010, 250], [70_020, 200]] }
+      : { bids: [[69_990, 250], [69_980, 200]], asks: [[70_010, 650], [70_020, 400]] } },
+    fundingCurrent: { data: { funding_rate: fundingRate } },
+    fundingHistory: { data: { data: Array.from({ length: 30 }, (_, index) => ({ funding_rate: String(-0.0002 + index * 0.000014) })) } },
+    oiCurrent: { data: [{ value: 1_100_000_000 }] },
+    oiHistory: { data: { tick: [{ ts: now - 86_400_000, value: 1_000_000_000 }, { ts: now, value: 1_100_000_000 }] } },
+    eliteAccount: { data: { list: [{ ts: now, buy_ratio: buyRatio, sell_ratio: sellRatio }] } },
+    elitePosition: { data: { list: [{ ts: now, buy_ratio: buyRatio - 0.03, sell_ratio: sellRatio + 0.03 }] } },
+    liquidations: { data: Array.from({ length: extremeCrowding ? 3 : 1 }, (_, index) => ({
+      created_at: now - index * 1_000,
+      direction: direction > 0 ? "sell" : "buy",
       trade_turnover: 1_000_000
     })) },
     markPrice: { data: [{ close: 70_000 }] },
-    premium: { data: [{ close: 0.001 }] },
-    basis: { data: Array.from({ length: 24 }, (_, index) => ({ basis_rate: index / 10_000 })) }
+    premium: { data: [{ close: direction * 0.0001 }] },
+    basis: { data: Array.from({ length: 24 }, (_, index) => ({ basis_rate: direction * index / 100_000 })) }
   };
+}
 
-  const report = analyzeSnapshot(snapshot);
+test("market regime is derived from current trend strength, not a saved setup", () => {
+  assert.equal(deriveMarketRegime({ "4h": { adx14: 30, score: 40 } }), "TRENDING");
+  assert.equal(deriveMarketRegime({ "4h": { adx14: 14, score: 5 } }), "RANGE");
+  assert.equal(deriveMarketRegime({ "4h": { adx14: 20, score: 5 } }), "TRANSITION");
+});
+
+test("every analysis scores LONG and SHORT independently and can enter immediately", () => {
+  const report = analyzeSnapshot(marketSnapshot({ direction: 1 }));
+  assert.equal(report.version, "V1.2");
   assert.equal(report.candidateDecision, "LONG");
-  assert.equal(report.derivatives.squeezeRisk, "long_squeeze");
-  assert.ok(report.derivatives.pressureScore >= 76);
+  assert.ok(report.opportunities.LONG.score > report.opportunities.SHORT.score);
+  assert.equal(report.entryAssessment.enterNow, true);
+  assert.equal(report.decision, "LONG");
+  assert.ok(["DIRECT_NOW", "BREAKOUT_NOW", "RECOVERY_NOW"].includes(report.entryAssessment.method));
+  assert.equal(report.plan.entryPrice, report.currentPrice);
+  assert.equal("waitTriggers" in report.plan, false);
+  assert.ok(report.plan.stopLoss < report.currentPrice);
+});
+
+test("reversing current market data reverses the independently recomputed preference", () => {
+  const bullish = analyzeSnapshot(marketSnapshot({ direction: 1 }));
+  const bearish = analyzeSnapshot(marketSnapshot({ direction: -1 }));
+  assert.equal(bullish.candidateDecision, "LONG");
+  assert.equal(bearish.candidateDecision, "SHORT");
+  assert.ok(bearish.opportunities.SHORT.score > bearish.opportunities.LONG.score);
+  assert.equal(bearish.decision, "SHORT");
+  assert.ok(bearish.plan.stopLoss > bearish.currentPrice);
+});
+
+test("RSI, Funding and crowding modify score or risk but never become a one-indicator hard veto", () => {
+  const report = analyzeSnapshot(marketSnapshot({ direction: 1, extremeCrowding: true }));
+  assert.equal(report.dataQuality.validForEntry, true);
+  assert.deepEqual(report.riskGates, []);
+  assert.ok(report.opportunities.LONG);
+  assert.ok(report.opportunities.SHORT);
+  assert.equal(report.strategy.riskTier, "REDUCED");
+  assert.equal(report.strategy.riskPct <= 0.005 || report.decision === "WAIT", true);
+  assert.equal("setupProposal" in report.strategy, false);
+});
+
+test("missing public market data is the hard gate and prevents paper entry", () => {
+  const snapshot = marketSnapshot({ direction: 1 });
+  snapshot.depth = { tick: { bids: [], asks: [] } };
+  const report = analyzeSnapshot(snapshot);
   assert.equal(report.decision, "WAIT");
-  assert.match(report.riskGates.join(" "), /极端衍生品拥挤/);
-  assert.equal(report.strategy.setupProposal, null);
+  assert.equal(report.entryAssessment.enterNow, false);
+  assert.equal(report.dataQuality.validForEntry, false);
+  assert.match(report.riskGates.join(" "), /Order Book/);
 });

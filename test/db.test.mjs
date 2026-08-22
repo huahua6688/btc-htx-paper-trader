@@ -46,19 +46,34 @@ test("SQLite enforces one open paper position", () => {
   }
 });
 
-test("SQLite persists one active V1.1 setup and its terminal lifecycle", () => {
+test("SQLite keeps legacy setup rows readable so V1.2 can cancel them safely", () => {
   const db = new PaperDatabase(":memory:");
   try {
     const report = paperReport();
     const snapshotId = db.insertSnapshot(report);
-    const setup = db.createSetup({
-      ...report.strategy.setupProposal,
+    const legacyProposal = {
+      side: "LONG",
+      type: "TREND_PULLBACK",
+      createdAt: report.generatedAt,
+      expiresAt: "2026-08-21T07:00:00.000Z",
+      basisBarTs: report.completed15mBar.timestamp,
+      entryZone: [99, 101],
+      triggerPrice: 100,
+      invalidationPrice: 95,
+      stopLoss: 95,
+      takeProfit: [111, 114],
+      riskReward: [2.2, 2.8],
+      riskPct: 0.005,
+      riskTier: "REDUCED",
+      reasons: ["旧版兼容测试"],
+      warnings: [],
       armImmediately: false,
       triggeredNow: false
-    }, snapshotId);
+    };
+    const setup = db.createSetup(legacyProposal, snapshotId);
     assert.equal(setup.status, "WATCHING");
     assert.equal(db.getActiveSetup().plan.triggerPrice, 100);
-    assert.throws(() => db.createSetup(report.strategy.setupProposal, snapshotId), /already active/);
+    assert.throws(() => db.createSetup(legacyProposal, snapshotId), /already active/);
     const armed = db.armSetup(setup.id, report.generatedAt, report.completed15mBar.timestamp);
     assert.equal(armed.status, "ARMED");
     const finished = db.finishSetup(setup.id, "TRIGGERED", report.generatedAt, "test");
