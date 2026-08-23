@@ -5,6 +5,13 @@ node_modules/
 *.log
 latest-analysis.json
 data/*.sqlite
+data/*.sqlite.*
 data/*.sqlite-shm
 data/*.sqlite-wal
+data/*.bak
+data/*.bak-*
+data/notification-state/
+data/research/
+research-output/
 vendor/htx-cli-linux-x64
+vendor/htx-cli-windows-x64.exe
