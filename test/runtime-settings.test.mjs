@@ -13,6 +13,7 @@ test("runtime settings are atomic, audited, idempotent and survive restart", () 
     const firstDefaultsAt = db.getRuntimeSettings().updatedAt;
     const firstRevision = db.getRuntimeSettings().revision;
     const result = db.updateRuntimeSettings({
+      positionMode: "HEDGE",
       allowPyramiding: true,
       maxOpenPositions: 2,
       riskPerTradePct: 0.0075
@@ -21,7 +22,7 @@ test("runtime settings are atomic, audited, idempotent and survive restart", () 
       sourceEventId: "telegram:42",
       updatedAt: "2026-08-21T01:00:00.000Z"
     });
-    assert.ok(["allowPyramiding", "maxOpenPositions", "riskPerTradePct", "riskMode", "riskManualPct"]
+    assert.ok(["positionMode", "allowPyramiding", "maxOpenPositions", "riskPerTradePct", "riskMode", "riskManualPct"]
       .every((key) => result.changed.includes(key)));
     const duplicate = db.updateRuntimeSettings({ riskPerTradePct: 0.005 }, {
       source: "TELEGRAM_ADMIN_CHAT",
@@ -49,6 +50,7 @@ test("runtime settings are atomic, audited, idempotent and survive restart", () 
 
     db = new PaperDatabase(path);
     assert.equal(db.getRuntimeSettings().allowPyramiding, true);
+    assert.equal(db.getRuntimeSettings().positionMode, "HEDGE");
     assert.equal(db.getRuntimeSettings().maxOpenPositions, 2);
     assert.equal(db.getRuntimeSettings().leverageMax, 120);
     assert.equal(db.getRuntimeSettings().riskMaxPct, 0.06);

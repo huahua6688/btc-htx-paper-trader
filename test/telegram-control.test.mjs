@@ -50,6 +50,7 @@ test("Telegram control accepts only the configured administrator and persists at
     assert.ok(panel.view("range-risk").text.includes("自动可用上限"));
     assert.ok(panel.view("range-leverage").markup.inline_keyboard.flat().some((button) => button.callback_data?.includes("leverageManual")));
     assert.ok(panel.view("leverage").text.includes("1x～200x"));
+    assert.ok(panel.view("position-mode").markup.inline_keyboard.flat().some((button) => button.callback_data === "paper:set:positionMode:HEDGE"));
     assert.equal(panel.view("main").markup.inline_keyboard.flat().some((button) => button.text.includes("恢复")), false);
     assert.ok(panel.view("details").text.includes("仅实际生效因素"));
     assert.ok(panel.view("research").text.includes("权重为 0"));

@@ -126,11 +126,11 @@ test("default blocks duplicate positions and controlled pyramiding requires favo
     const grouped = db.getOpenPositions();
     assert.equal(grouped.length, 2);
     assert.equal(grouped[0].position_group_id, grouped[1].position_group_id);
-    assert.equal(grouped[0].stop_loss, allowed.candidate.portfolioAfter.overallStopLoss);
-    assert.equal(grouped[1].stop_loss, allowed.candidate.portfolioAfter.overallStopLoss);
-    assert.equal(grouped[0].take_profit, grouped[1].take_profit);
-    assert.equal(grouped[0].liquidation_price_estimate, grouped[1].liquidation_price_estimate);
-    assert.equal(grouped[0].liquidation_price_estimate, allowed.candidate.portfolioAfter.liquidationPriceEstimate);
+    assert.equal(grouped[0].stop_loss, 95, "旧腿保留自己的止损，不被新腿覆盖");
+    assert.equal(grouped[1].stop_loss, allowed.candidate.stopLoss);
+    assert.equal(grouped[0].take_profit, 111, "旧腿保留自己的止盈");
+    assert.notEqual(grouped[0].liquidation_price_estimate, grouped[1].liquidation_price_estimate, "每腿保留独立强平估算");
+    assert.equal(grouped[1].liquidation_price_estimate, allowed.candidate.liquidationPriceEstimate);
     assert.equal(grouped[0].management.events.at(-1).type, "PORTFOLIO_REBASED");
   } finally {
     db.close();

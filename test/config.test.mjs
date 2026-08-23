@@ -13,6 +13,7 @@ import {
 import { resolveCliPath } from "../src/htx-cli.mjs";
 
 test("frozen V1.2 signals coexist with ranged Paper risk and the public 200x product ceiling", () => {
+  assert.equal(RUNTIME_SETTINGS_DEFAULTS.positionMode, "NET");
   assert.equal(PAPER_CONFIG.version, "V1.2");
   assert.equal(PAPER_CONFIG.monitorIntervalMs, 5 * 60 * 1000);
   assert.equal(PAPER_CONFIG.initialCapitalCny, 1_000);
