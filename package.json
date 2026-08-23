@@ -11,6 +11,7 @@
     "status": "node src/status.mjs",
     "health": "node src/health.mjs",
     "report": "node src/report.mjs",
+    "positions:repair": "node src/repair-position-groups.mjs",
     "gate:report": "node src/gate-report.mjs",
     "data:update": "node src/research-cli.mjs data:update",
     "data:inspect": "node src/research-cli.mjs data:inspect",
