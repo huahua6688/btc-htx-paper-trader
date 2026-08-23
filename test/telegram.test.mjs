@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PaperDatabase } from "../src/db.mjs";
-import { sendTelegramMessage } from "../src/telegram-client.mjs";
+import { editTelegramMessage, sendTelegramMessage } from "../src/telegram-client.mjs";
 import { formatCloseTelegram, formatOpenTelegram } from "../src/telegram-format.mjs";
 import { shanghaiClock, TelegramNotifier } from "../src/telegram-notifier.mjs";
 import { directCandidate, paperReport } from "./helpers.mjs";
@@ -50,6 +50,26 @@ test("Telegram client posts plain text through sendMessage", async () => {
   assert.equal(result.messageId, 77);
   assert.equal(request.url, "https://api.telegram.test/botunit-test-token/sendMessage");
   assert.deepEqual(JSON.parse(request.options.body), { chat_id: "12345", text: "paper test" });
+});
+
+test("Telegram panel refresh uses editMessageText instead of creating another message", async () => {
+  let request;
+  const result = await editTelegramMessage(77, "updated panel", {
+    config: telegramConfig,
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { message_id: 77 } }) };
+    },
+    replyMarkup: { inline_keyboard: [[{ text: "返回", callback_data: "paper:view:main" }]] }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(request.url, "https://api.telegram.test/botunit-test-token/editMessageText");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    chat_id: "12345",
+    message_id: 77,
+    text: "updated panel",
+    reply_markup: { inline_keyboard: [[{ text: "返回", callback_data: "paper:view:main" }]] }
+  });
 });
 
 test("Telegram client skips missing configuration and redacts token on network errors", async () => {

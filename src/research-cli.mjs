@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { CHALLENGER_BASE_PARAMETERS } from "./challenger-strategy.mjs";
+import { CHALLENGER_BASE_PARAMETERS, HISTORICAL_COMPATIBLE_PARAMETERS } from "./challenger-strategy.mjs";
 import { openPaperDatabase } from "./db.mjs";
 import { runCounterfactualReview } from "./counterfactual-review.mjs";
 import { auditExternalMarketFeatures } from "./external-features.mjs";
@@ -15,11 +15,19 @@ import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./simil
 import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
+import { ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
+import { buildTradeAttribution } from "./attribution-engine.mjs";
 
 export const PREDECLARED_RESEARCH_RANGE = Object.freeze({
   from: "2024-09-01T00:00:00.000Z",
   to: "2026-07-31T23:45:00.000Z",
   selectionPolicy: "contiguous predeclared range ending before this implementation run; not selected from backtest performance"
+});
+
+export const ANTI_CHASE_DEVELOPMENT_RANGE = Object.freeze({
+  from: "2024-09-01T00:00:00.000Z",
+  to: "2026-01-17T06:30:00.000Z",
+  selectionPolicy: "predeclared development-only interval; previously consumed Final OOS is excluded and no new holdout is opened"
 });
 
 function argumentsMap(argv = process.argv.slice(3)) {
@@ -269,6 +277,61 @@ async function tradableEdge(args) {
   return report;
 }
 
+async function antiChase(args) {
+  const dataset = await load(args);
+  const selected = range(args, ANTI_CHASE_DEVELOPMENT_RANGE);
+  const directory = resolveOutputPath(runId("anti-chase"));
+  await mkdir(directory, { recursive: true });
+  const baseline = await runHistoricalReplay(dataset, {
+    strategy: "historical-compatible", parameters: HISTORICAL_COMPATIBLE_PARAMETERS,
+    ...selected, outputDirectory: join(directory, "baseline")
+  });
+  const candidate = await runHistoricalReplay(dataset, {
+    strategy: "anti-chase", parameters: ANTI_CHASE_PARAMETERS,
+    ...selected, outputDirectory: join(directory, "candidate")
+  });
+  const blockedSignals = candidate.trace.filter((item) => item.entryQuality?.blocked).length;
+  const entryGeometry = candidate.trace.reduce((summary, item) => {
+    const quality = item.entryQuality;
+    if (!quality?.side) return summary;
+    summary.evaluated += 1;
+    if (quality.blocked) summary.blocked += 1;
+    else summary.eligible += 1;
+    const category = quality.entryType === "INSUFFICIENT_GEOMETRY" ? "INSUFFICIENT_GEOMETRY"
+      : quality.clusteredChase && quality.blocked ? "CLUSTERED_CHASE"
+        : quality.blocked ? "INSUFFICIENT_NET_ROOM"
+          : quality.validFreshBreakout ? "ELIGIBLE_FRESH_BREAKOUT"
+            : quality.validRetest ? "ELIGIBLE_RETEST"
+              : quality.recoveryNearMean ? "ELIGIBLE_MEAN_RECOVERY" : "ELIGIBLE_BALANCED_DIRECT";
+    summary.reasonCounts[category] = (summary.reasonCounts[category] ?? 0) + 1;
+    return summary;
+  }, { evaluated: 0, eligible: 0, blocked: 0, reasonCounts: {} });
+  const report = {
+    schemaVersion: 1,
+    runType: "ANTI_CHASE_DEVELOPMENT_AUDIT",
+    generatedAt: new Date().toISOString(),
+    developmentRange: { ...selected, selectionPolicy: ANTI_CHASE_DEVELOPMENT_RANGE.selectionPolicy },
+    dataManifestHash: dataset.manifest.manifestHash,
+    sameEvents: baseline.eventStreamHash === candidate.eventStreamHash && baseline.eventCount === candidate.eventCount,
+    frozenChampionChanged: false,
+    finalOosOpened: false,
+    parameters: ANTI_CHASE_PARAMETERS,
+    baseline: compactReplay(baseline),
+    candidate: compactReplay(candidate),
+    chaseAudit: {
+      blockedSignals,
+      blockedPct: candidate.eventCount ? blockedSignals / candidate.eventCount * 100 : 0,
+      entryGeometry,
+      attribution: buildTradeAttribution(candidate)
+    },
+    promotion: { eligible: false, reason: "development diagnosis only; requires purged walk-forward, new untouched OOS and Shadow before promotion" },
+    safety: { paperOnly: true, privateHtxApi: false, exchangeWriteOperations: false }
+  };
+  const reportPath = await save(join(directory, "anti-chase-report.json"), report);
+  process.stdout.write(`${JSON.stringify({ directory, reportPath, sameEvents: report.sameEvents, blockedSignals, entryGeometry, baseline: compactReplay(baseline), candidate: compactReplay(candidate), promotion: report.promotion }, null, 2)}\n`);
+  return report;
+}
+
 async function full(args) {
   const selected = range(args, PREDECLARED_RESEARCH_RANGE);
   await dataUpdate(args, PREDECLARED_RESEARCH_RANGE);
@@ -331,6 +394,7 @@ try {
   else if (command === "ablation") await ablation(args);
   else if (command === "edge:pipeline") await edgePipeline(args);
   else if (command === "tradable-edge") await tradableEdge(args);
+  else if (command === "anti-chase") await antiChase(args);
   else if (command === "full") await full(args);
   else throw new Error(`Unknown research command: ${command}`);
 } catch (error) {

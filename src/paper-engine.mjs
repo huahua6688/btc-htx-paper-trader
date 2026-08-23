@@ -8,7 +8,7 @@ import {
   minimumMarginForStopBeforeLiquidation,
   resolveExchangeConstraints
 } from "./exchange-constraints.mjs";
-import { riskProfileFactor } from "./runtime-settings.mjs";
+import { selectRiskPct } from "./runtime-settings.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
@@ -160,11 +160,20 @@ export function buildPaperCandidate(
   const availableNotional = Math.max(0, accountEquityCny * runtimeSettings.maxTotalNotionalMultiple - existingNotional);
   if (!(availableRisk > 0) || !(availableMargin > 0) || !(availableNotional > 0)) return null;
 
+  const opportunityScore = Number(report.opportunities?.[side]?.score ?? 0);
+  const volatilityPct = finite(report.timeframes?.["1h"]?.atr14)
+    ? Number(report.timeframes["1h"].atr14) / signalEntry
+    : Math.abs(signalEntry - stopLoss) / signalEntry;
   const marketRiskPct = finite(report.strategy?.riskPct) ? Number(report.strategy.riskPct) : config.maxRiskPerTradePct;
-  const requestedRiskPct = Math.min(runtimeSettings.riskPerTradePct, marketRiskPct, config.maxRiskPerTradePct)
-    * riskProfileFactor(runtimeSettings.riskProfile)
-    * opportunityRiskFactor(report, side);
-  const riskPct = clamp(requestedRiskPct, 0, config.maxRiskPerTradePct);
+  const marketRiskFactor = config.maxRiskPerTradePct > 0
+    ? clamp(marketRiskPct / config.maxRiskPerTradePct, 0.5, 1)
+    : 1;
+  const requestedRiskPct = selectRiskPct(runtimeSettings, {
+    opportunityScore,
+    volatilityPct,
+    marketRiskFactor
+  }) * opportunityRiskFactor(report, side);
+  const riskPct = clamp(requestedRiskPct, runtimeSettings.riskMinPct, config.absoluteMaxRiskPerTradePct);
   const riskBudgetCny = Math.min(accountEquityCny * riskPct, availableRisk);
   if (!(riskBudgetCny > 0)) return null;
 
@@ -177,12 +186,15 @@ export function buildPaperCandidate(
     return validDirection && finite(economics.netRr) && economics.netRr >= config.minimumRiskReward;
   });
   if (!viableTargets.length) return null;
-  const opportunityScore = Number(report.opportunities?.[side]?.score ?? 0);
   const selected = opportunityScore >= 80 ? viableTargets.at(-1) : viableTargets[0];
   const perBtc = selected.economics;
   const quantityByRisk = riskBudgetCny / perBtc.expectedLoss;
 
-  const hardMaxLeverage = Math.min(runtimeSettings.userMaxLeverage, exchangeConstraints.hardMaxLeverage);
+  const configuredLeverageMaximum = runtimeSettings.leverageMode === "MANUAL"
+    ? runtimeSettings.leverageManual
+    : runtimeSettings.leverageMax;
+  const hardMaxLeverage = Math.min(configuredLeverageMaximum, exchangeConstraints.hardMaxLeverage);
+  const hardMinLeverage = Math.max(1, Math.min(runtimeSettings.leverageMin, hardMaxLeverage));
   const unitSafeMargin = minimumMarginForStopBeforeLiquidation({
     side,
     entry: perBtc.entryFill,
@@ -201,14 +213,11 @@ export function buildPaperCandidate(
   if (!(quantityBtc >= contractSize)) return null;
 
   const notionalCny = quantityBtc * perBtc.entryFill * config.usdtCnyRate;
-  const volatilityPct = finite(report.timeframes?.["1h"]?.atr14)
-    ? Number(report.timeframes["1h"].atr14) / signalEntry
-    : Math.abs(signalEntry - stopLoss) / signalEntry;
-  const quality = clamp((opportunityScore - 60) / 40, 0.15, 1);
-  const volatilityControl = clamp(0.03 / Math.max(volatilityPct, 0.005), 0.25, 1);
-  const preferredLeverage = 1 + (leverageCap - 1) * quality * volatilityControl;
   const requiredLeverage = notionalCny / availableMargin;
-  const leverage = round(clamp(Math.max(preferredLeverage, requiredLeverage), 1, leverageCap), 2);
+  const desiredLeverage = runtimeSettings.leverageMode === "MANUAL"
+    ? Number(runtimeSettings.leverageManual)
+    : Math.max(hardMinLeverage, requiredLeverage);
+  const leverage = round(clamp(desiredLeverage, hardMinLeverage, leverageCap), 2);
   const marginCny = notionalCny / leverage;
   if (marginCny > availableMargin + 0.01) return null;
 

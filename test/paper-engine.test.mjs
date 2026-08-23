@@ -55,11 +55,11 @@ test("position sizing follows equity and opportunity quality rather than a fixed
 test("dynamic leverage allocates margin but never raises the allowed loss", () => {
   const conservative = buildPaperCandidate(paperReport(), { cash_cny: 1_000 }, {
     ...RUNTIME_SETTINGS_DEFAULTS,
-    userMaxLeverage: 2
+    leverageMode: "MANUAL", leverageManual: 2, userMaxLeverage: 2
   });
   const widerLimit = buildPaperCandidate(paperReport(), { cash_cny: 1_000 }, {
     ...RUNTIME_SETTINGS_DEFAULTS,
-    userMaxLeverage: 8
+    leverageMode: "MANUAL", leverageManual: 8, userMaxLeverage: 8
   });
   assert.ok(conservative && widerLimit);
   assert.ok(conservative.leverage <= 2);
@@ -68,7 +68,7 @@ test("dynamic leverage allocates margin but never raises the allowed loss", () =
   assert.ok(Math.abs(widerLimit.notionalCny / widerLimit.leverage - widerLimit.marginCny) < 0.001);
 });
 
-test("public general max leverage is recorded but tier-specific HTX leverage is never fabricated", () => {
+test("public 200x product range is recorded while account and tier eligibility remain unknown", () => {
   const constraints = resolveExchangeConstraints({
     contractElements: { data: [{ contract_code: "BTC-USDT", instrument_value: "0.001", max_level: "200" }] }
   });
@@ -76,19 +76,22 @@ test("public general max leverage is recorded but tier-specific HTX leverage is 
   assert.equal(constraints.publicAdvertisedMaxLeverage, 200);
   assert.equal(constraints.verifiedPositionTierMaxLeverage, null);
   assert.equal(constraints.tierLimitVerified, false);
-  assert.ok(constraints.hardMaxLeverage < constraints.publicAdvertisedMaxLeverage);
+  assert.equal(constraints.hardMaxLeverage, 200);
+  assert.match(constraints.note, /账户|KYC|档位/);
 });
 
-test("market risk reduction lowers size below 0.5% and the 1% hard ceiling remains intact", () => {
+test("automatic and manual risk remain inside the configured minimum/maximum interval", () => {
   const reduced = buildPaperCandidate(paperReport({ strategy: { riskPct: 0.005 } }), { cash_cny: 1_000 });
-  const capped = buildPaperCandidate(paperReport({ strategy: { riskPct: 0.5 } }), { cash_cny: 1_000 }, {
+  const manual = buildPaperCandidate(paperReport({ strategy: { riskPct: 0.5 } }), { cash_cny: 1_000 }, {
     ...RUNTIME_SETTINGS_DEFAULTS,
-    riskProfile: "AGGRESSIVE"
+    riskMode: "MANUAL", riskMinPct: 0.005, riskMaxPct: 0.10, riskManualPct: 0.08,
+    riskPerTradePct: 0.08, maxTotalRiskPct: 0.20
   });
-  assert.ok(reduced && capped);
-  assert.ok(reduced.riskPct < 0.005);
-  assert.ok(capped.riskPct <= 0.01);
-  assert.ok(reduced.expectedLossCny < capped.expectedLossCny);
+  assert.ok(reduced && manual);
+  assert.ok(reduced.riskBudgetCny / 1_000 >= RUNTIME_SETTINGS_DEFAULTS.riskMinPct);
+  assert.ok(reduced.riskPct <= RUNTIME_SETTINGS_DEFAULTS.riskMaxPct);
+  assert.ok(manual.riskPct <= 0.08);
+  assert.ok(reduced.expectedLossCny < manual.expectedLossCny);
 });
 
 test("default blocks duplicate positions and controlled pyramiding requires favorable high-quality progress", () => {
@@ -151,6 +154,10 @@ test("WAIT, data gates, manual pause, daily loss and loss streak block new entri
 test("three consecutive losses and 3% daily loss pause entries for the Shanghai day", () => {
   const db = new PaperDatabase(":memory:");
   try {
+    db.updateRuntimeSettings({
+      dailyLossMode: "MANUAL", dailyLossManualPct: 0.03,
+      lossStreakMode: "MANUAL", lossStreakManual: 3
+    }, { source: "TEST" });
     for (let index = 0; index < 3; index += 1) {
       const openedAt = `2026-08-21T0${index + 1}:00:00.000Z`;
       const snapshotId = db.insertSnapshot(paperReport({ generatedAt: openedAt }));

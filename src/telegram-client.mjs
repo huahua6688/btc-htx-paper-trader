@@ -54,6 +54,23 @@ export async function sendTelegramMessage(text, {
     : response;
 }
 
+export async function editTelegramMessage(messageId, text, {
+  config = TELEGRAM_CONFIG,
+  fetchImpl = globalThis.fetch,
+  replyMarkup = undefined
+} = {}) {
+  const response = await callTelegramApi("editMessageText", {
+    chat_id: config.chatId,
+    message_id: Number(messageId),
+    text: String(text).slice(0, 4_000),
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  }, { config, fetchImpl });
+  if (!response.ok && /message is not modified/i.test(response.error ?? "")) {
+    return { ok: true, skipped: false, unchanged: true, messageId: Number(messageId) };
+  }
+  return response.ok ? { ...response, messageId: Number(messageId) } : response;
+}
+
 export async function getTelegramUpdates(offset, options = {}) {
   return callTelegramApi("getUpdates", {
     offset,

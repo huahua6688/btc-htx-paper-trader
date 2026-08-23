@@ -2,7 +2,11 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { PAPER_CONFIG, RUNTIME_SETTINGS_DEFAULTS } from "./config.mjs";
-import { RUNTIME_SETTING_KEYS, validateCompleteRuntimeSettings } from "./runtime-settings.mjs";
+import {
+  RUNTIME_SETTING_KEYS,
+  expandLegacyRuntimePatch,
+  validateCompleteRuntimeSettings
+} from "./runtime-settings.mjs";
 import {
   FEATURE_REGISTRY_SEEDS,
   assertLayerEffectAllowed
@@ -28,39 +32,35 @@ const hydratePosition = (row) => row ? {
   management: parseJson(row.management_json, {})
 } : null;
 
+const RUNTIME_FIELDS = Object.freeze([
+  ["riskProfile", "risk_profile", "text"],
+  ["riskMode", "risk_mode", "text"], ["riskMinPct", "risk_min_pct"], ["riskMaxPct", "risk_max_pct"], ["riskManualPct", "risk_manual_pct"], ["riskPerTradePct", "risk_per_trade_pct"],
+  ["marginMode", "margin_mode", "text"], ["marginMinUsagePct", "margin_min_usage_pct"], ["marginMaxUsagePct", "margin_max_usage_pct"], ["marginManualUsagePct", "margin_manual_usage_pct"], ["maxMarginUsagePct", "max_margin_usage_pct"],
+  ["leverageMode", "leverage_mode", "text"], ["leverageMin", "leverage_min"], ["leverageMax", "leverage_max"], ["leverageManual", "leverage_manual"], ["userMaxLeverage", "user_max_leverage"],
+  ["notionalMode", "notional_mode", "text"], ["notionalMinMultiple", "notional_min_multiple"], ["notionalMaxMultiple", "notional_max_multiple"], ["notionalManualMultiple", "notional_manual_multiple"], ["maxTotalNotionalMultiple", "max_total_notional_multiple"],
+  ["allowPyramiding", "allow_pyramiding", "boolean"],
+  ["positionLimitMode", "position_limit_mode", "text"], ["positionLimitMin", "position_limit_min"], ["positionLimitMax", "position_limit_max"], ["positionLimitManual", "position_limit_manual"], ["maxOpenPositions", "max_open_positions"],
+  ["totalRiskMode", "total_risk_mode", "text"], ["totalRiskMinPct", "total_risk_min_pct"], ["totalRiskMaxPct", "total_risk_max_pct"], ["totalRiskManualPct", "total_risk_manual_pct"], ["maxTotalRiskPct", "max_total_risk_pct"],
+  ["dailyLossMode", "daily_loss_mode", "text"], ["dailyLossMinPct", "daily_loss_min_pct"], ["dailyLossMaxPct", "daily_loss_max_pct"], ["dailyLossManualPct", "daily_loss_manual_pct"], ["maxDailyLossPct", "max_daily_loss_pct"],
+  ["lossStreakMode", "loss_streak_mode", "text"], ["lossStreakMin", "loss_streak_min"], ["lossStreakMax", "loss_streak_max"], ["lossStreakManual", "loss_streak_manual"], ["maxConsecutiveLosses", "max_consecutive_losses"],
+  ["newEntriesPaused", "new_entries_paused", "boolean"]
+]);
+
 function runtimeFromRow(row) {
-  return row ? {
-    riskProfile: row.risk_profile,
-    riskPerTradePct: Number(row.risk_per_trade_pct),
-    maxMarginUsagePct: Number(row.max_margin_usage_pct),
-    userMaxLeverage: Number(row.user_max_leverage),
-    maxTotalNotionalMultiple: Number(row.max_total_notional_multiple),
-    allowPyramiding: Boolean(row.allow_pyramiding),
-    maxOpenPositions: Number(row.max_open_positions),
-    maxTotalRiskPct: Number(row.max_total_risk_pct),
-    maxDailyLossPct: Number(row.max_daily_loss_pct),
-    maxConsecutiveLosses: Number(row.max_consecutive_losses),
-    newEntriesPaused: Boolean(row.new_entries_paused),
+  if (!row) return null;
+  const settings = Object.fromEntries(RUNTIME_FIELDS.map(([key, column, type]) => [key,
+    type === "boolean" ? Boolean(row[column]) : type === "text" ? row[column] : Number(row[column])
+  ]));
+  return {
+    ...settings,
     revision: Number(row.revision ?? 0),
     updatedAt: row.updated_at,
     updatedBy: row.updated_by
-  } : null;
+  };
 }
 
 function runtimeValues(settings) {
-  return [
-    settings.riskProfile,
-    settings.riskPerTradePct,
-    settings.maxMarginUsagePct,
-    settings.userMaxLeverage,
-    settings.maxTotalNotionalMultiple,
-    settings.allowPyramiding ? 1 : 0,
-    settings.maxOpenPositions,
-    settings.maxTotalRiskPct,
-    settings.maxDailyLossPct,
-    settings.maxConsecutiveLosses,
-    settings.newEntriesPaused ? 1 : 0
-  ];
+  return RUNTIME_FIELDS.map(([key, , type]) => type === "boolean" ? (settings[key] ? 1 : 0) : settings[key]);
 }
 
 export class PaperDatabase {
@@ -82,7 +82,9 @@ export class PaperDatabase {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((column) => column.name === name)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      return true;
     }
+    return false;
   }
 
   initialize() {
@@ -214,14 +216,46 @@ export class PaperDatabase {
       CREATE TABLE IF NOT EXISTS runtime_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         risk_profile TEXT NOT NULL,
+        risk_mode TEXT NOT NULL,
+        risk_min_pct REAL NOT NULL,
+        risk_max_pct REAL NOT NULL,
+        risk_manual_pct REAL NOT NULL,
         risk_per_trade_pct REAL NOT NULL,
+        margin_mode TEXT NOT NULL,
+        margin_min_usage_pct REAL NOT NULL,
+        margin_max_usage_pct REAL NOT NULL,
+        margin_manual_usage_pct REAL NOT NULL,
         max_margin_usage_pct REAL NOT NULL,
+        leverage_mode TEXT NOT NULL,
+        leverage_min REAL NOT NULL,
+        leverage_max REAL NOT NULL,
+        leverage_manual REAL NOT NULL,
         user_max_leverage REAL NOT NULL,
+        notional_mode TEXT NOT NULL,
+        notional_min_multiple REAL NOT NULL,
+        notional_max_multiple REAL NOT NULL,
+        notional_manual_multiple REAL NOT NULL,
         max_total_notional_multiple REAL NOT NULL,
         allow_pyramiding INTEGER NOT NULL CHECK (allow_pyramiding IN (0, 1)),
+        position_limit_mode TEXT NOT NULL,
+        position_limit_min INTEGER NOT NULL,
+        position_limit_max INTEGER NOT NULL,
+        position_limit_manual INTEGER NOT NULL,
         max_open_positions INTEGER NOT NULL,
+        total_risk_mode TEXT NOT NULL,
+        total_risk_min_pct REAL NOT NULL,
+        total_risk_max_pct REAL NOT NULL,
+        total_risk_manual_pct REAL NOT NULL,
         max_total_risk_pct REAL NOT NULL,
+        daily_loss_mode TEXT NOT NULL,
+        daily_loss_min_pct REAL NOT NULL,
+        daily_loss_max_pct REAL NOT NULL,
+        daily_loss_manual_pct REAL NOT NULL,
         max_daily_loss_pct REAL NOT NULL,
+        loss_streak_mode TEXT NOT NULL,
+        loss_streak_min INTEGER NOT NULL,
+        loss_streak_max INTEGER NOT NULL,
+        loss_streak_manual INTEGER NOT NULL,
         max_consecutive_losses INTEGER NOT NULL,
         new_entries_paused INTEGER NOT NULL CHECK (new_entries_paused IN (0, 1)),
         revision INTEGER NOT NULL DEFAULT 0,
@@ -324,6 +358,52 @@ export class PaperDatabase {
     this.ensureColumn("feature_validation_runs", "validation_stage", "TEXT NOT NULL DEFAULT 'HISTORICAL_OOS'");
     this.ensureColumn("feature_validation_runs", "candidate_version", "TEXT NOT NULL DEFAULT 'unversioned'");
     this.ensureColumn("runtime_settings", "revision", "INTEGER NOT NULL DEFAULT 0");
+    const rangeMigrations = [
+      ["risk_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["risk_min_pct", "REAL NOT NULL DEFAULT 0.005"], ["risk_max_pct", "REAL NOT NULL DEFAULT 0.05"], ["risk_manual_pct", "REAL NOT NULL DEFAULT 0.01"],
+      ["margin_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["margin_min_usage_pct", "REAL NOT NULL DEFAULT 0.10"], ["margin_max_usage_pct", "REAL NOT NULL DEFAULT 0.80"], ["margin_manual_usage_pct", "REAL NOT NULL DEFAULT 0.25"],
+      ["leverage_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["leverage_min", "REAL NOT NULL DEFAULT 1"], ["leverage_max", "REAL NOT NULL DEFAULT 200"], ["leverage_manual", "REAL NOT NULL DEFAULT 5"],
+      ["notional_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["notional_min_multiple", "REAL NOT NULL DEFAULT 0.5"], ["notional_max_multiple", "REAL NOT NULL DEFAULT 20"], ["notional_manual_multiple", "REAL NOT NULL DEFAULT 1"],
+      ["position_limit_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["position_limit_min", "INTEGER NOT NULL DEFAULT 1"], ["position_limit_max", "INTEGER NOT NULL DEFAULT 5"], ["position_limit_manual", "INTEGER NOT NULL DEFAULT 1"],
+      ["total_risk_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["total_risk_min_pct", "REAL NOT NULL DEFAULT 0.02"], ["total_risk_max_pct", "REAL NOT NULL DEFAULT 0.20"], ["total_risk_manual_pct", "REAL NOT NULL DEFAULT 0.02"],
+      ["daily_loss_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["daily_loss_min_pct", "REAL NOT NULL DEFAULT 0.03"], ["daily_loss_max_pct", "REAL NOT NULL DEFAULT 0.20"], ["daily_loss_manual_pct", "REAL NOT NULL DEFAULT 0.03"],
+      ["loss_streak_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["loss_streak_min", "INTEGER NOT NULL DEFAULT 3"], ["loss_streak_max", "INTEGER NOT NULL DEFAULT 10"], ["loss_streak_manual", "INTEGER NOT NULL DEFAULT 3"]
+    ];
+    let rangeSchemaAdded = false;
+    for (const [name, definition] of rangeMigrations) {
+      if (this.ensureColumn("runtime_settings", name, definition)) rangeSchemaAdded = true;
+    }
+    if (rangeSchemaAdded) {
+      this.db.exec(`
+        UPDATE runtime_settings SET
+          risk_manual_pct = risk_per_trade_pct,
+          risk_min_pct = MIN(risk_min_pct, risk_per_trade_pct),
+          risk_max_pct = MAX(risk_max_pct, risk_per_trade_pct),
+          margin_manual_usage_pct = max_margin_usage_pct,
+          margin_min_usage_pct = MIN(margin_min_usage_pct, max_margin_usage_pct),
+          margin_max_usage_pct = MAX(margin_max_usage_pct, max_margin_usage_pct),
+          leverage_manual = user_max_leverage,
+          leverage_min = MIN(leverage_min, user_max_leverage),
+          leverage_max = MAX(leverage_max, user_max_leverage),
+          notional_manual_multiple = max_total_notional_multiple,
+          notional_min_multiple = MIN(notional_min_multiple, max_total_notional_multiple),
+          notional_max_multiple = MAX(notional_max_multiple, max_total_notional_multiple),
+          position_limit_manual = max_open_positions,
+          position_limit_min = MIN(position_limit_min, max_open_positions),
+          position_limit_max = MAX(position_limit_max, max_open_positions),
+          total_risk_manual_pct = max_total_risk_pct,
+          total_risk_min_pct = MIN(total_risk_min_pct, max_total_risk_pct),
+          total_risk_max_pct = MAX(total_risk_max_pct, max_total_risk_pct),
+          daily_loss_manual_pct = max_daily_loss_pct,
+          daily_loss_min_pct = MIN(daily_loss_min_pct, max_daily_loss_pct),
+          daily_loss_max_pct = MAX(daily_loss_max_pct, max_daily_loss_pct),
+          loss_streak_manual = max_consecutive_losses,
+          loss_streak_min = MIN(loss_streak_min, max_consecutive_losses),
+          loss_streak_max = MAX(loss_streak_max, max_consecutive_losses),
+          risk_mode = 'MANUAL', margin_mode = 'MANUAL', leverage_mode = 'MANUAL',
+          notional_mode = 'MANUAL', position_limit_mode = 'MANUAL', total_risk_mode = 'MANUAL',
+          daily_loss_mode = 'MANUAL', loss_streak_mode = 'MANUAL'
+      `);
+    }
     this.db.exec("DROP INDEX IF EXISTS one_open_position_idx;");
     this.db.exec("DROP INDEX IF EXISTS one_entry_per_side_bar_idx;");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS one_entry_per_side_bar_idx ON positions(side, entry_bar_ts) WHERE status = 'OPEN';");
@@ -334,12 +414,10 @@ export class PaperDatabase {
       VALUES (1, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).run(this.config.initialCapitalCny, this.config.initialCapitalCny, now);
+    const runtimeColumns = RUNTIME_FIELDS.map(([, column]) => column);
     this.db.prepare(`
-      INSERT INTO runtime_settings(
-        id, risk_profile, risk_per_trade_pct, max_margin_usage_pct, user_max_leverage,
-        max_total_notional_multiple, allow_pyramiding, max_open_positions, max_total_risk_pct,
-        max_daily_loss_pct, max_consecutive_losses, new_entries_paused, updated_at, updated_by
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FIRST_START_DEFAULTS')
+      INSERT INTO runtime_settings(id, ${runtimeColumns.join(", ")}, updated_at, updated_by)
+      VALUES (1, ${runtimeColumns.map(() => "?").join(", ")}, ?, 'FIRST_START_DEFAULTS')
       ON CONFLICT(id) DO NOTHING
     `).run(...runtimeValues(RUNTIME_SETTINGS_DEFAULTS), now);
     this.db.prepare(`
@@ -397,13 +475,14 @@ export class PaperDatabase {
       }
       const current = this.getRuntimeSettings();
       const currentValues = Object.fromEntries(RUNTIME_SETTING_KEYS.map((key) => [key, current[key]]));
-      const next = validateCompleteRuntimeSettings({ ...currentValues, ...patch });
+      const expandedPatch = expandLegacyRuntimePatch(patch);
+      const next = validateCompleteRuntimeSettings({ ...currentValues, ...expandedPatch });
       const changed = RUNTIME_SETTING_KEYS.filter((key) => current[key] !== next[key]);
+      if (!changed.length) return { settings: current, changed, duplicate: false, noChange: true };
+      const assignments = RUNTIME_FIELDS.map(([, column]) => `${column} = ?`).join(", ");
       this.db.prepare(`
         UPDATE runtime_settings SET
-          risk_profile = ?, risk_per_trade_pct = ?, max_margin_usage_pct = ?, user_max_leverage = ?,
-          max_total_notional_multiple = ?, allow_pyramiding = ?, max_open_positions = ?, max_total_risk_pct = ?,
-          max_daily_loss_pct = ?, max_consecutive_losses = ?, new_entries_paused = ?,
+          ${assignments},
           revision = revision + 1, updated_at = ?, updated_by = ?
         WHERE id = 1
       `).run(...runtimeValues(next), updatedAt, source);

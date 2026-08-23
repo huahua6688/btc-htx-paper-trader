@@ -1,7 +1,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { PaperDatabase } from "../src/db.mjs";
 import { directCandidate, paperReport } from "./helpers.mjs";
+
+test("range migration preserves legacy runtime values even below new defaults", () => {
+  const directory = mkdtempSync(join(tmpdir(), "btc-paper-legacy-settings-"));
+  const path = join(directory, "paper.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE runtime_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1), risk_profile TEXT NOT NULL,
+      risk_per_trade_pct REAL NOT NULL, max_margin_usage_pct REAL NOT NULL,
+      user_max_leverage REAL NOT NULL, max_total_notional_multiple REAL NOT NULL,
+      allow_pyramiding INTEGER NOT NULL, max_open_positions INTEGER NOT NULL,
+      max_total_risk_pct REAL NOT NULL, max_daily_loss_pct REAL NOT NULL,
+      max_consecutive_losses INTEGER NOT NULL, new_entries_paused INTEGER NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL
+    );
+    INSERT INTO runtime_settings VALUES
+      (1, 'CONSERVATIVE', 0.001, 0.05, 2, 0.25, 0, 1, 0.005, 0.01, 2, 0, 7, '2026-01-01T00:00:00.000Z', 'LEGACY');
+  `);
+  legacy.close();
+  const db = new PaperDatabase(path);
+  try {
+    const settings = db.getRuntimeSettings();
+    assert.equal(settings.riskMode, "MANUAL");
+    assert.equal(settings.riskManualPct, 0.001);
+    assert.equal(settings.riskMinPct, 0.001);
+    assert.equal(settings.totalRiskManualPct, 0.005);
+    assert.equal(settings.dailyLossManualPct, 0.01);
+    assert.equal(settings.lossStreakManual, 2);
+    assert.equal(settings.revision, 7);
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("SQLite initializes the paper account and persists a complete position lifecycle", () => {
   const db = new PaperDatabase(":memory:");

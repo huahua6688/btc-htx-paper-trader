@@ -24,6 +24,33 @@ function holdingBin(value) {
   return HOLDING_BINS.find(([minimum, maximum]) => minutes >= minimum && minutes < maximum)?.[2] ?? "UNKNOWN";
 }
 
+function extensionBin(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "UNKNOWN";
+  if (numeric < 0.5) return "<0.5ATR";
+  if (numeric < 1) return "0.5-1ATR";
+  if (numeric < 1.5) return "1-1.5ATR";
+  return ">=1.5ATR";
+}
+
+function impulseBin(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "UNKNOWN";
+  if (numeric < 1) return "<1ATR";
+  if (numeric < 2) return "1-2ATR";
+  return ">=2ATR";
+}
+
+function rangePositionBin(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "UNKNOWN";
+  if (numeric < 20) return "0-20%";
+  if (numeric < 40) return "20-40%";
+  if (numeric < 60) return "40-60%";
+  if (numeric < 80) return "60-80%";
+  return "80-100%";
+}
+
 function profitFactor(values) {
   const profits = values.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const losses = -values.filter((value) => value < 0).reduce((sum, value) => sum + value, 0);
@@ -90,7 +117,10 @@ const DIMENSIONS = Object.freeze({
   entryType: { eligibleAtEntry: true, selector: (row) => row.entryType },
   exitType: { eligibleAtEntry: false, selector: (row) => row.exitType },
   sideRegime: { eligibleAtEntry: true, selector: (row) => `${row.side}|${row.marketRegime}` },
-  regimeScore: { eligibleAtEntry: true, selector: (row) => `${row.marketRegime}|${scoreBin(row.opportunityScore)}` }
+  regimeScore: { eligibleAtEntry: true, selector: (row) => `${row.marketRegime}|${scoreBin(row.opportunityScore)}` },
+  entryExtension: { eligibleAtEntry: true, selector: (row) => extensionBin(row.entryExtensionAtr) },
+  entryImpulse: { eligibleAtEntry: true, selector: (row) => impulseBin(row.entryImpulseAtr) },
+  entryRangePosition: { eligibleAtEntry: true, selector: (row) => rangePositionBin(row.entryRangePositionPct) }
 });
 
 function windowRows(rows, window) {

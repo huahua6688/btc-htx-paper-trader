@@ -25,6 +25,7 @@
     "ablation": "node src/research-cli.mjs ablation",
     "edge:pipeline": "node src/research-cli.mjs edge:pipeline",
     "tradable-edge": "node src/research-cli.mjs tradable-edge",
+    "anti-chase": "node src/research-cli.mjs anti-chase",
     "research:run": "node src/research-cli.mjs full",
     "telegram:test": "node src/telegram-test.mjs",
     "test": "node --test \"test/*.test.mjs\"",

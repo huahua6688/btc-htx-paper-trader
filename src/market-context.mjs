@@ -106,9 +106,11 @@ export function coreMarketDataFreshForTrading(report, market, { maxKlineAgeMs = 
 function timeframeFactor(report, timeframe, featureKey) {
   const item = report.timeframes?.[timeframe];
   if (!item) return null;
+  const score = Number(item.score);
+  const direction = score > 0 ? "偏多" : score < 0 ? "偏空" : "中性";
   return {
     featureKey,
-    label: `${timeframe} 技术结构 ${item.score >= 0 ? "偏多" : "偏空"}（${item.score}）`,
+    label: `${timeframe} 技术结构${direction}，方向强度 ${Math.abs(score)}/100`,
     observedAt: report.generatedAt,
     actuallyInfluencesDecision: true
   };
@@ -118,9 +120,11 @@ function derivativeFactors(report) {
   const factors = [];
   const derivatives = report.derivatives ?? {};
   if (Number.isFinite(Number(derivatives.directionalScore))) {
+    const score = Number(derivatives.directionalScore);
+    const direction = score > 0 ? "偏多" : score < 0 ? "偏空" : "中性";
     factors.push({
       featureKey: "htx_derivatives_pressure",
-      label: `HTX 衍生品综合方向分 ${derivatives.directionalScore}，压力 ${derivatives.pressureScore ?? "—"}`,
+      label: `HTX 衍生品${direction}，方向强度 ${Math.abs(score)}/100；拥挤压力 ${derivatives.pressureScore ?? "—"}/100`,
       observedAt: report.generatedAt,
       actuallyInfluencesDecision: true
     });

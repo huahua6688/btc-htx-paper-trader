@@ -10,6 +10,7 @@ import {
   HISTORICAL_COMPATIBLE_PARAMETERS
 } from "../src/challenger-strategy.mjs";
 import { buildTradeAttribution } from "../src/attribution-engine.mjs";
+import { ANTI_CHASE_PARAMETERS } from "../src/anti-chase-challenger.mjs";
 import { generateDiagnosisCandidates } from "../src/edge-candidate-pipeline.mjs";
 import { runCounterfactualReview } from "../src/counterfactual-review.mjs";
 import { auditExternalMarketFeatures } from "../src/external-features.mjs";
@@ -153,6 +154,21 @@ test("historical-compatible analysis ablates only timestamped OHLCV and Funding"
     "historical Order Book", "historical OI", "historical liquidations",
     "historical elite positioning", "historical Mark/Basis"
   ]);
+});
+
+test("Anti-Chase replay keeps the raw geometry window even after baseline frame caching", async () => {
+  const dataset = syntheticDataset(75);
+  const from = new Date(dataset.candles[68 * 96].timestamp).toISOString();
+  const to = new Date(dataset.candles[69 * 96].timestamp).toISOString();
+  await runHistoricalReplay(dataset, {
+    strategy: "historical-compatible", parameters: HISTORICAL_COMPATIBLE_PARAMETERS, from, to
+  });
+  const replay = await runHistoricalReplay(dataset, {
+    strategy: "anti-chase", parameters: ANTI_CHASE_PARAMETERS, from, to
+  });
+  const evaluated = replay.trace.filter((item) => item.entryQuality?.side);
+  assert.ok(evaluated.length > 0);
+  assert.equal(evaluated.some((item) => item.entryQuality.entryType === "INSUFFICIENT_GEOMETRY"), false);
 });
 
 test("diagnosis candidates never turn unstable observed subsets into hard filters", () => {

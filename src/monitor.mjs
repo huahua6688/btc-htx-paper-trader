@@ -7,10 +7,11 @@ import { TelegramControlPanel } from "./telegram-control.mjs";
 import { analyzeChallenger, analyzeHistoricalCompatible } from "./challenger-strategy.mjs";
 import { readJson, resolveResearchPath } from "./research-utils.mjs";
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
+import { analyzeAntiChaseChallenger } from "./anti-chase-challenger.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
-if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge"].includes(activeShadow.strategyType))) {
+if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase"].includes(activeShadow.strategyType))) {
   throw new Error("Active Shadow strategy is not an approved Paper-only research configuration");
 }
 const activeEdgeModel = activeShadow?.strategyType === "tradable-edge"
@@ -23,7 +24,9 @@ if (activeShadow?.strategyType === "tradable-edge"
 const shadowDatabasePath = activeShadow?.databasePath ?? SHADOW_CONFIG.databasePath;
 const shadowStrategyVersion = activeShadow?.version ?? SHADOW_CONFIG.strategyVersion;
 const shadowAnalyze = activeShadow
-  ? activeShadow.strategyType === "tradable-edge"
+  ? activeShadow.strategyType === "anti-chase"
+    ? (market) => analyzeAntiChaseChallenger(market, activeShadow.parameters)
+    : activeShadow.strategyType === "tradable-edge"
     ? (market) => analyzeTradableEdge(market, {
         ...activeShadow.parameters,
         model: activeEdgeModel,

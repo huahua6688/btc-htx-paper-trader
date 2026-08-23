@@ -41,7 +41,7 @@ export function estimatePaperLiquidation({ side, entry, quantityBtc, marginCny, 
   const price = side === "LONG"
     ? (quantity * entry - marginUsdt) / (quantity * (1 - mmr))
     : (marginUsdt + quantity * entry) / (quantity * (1 + mmr));
-  if (!(price > 0)) return null;
+  if (!(price >= 0)) return null;
   return {
     price: round(price, 2),
     distancePct: round(Math.abs(price - entry) / entry * 100, 4),

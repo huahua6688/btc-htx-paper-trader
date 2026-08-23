@@ -12,7 +12,7 @@ import {
 } from "../src/config.mjs";
 import { resolveCliPath } from "../src/htx-cli.mjs";
 
-test("V1.2 risk, scheduling and dynamic opportunity defaults match the specification", () => {
+test("frozen V1.2 signals coexist with ranged Paper risk and the public 200x product ceiling", () => {
   assert.equal(PAPER_CONFIG.version, "V1.2");
   assert.equal(PAPER_CONFIG.monitorIntervalMs, 5 * 60 * 1000);
   assert.equal(PAPER_CONFIG.initialCapitalCny, 1_000);
@@ -32,8 +32,12 @@ test("V1.2 risk, scheduling and dynamic opportunity defaults match the specifica
   assert.equal(TELEGRAM_CONFIG.dailySummaryMinute, 55);
   assert.equal(TELEGRAM_CONFIG.controlPollIntervalMs, 5_000);
   assert.equal(RUNTIME_SETTINGS_DEFAULTS.allowPyramiding, false);
-  assert.equal(RUNTIME_SETTINGS_DEFAULTS.userMaxLeverage, 5);
-  assert.equal(PAPER_EXCHANGE_CONSTRAINTS.maxLeverage, 20);
+  assert.equal(RUNTIME_SETTINGS_DEFAULTS.riskMode, "AUTO");
+  assert.deepEqual([RUNTIME_SETTINGS_DEFAULTS.riskMinPct, RUNTIME_SETTINGS_DEFAULTS.riskMaxPct], [0.005, 0.05]);
+  assert.deepEqual([RUNTIME_SETTINGS_DEFAULTS.leverageMin, RUNTIME_SETTINGS_DEFAULTS.leverageMax], [1, 200]);
+  assert.equal(RUNTIME_SETTINGS_DEFAULTS.userMaxLeverage, 200);
+  assert.equal(PAPER_EXCHANGE_CONSTRAINTS.maxLeverage, 200);
+  assert.equal(PAPER_EXCHANGE_CONSTRAINTS.advertisedProductMaxLeverage, 200);
   assert.equal(PAPER_EXCHANGE_CONSTRAINTS.liquidationFormulaAvailable, false);
   assert.equal(Object.isFrozen(PAPER_CONFIG), true);
 });

@@ -1,8 +1,9 @@
-import { TELEGRAM_CONFIG } from "./config.mjs";
+import { RUNTIME_SETTINGS_DEFAULTS, TELEGRAM_CONFIG } from "./config.mjs";
 import { calculateAccountState, calculatePerformance, getDailyRiskState } from "./paper-engine.mjs";
-import { riskProfileChinese } from "./runtime-settings.mjs";
+import { controlModeChinese, RANGE_DEFINITIONS, riskProfileChinese } from "./runtime-settings.mjs";
 import {
   answerTelegramCallback,
+  editTelegramMessage,
   getTelegramUpdates,
   sendTelegramMessage,
   telegramEnabled
@@ -13,31 +14,39 @@ const n = (value, digits = 2) => value !== null && value !== undefined && Number
   : "—";
 const pct = (value, digits = 2) => value === null || value === undefined ? "—" : `${n(Number(value) * 100, digits)}%`;
 
-const MAIN_BUTTONS = Object.freeze({
-  inline_keyboard: [
+function mainButtons(settings = { newEntriesPaused: false }) {
+  return { inline_keyboard: [
     [{ text: "📊 当前仓位", callback_data: "paper:view:positions" }, { text: "🧠 当前判断", callback_data: "paper:view:decision" }],
     [{ text: "🔬 详细分析", callback_data: "paper:view:details" }, { text: "🧪 研究页面", callback_data: "paper:view:research" }],
     [{ text: "💰 账户状态", callback_data: "paper:view:account" }, { text: "📈 今日表现", callback_data: "paper:view:today" }],
     [{ text: "⚙️ 风险设置", callback_data: "paper:view:risk" }, { text: "🎚 杠杆设置", callback_data: "paper:view:leverage" }],
     [{ text: "➕ 加仓设置", callback_data: "paper:view:pyramiding" }, { text: "📋 最近交易", callback_data: "paper:view:recent" }],
-    [{ text: "⏸ 暂停新开仓", callback_data: "paper:set:newEntriesPaused:true" }, { text: "▶️ 恢复", callback_data: "paper:set:newEntriesPaused:false" }]
-  ]
-});
+    [{ text: "✨ 一键启用新版自动区间", callback_data: "paper:preset:autoRanges" }],
+    [settings.newEntriesPaused
+      ? { text: "▶️ 取消手动暂停", callback_data: "paper:set:newEntriesPaused:false" }
+      : { text: "⏸ 暂停新开仓", callback_data: "paper:set:newEntriesPaused:true" }]
+  ] };
+}
+
+const MAIN_BUTTONS = Object.freeze(mainButtons());
 
 function settingsText(settings) {
   return [
     "⚙️ Paper Trading 控制面板",
     `配置版本：${settings.revision}`,
-    `新开仓：${settings.newEntriesPaused ? "已暂停" : "允许评估"}`,
+    `手动新开仓开关：${settings.newEntriesPaused ? "已暂停" : "允许评估（仍须通过自动风控）"}`,
     `风险偏好：${riskProfileChinese(settings.riskProfile)}`,
-    `单笔风险上限：${pct(settings.riskPerTradePct)}`,
-    `总风险上限：${pct(settings.maxTotalRiskPct)}`,
-    `保证金使用上限：${pct(settings.maxMarginUsagePct)}`,
-    `用户杠杆上限：${n(settings.userMaxLeverage, 1)}x（实际杠杆仍由仓位反推）`,
-    `总名义仓位上限：权益的 ${n(settings.maxTotalNotionalMultiple, 1)} 倍`,
-    `加仓：${settings.allowPyramiding ? "开启" : "关闭"}；最大 ${settings.maxOpenPositions} 仓`,
-    `日损失上限：${pct(settings.maxDailyLossPct)}；连亏 ${settings.maxConsecutiveLosses} 笔暂停`,
-    "所有按钮只改变本地 SQLite 中的模拟交易参数。"
+    `单笔风险：${controlModeChinese(settings.riskMode)}；区间 ${pct(settings.riskMinPct)}～${pct(settings.riskMaxPct)}；当前限制 ${pct(settings.riskPerTradePct)}`,
+    `总风险：${controlModeChinese(settings.totalRiskMode)}；区间 ${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
+    `保证金：${controlModeChinese(settings.marginMode)}；区间 ${pct(settings.marginMinUsagePct)}～${pct(settings.marginMaxUsagePct)}；当前上限 ${pct(settings.maxMarginUsagePct)}`,
+    `杠杆：${controlModeChinese(settings.leverageMode)}；用户区间 ${n(settings.leverageMin, 0)}x～${n(settings.leverageMax, 0)}x；当前上限 ${n(settings.userMaxLeverage, 1)}x`,
+    `HTX公开产品范围：1x～200x；账户/KYC/仓位档位实际可用上限未知`,
+    `名义仓位：${controlModeChinese(settings.notionalMode)}；权益 ${n(settings.notionalMinMultiple, 1)}～${n(settings.notionalMaxMultiple, 1)} 倍；当前上限 ${n(settings.maxTotalNotionalMultiple, 1)} 倍`,
+    `加仓：${settings.allowPyramiding ? "开启" : "关闭"}；仓位区间 ${settings.positionLimitMin}～${settings.positionLimitMax}；当前最多 ${settings.maxOpenPositions} 仓`,
+    `日损：${controlModeChinese(settings.dailyLossMode)}；区间 ${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}；当前 ${pct(settings.maxDailyLossPct)}`,
+    `连亏：${controlModeChinese(settings.lossStreakMode)}；区间 ${settings.lossStreakMin}～${settings.lossStreakMax}；当前 ${settings.maxConsecutiveLosses} 笔暂停`,
+    "旧数据库保留原值；需要时点“一键启用新版自动区间”，无需逐项修改。",
+    "按钮修改本地 SQLite；回调会编辑本消息，不再每按一次新增一条。"
   ].join("\n");
 }
 
@@ -142,16 +151,16 @@ function riskPanel(settings) {
     text: [
       "⚙️ 风险设置",
       `风险偏好：${riskProfileChinese(settings.riskProfile)}`,
-      `单笔风险：${pct(settings.riskPerTradePct)}`,
-      `总风险：${pct(settings.maxTotalRiskPct)}`,
-      `日损失：${pct(settings.maxDailyLossPct)}`,
-      `连亏暂停：${settings.maxConsecutiveLosses} 笔`
+      `单笔风险：${controlModeChinese(settings.riskMode)} ${pct(settings.riskMinPct)}～${pct(settings.riskMaxPct)}`,
+      `账户总风险：${controlModeChinese(settings.totalRiskMode)} ${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}`,
+      `每日损失：${controlModeChinese(settings.dailyLossMode)} ${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}`,
+      `连亏暂停：${controlModeChinese(settings.lossStreakMode)} ${settings.lossStreakMin}～${settings.lossStreakMax} 笔`,
+      "选择一项后再调最低、最高和手动值；每次点击只刷新当前消息。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "保守", callback_data: "paper:set:riskProfile:CONSERVATIVE" }, { text: "均衡", callback_data: "paper:set:riskProfile:BALANCED" }, { text: "积极", callback_data: "paper:set:riskProfile:AGGRESSIVE" }],
-      [{ text: "单笔0.5%", callback_data: "paper:set:riskPerTradePct:0.005" }, { text: "单笔0.75%", callback_data: "paper:set:riskPerTradePct:0.0075" }, { text: "单笔1%", callback_data: "paper:set:riskPerTradePct:0.01" }],
-      [{ text: "日损1%", callback_data: "paper:set:maxDailyLossPct:0.01" }, { text: "日损2%", callback_data: "paper:set:maxDailyLossPct:0.02" }, { text: "日损3%", callback_data: "paper:set:maxDailyLossPct:0.03" }],
-      [{ text: "连亏1笔暂停", callback_data: "paper:set:maxConsecutiveLosses:1" }, { text: "2笔", callback_data: "paper:set:maxConsecutiveLosses:2" }, { text: "3笔", callback_data: "paper:set:maxConsecutiveLosses:3" }],
+      [{ text: "单笔风险", callback_data: "paper:view:range-risk" }, { text: "总风险", callback_data: "paper:view:range-totalRisk" }],
+      [{ text: "每日损失", callback_data: "paper:view:range-dailyLoss" }, { text: "连亏暂停", callback_data: "paper:view:range-lossStreak" }],
       [{ text: "返回", callback_data: "paper:view:main" }]
     ] }
   };
@@ -161,15 +170,14 @@ function leveragePanel(settings) {
   return {
     text: [
       "🎚 杠杆与保证金设置",
-      `用户最大杠杆：${n(settings.userMaxLeverage, 1)}x`,
-      `保证金使用上限：${pct(settings.maxMarginUsagePct)}`,
-      `总名义仓位：权益的 ${n(settings.maxTotalNotionalMultiple, 1)} 倍`,
-      "实际杠杆由止损、风险、仓位和保证金反推，不会自动用满上限。"
+      `杠杆：${controlModeChinese(settings.leverageMode)}；${n(settings.leverageMin, 0)}x～${n(settings.leverageMax, 0)}x；手动 ${n(settings.leverageManual, 0)}x`,
+      `保证金：${controlModeChinese(settings.marginMode)}；${pct(settings.marginMinUsagePct)}～${pct(settings.marginMaxUsagePct)}；手动 ${pct(settings.marginManualUsagePct)}`,
+      `名义仓位：${controlModeChinese(settings.notionalMode)}；权益 ${n(settings.notionalMinMultiple, 1)}～${n(settings.notionalMaxMultiple, 1)} 倍；手动 ${n(settings.notionalManualMultiple, 1)} 倍`,
+      "公开产品范围1x～200x；账户实际可用上限未知。选择一项进入完整的最低/最高/手动调节。"
     ].join("\n"),
     markup: { inline_keyboard: [
-      [{ text: "上限2x", callback_data: "paper:set:userMaxLeverage:2" }, { text: "上限3x", callback_data: "paper:set:userMaxLeverage:3" }, { text: "上限5x", callback_data: "paper:set:userMaxLeverage:5" }],
-      [{ text: "保证金10%", callback_data: "paper:set:maxMarginUsagePct:0.1" }, { text: "20%", callback_data: "paper:set:maxMarginUsagePct:0.2" }, { text: "30%", callback_data: "paper:set:maxMarginUsagePct:0.3" }],
-      [{ text: "仓位0.5倍", callback_data: "paper:set:maxTotalNotionalMultiple:0.5" }, { text: "1倍", callback_data: "paper:set:maxTotalNotionalMultiple:1" }, { text: "2倍", callback_data: "paper:set:maxTotalNotionalMultiple:2" }],
+      [{ text: "杠杆区间", callback_data: "paper:view:range-leverage" }],
+      [{ text: "保证金区间", callback_data: "paper:view:range-margin" }, { text: "名义仓位区间", callback_data: "paper:view:range-notional" }],
       [{ text: "返回", callback_data: "paper:view:main" }]
     ] }
   };
@@ -180,15 +188,55 @@ function pyramidingPanel(settings) {
     text: [
       "➕ 加仓设置",
       `加仓：${settings.allowPyramiding ? "开启" : "关闭"}`,
-      `最大同时仓位：${settings.maxOpenPositions}`,
-      `组合总风险上限：${pct(settings.maxTotalRiskPct)}`,
-      "开启后仍要求同方向、有利进展、新高质量信号及组合风险/保证金/名义仓位全部通过。"
+      `仓位模式：${controlModeChinese(settings.positionLimitMode)}；${settings.positionLimitMin}～${settings.positionLimitMax}；当前 ${settings.maxOpenPositions}`,
+      `组合总风险：${controlModeChinese(settings.totalRiskMode)}；${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
+      "开启后仍要求同方向、有利进展、新高质量信号及组合风险/保证金/名义仓位全部通过。仓位数量也有完整最低/最高/手动区间。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "关闭加仓", callback_data: "paper:set:allowPyramiding:false" }, { text: "开启加仓", callback_data: "paper:set:allowPyramiding:true" }],
-      [{ text: "最多1仓", callback_data: "paper:set:maxOpenPositions:1" }, { text: "最多2仓", callback_data: "paper:set:maxOpenPositions:2" }, { text: "最多3仓", callback_data: "paper:set:maxOpenPositions:3" }],
-      [{ text: "总风险1%", callback_data: "paper:set:maxTotalRiskPct:0.01" }, { text: "2%", callback_data: "paper:set:maxTotalRiskPct:0.02" }, { text: "3%", callback_data: "paper:set:maxTotalRiskPct:0.03" }],
+      [{ text: "仓位数量区间", callback_data: "paper:view:range-positions" }],
       [{ text: "返回", callback_data: "paper:view:main" }]
+    ] }
+  };
+}
+
+const RANGE_PANEL_META = Object.freeze({
+  risk: Object.freeze({ title: "单笔账户风险", effectiveLabel: "自动可用上限", step: 0.0025, format: pct, back: "risk", note: "自动模式会在区间内按权益、机会质量、波动和已有风险动态选择，并不固定使用最高值。" }),
+  totalRisk: Object.freeze({ title: "账户总风险", effectiveLabel: "当前阈值", step: 0.005, format: pct, back: "risk", note: "这是所有未平仓仓位合计的账户风险边界。" }),
+  dailyLoss: Object.freeze({ title: "每日最大损失", effectiveLabel: "当前阈值", step: 0.005, format: pct, back: "risk", note: "达到本轮采用值后，当天暂停新增模拟仓位。" }),
+  lossStreak: Object.freeze({ title: "连亏暂停笔数", effectiveLabel: "当前阈值", step: 1, format: (value) => `${n(value, 0)} 笔`, back: "risk", note: "达到本轮采用值后，当天暂停新增模拟仓位。" }),
+  leverage: Object.freeze({ title: "用户杠杆限制", effectiveLabel: "当前最高允许", step: 5, format: (value) => `${n(value, 0)}x`, back: "leverage", note: "自动模式只把最高值当上限；实际杠杆由止损、名义仓位和保证金反推，不会自动用满。" }),
+  margin: Object.freeze({ title: "保证金使用比例", effectiveLabel: "当前使用上限", step: 0.05, format: pct, back: "leverage", note: "限制模拟仓位最多占用多少账户权益作为保证金。" }),
+  notional: Object.freeze({ title: "总名义仓位", effectiveLabel: "当前总上限", step: 0.5, format: (value) => `${n(value, 1)} 倍权益`, back: "leverage", note: "杠杆不能让名义仓位突破这里的限制。" }),
+  positions: Object.freeze({ title: "同时仓位数量", effectiveLabel: "当前最多", step: 1, format: (value) => `${n(value, 0)} 仓`, back: "pyramiding", note: "关闭加仓时，无论此处设置如何，实际仍只允许 1 个 BTC 仓位组。" })
+});
+
+function rangeControlPanel(settings, name) {
+  const definition = RANGE_DEFINITIONS[name];
+  const meta = RANGE_PANEL_META[name];
+  if (!definition || !meta) return riskPanel(settings);
+  const format = meta.format;
+  const delta = meta.step;
+  const minus = String(-delta);
+  const plus = String(delta);
+  return {
+    text: [
+      `🎛 ${meta.title}`,
+      `模式：${controlModeChinese(settings[definition.mode])}`,
+      `最低值：${format(settings[definition.minimum])}`,
+      `最高值：${format(settings[definition.maximum])}`,
+      `手动值：${format(settings[definition.manual])}`,
+      `${meta.effectiveLabel}：${format(settings[definition.effective])}`,
+      meta.note,
+      "修改写入 SQLite，下一轮 monitor 生效。"
+    ].join("\n"),
+    markup: { inline_keyboard: [
+      [{ text: settings[definition.mode] === "AUTO" ? "✅ 自动" : "自动", callback_data: `paper:set:${definition.mode}:AUTO` },
+        { text: settings[definition.mode] === "MANUAL" ? "✅ 手动" : "手动", callback_data: `paper:set:${definition.mode}:MANUAL` }],
+      [{ text: `最低 −${format(delta)}`, callback_data: `paper:adj:${definition.minimum}:${minus}` }, { text: `最低 +${format(delta)}`, callback_data: `paper:adj:${definition.minimum}:${plus}` }],
+      [{ text: `最高 −${format(delta)}`, callback_data: `paper:adj:${definition.maximum}:${minus}` }, { text: `最高 +${format(delta)}`, callback_data: `paper:adj:${definition.maximum}:${plus}` }],
+      [{ text: `手动 −${format(delta)}`, callback_data: `paper:adj:${definition.manual}:${minus}` }, { text: `手动 +${format(delta)}`, callback_data: `paper:adj:${definition.manual}:${plus}` }],
+      [{ text: "返回", callback_data: `paper:view:${meta.back}` }]
     ] }
   };
 }
@@ -203,8 +251,28 @@ function recentText(db) {
 
 function parseSettingValue(key, raw) {
   if (["allowPyramiding", "newEntriesPaused"].includes(key)) return raw === "true";
-  if (key === "riskProfile") return raw;
+  if (key === "riskProfile" || Object.values(RANGE_DEFINITIONS).some((definition) => definition.mode === key)) return raw;
   return Number(raw);
+}
+
+function automaticRangePreset() {
+  const patch = {};
+  for (const definition of Object.values(RANGE_DEFINITIONS)) {
+    patch[definition.mode] = "AUTO";
+    patch[definition.minimum] = RUNTIME_SETTINGS_DEFAULTS[definition.minimum];
+    patch[definition.maximum] = RUNTIME_SETTINGS_DEFAULTS[definition.maximum];
+    patch[definition.manual] = RUNTIME_SETTINGS_DEFAULTS[definition.manual];
+  }
+  return patch;
+}
+
+function panelNameForSetting(key) {
+  for (const [name, definition] of Object.entries(RANGE_DEFINITIONS)) {
+    if ([definition.mode, definition.minimum, definition.maximum, definition.manual, definition.effective].includes(key)) return `range-${name}`;
+  }
+  if (key === "riskProfile") return "risk";
+  if (/position|Pyramiding/i.test(key)) return "pyramiding";
+  return "main";
 }
 
 export class TelegramControlPanel {
@@ -214,6 +282,7 @@ export class TelegramControlPanel {
     logger = (message) => process.stderr.write(`${message}\n`),
     getUpdates = getTelegramUpdates,
     send = sendTelegramMessage,
+    edit = editTelegramMessage,
     answer = answerTelegramCallback
   } = {}) {
     this.db = db;
@@ -222,6 +291,7 @@ export class TelegramControlPanel {
     this.logger = logger;
     this.getUpdates = getUpdates;
     this.send = send;
+    this.edit = edit;
     this.answer = answer;
     this.timer = null;
     this.polling = false;
@@ -234,30 +304,67 @@ export class TelegramControlPanel {
     return this.send(text, { config: this.config, fetchImpl: this.fetchImpl, replyMarkup });
   }
 
+  async editView(messageId, text, replyMarkup = MAIN_BUTTONS) {
+    const result = await this.edit(messageId, text, {
+      config: this.config,
+      fetchImpl: this.fetchImpl,
+      replyMarkup
+    });
+    if (!result.ok) this.logger(`Telegram panel edit failed safely: ${result.error}`);
+    return result;
+  }
+
   view(name) {
     const settings = this.db.getRuntimeSettings();
-    if (name === "positions") return { text: positionText(this.db), markup: MAIN_BUTTONS };
-    if (name === "decision") return { text: decisionText(this.db), markup: MAIN_BUTTONS };
-    if (name === "details") return { text: detailedAnalysisText(this.db), markup: MAIN_BUTTONS };
-    if (name === "research") return { text: researchText(this.db), markup: MAIN_BUTTONS };
-    if (name === "account") return { text: accountText(this.db), markup: MAIN_BUTTONS };
-    if (name === "today") return { text: todayText(this.db), markup: MAIN_BUTTONS };
+    const main = mainButtons(settings);
+    if (name === "positions") return { text: positionText(this.db), markup: main };
+    if (name === "decision") return { text: decisionText(this.db), markup: main };
+    if (name === "details") return { text: detailedAnalysisText(this.db), markup: main };
+    if (name === "research") return { text: researchText(this.db), markup: main };
+    if (name === "account") return { text: accountText(this.db), markup: main };
+    if (name === "today") return { text: todayText(this.db), markup: main };
     if (name === "risk") return riskPanel(settings);
     if (name === "leverage") return leveragePanel(settings);
     if (name === "pyramiding") return pyramidingPanel(settings);
-    if (name === "recent") return { text: recentText(this.db), markup: MAIN_BUTTONS };
-    return { text: settingsText(settings), markup: MAIN_BUTTONS };
+    if (name.startsWith("range-")) return rangeControlPanel(settings, name.slice("range-".length));
+    if (name === "recent") return { text: recentText(this.db), markup: main };
+    return { text: settingsText(settings), markup: main };
   }
 
   async applySetting(key, rawValue, updateId) {
     const value = parseSettingValue(key, rawValue);
     const current = this.db.getRuntimeSettings();
     const patch = { [key]: value };
+    const range = Object.values(RANGE_DEFINITIONS).find((definition) => definition.minimum === key || definition.maximum === key);
+    if (range?.minimum === key) {
+      if (value > Number(current[range.maximum])) throw new Error("最低值不能高于最高值");
+      if (value > Number(current[range.manual])) patch[range.manual] = value;
+    }
+    if (range?.maximum === key) {
+      if (value < Number(current[range.minimum])) throw new Error("最高值不能低于最低值");
+      if (value < Number(current[range.manual])) patch[range.manual] = value;
+    }
     if (key === "allowPyramiding" && value === false && current.maxOpenPositions !== 1) patch.maxOpenPositions = 1;
     if (key === "maxOpenPositions" && value > 1 && !current.allowPyramiding) {
       throw new Error("请先开启加仓，再提高最大仓位数");
     }
     return this.db.updateRuntimeSettings(patch, {
+      source: "TELEGRAM_ADMIN_CHAT",
+      sourceEventId: `telegram:${updateId}`
+    });
+  }
+
+  async adjustSetting(key, rawDelta, updateId) {
+    const current = this.db.getRuntimeSettings();
+    if (!(key in current)) throw new Error(`未知参数：${key}`);
+    const delta = Number(rawDelta);
+    if (!Number.isFinite(delta)) throw new Error("调整步长必须是数字");
+    const next = Number((Number(current[key]) + delta).toFixed(8));
+    return this.applySetting(key, String(next), updateId);
+  }
+
+  applyAutomaticRangePreset(updateId) {
+    return this.db.updateRuntimeSettings(automaticRangePreset(), {
       source: "TELEGRAM_ADMIN_CHAT",
       sourceEventId: `telegram:${updateId}`
     });
@@ -278,21 +385,38 @@ export class TelegramControlPanel {
         if (parts[0] !== "paper") throw new Error("不支持的按钮");
         if (parts[1] === "view") {
           const view = this.view(parts[2]);
-          await this.sendView(view.text, view.markup);
+          await this.editView(callback.message.message_id, view.text, view.markup);
           await this.answer(callback.id, "已刷新", { config: this.config, fetchImpl: this.fetchImpl });
         } else if (parts[1] === "set") {
-          const result = await this.applySetting(parts[2], parts[3], update.update_id);
-          await this.sendView(`✅ 设置已保存，下一轮 monitor 生效。\n\n${settingsText(result.settings)}`, MAIN_BUTTONS);
+          await this.applySetting(parts[2], parts[3], update.update_id);
+          const view = this.view(panelNameForSetting(parts[2]));
+          await this.editView(callback.message.message_id, view.text, view.markup);
+          await this.answer(callback.id, "已保存；下一轮生效", { config: this.config, fetchImpl: this.fetchImpl });
+        } else if (parts[1] === "adj") {
+          await this.adjustSetting(parts[2], parts[3], update.update_id);
+          const view = this.view(panelNameForSetting(parts[2]));
+          await this.editView(callback.message.message_id, view.text, view.markup);
           await this.answer(callback.id, "设置已保存", { config: this.config, fetchImpl: this.fetchImpl });
+        } else if (parts[1] === "preset" && parts[2] === "autoRanges") {
+          await this.applyAutomaticRangePreset(update.update_id);
+          const view = this.view("main");
+          await this.editView(callback.message.message_id, view.text, view.markup);
+          await this.answer(callback.id, "新版自动区间已启用；下一轮生效", { config: this.config, fetchImpl: this.fetchImpl });
         } else throw new Error("不支持的按钮");
       } else {
         const text = String(message?.text ?? "").trim();
         if (["/start", "/paper", "/panel", "/status"].includes(text)) {
-          await this.sendView(settingsText(this.db.getRuntimeSettings()), MAIN_BUTTONS);
+          const view = this.view("main");
+          await this.sendView(view.text, view.markup);
         } else if (["/pause", "/resume"].includes(text)) {
           const paused = text === "/pause";
           const result = await this.applySetting("newEntriesPaused", String(paused), update.update_id);
-          await this.sendView(`✅ 已${paused ? "暂停" : "恢复"}新开仓。\n\n${settingsText(result.settings)}`, MAIN_BUTTONS);
+          await this.sendView(`✅ 已${paused ? "暂停" : "恢复"}新开仓。\n\n${settingsText(result.settings)}`, mainButtons(result.settings));
+        } else if (text.startsWith("/set ")) {
+          const [, key, rawValue] = text.split(/\s+/, 3);
+          if (!key || rawValue === undefined) throw new Error("格式：/set 参数 值，例如 /set leverageMax 100");
+          const result = await this.applySetting(key, rawValue, update.update_id);
+          await this.sendView(`✅ ${key} 已更新。\n\n${settingsText(result.settings)}`, mainButtons(result.settings));
         }
       }
     } catch (error) {

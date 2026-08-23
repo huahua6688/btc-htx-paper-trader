@@ -21,6 +21,7 @@ import { manageOpenPosition } from "./position-manager.mjs";
 import { buildPointInTimeMarket, firstReplayableIndex } from "./replay-market.mjs";
 import { BAR_MS, hashObject, mean, round, standardDeviation } from "./research-utils.mjs";
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
+import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
   signalClock: "decision at completed 15m candle close",
@@ -120,6 +121,8 @@ function buildReport(strategy, market, parameters, config) {
       ? analyzeHistoricalCompatible(market, parameters, config)
       : strategy === "tradable-edge"
         ? analyzeTradableEdge(market, parameters, config)
+        : strategy === "anti-chase"
+          ? analyzeAntiChaseChallenger(market, parameters, config)
       : analyzeChallenger(market, parameters, config);
   const candle = market.replay.eventCandle;
   report.latest15mBar = {
@@ -241,6 +244,10 @@ function tradePathContext(db, dataset, trades) {
       marketRegime: entryReport.strategy?.marketRegime ?? "UNKNOWN",
       opportunityScore: Number(trade.opportunity_score ?? entryReport.opportunities?.[side]?.score ?? 0),
       featureSet: entryReport.featureSet ?? entryReport.strategy?.featureSet ?? "LEGACY_CHALLENGER",
+      entryExtensionAtr: Number(entryReport.entryQuality?.extensionAtr),
+      entryImpulseAtr: Number(entryReport.entryQuality?.impulseAtr),
+      entryRangePositionPct: Number(entryReport.entryQuality?.rangePositionPct),
+      entryNetRemainingRoomPct: Number(entryReport.entryQuality?.netRemainingRoomPct),
       entryPrice: entry,
       exitPrice: Number(trade.exit_price),
       notionalCny,
@@ -274,8 +281,9 @@ export async function runHistoricalReplay(dataset, {
   collectTrace = true,
   forceCloseAtEnd = true
 } = {}) {
-  if (!["champion", "challenger", "historical-compatible", "tradable-edge"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
+  if (!["champion", "challenger", "historical-compatible", "tradable-edge", "anti-chase"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
   if (strategy === "historical-compatible" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = HISTORICAL_COMPATIBLE_PARAMETERS;
+  if (strategy === "anti-chase" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = ANTI_CHASE_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
   const warmupIndex = firstReplayableIndex(dataset.candles);
@@ -309,6 +317,8 @@ export async function runHistoricalReplay(dataset, {
   try {
     for (let index = firstIndex; index <= lastIndex; index += eventStride) {
       const candle = dataset.candles[index];
+      // Anti-Chase consumes raw 15m/1h geometry on every event and therefore
+      // cannot use the 12-row summary-cache shortcut.
       const compactCachedFrame = ["challenger", "historical-compatible", "tradable-edge"].includes(strategy)
         && hasChallengerFrameCache(candle.timestamp + BAR_MS, candle.close);
       const market = buildPointInTimeMarket(dataset.candles, dataset.funding, index, { maximumBars: compactCachedFrame ? 12 : 260 });
@@ -336,6 +346,7 @@ export async function runHistoricalReplay(dataset, {
         shortScore: report.scores.shortOpportunity,
         opportunityIndex: report.opportunityIndex ?? null,
         tradableEdge: report.tradableEdge ?? null,
+        entryQuality: report.entryQuality ?? null,
         regime: report.strategy.marketRegime,
         validForEntry: report.dataQuality.validForEntry,
         riskGates: report.riskGates

@@ -5,7 +5,7 @@ import {
   getDailyRiskState
 } from "./paper-engine.mjs";
 import { PAPER_ASSUMPTIONS, PAPER_EXCHANGE_CONSTRAINTS } from "./config.mjs";
-import { riskProfileChinese } from "./runtime-settings.mjs";
+import { controlModeChinese, riskProfileChinese } from "./runtime-settings.mjs";
 
 const n = (value, digits = 2) => value !== null && value !== undefined && Number.isFinite(Number(value))
   ? Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })
@@ -107,9 +107,14 @@ export function formatStatus(db) {
   lines.push(
     "",
     "运行时设置（SQLite 持久化）",
-    `配置版本 ${settings.revision} / 风险偏好 ${riskProfileChinese(settings.riskProfile)} / 单笔 ${pct(settings.riskPerTradePct)} / 总风险 ${pct(settings.maxTotalRiskPct)}`,
-    `保证金上限 ${pct(settings.maxMarginUsagePct)} / 用户杠杆上限 ${n(settings.userMaxLeverage, 1)}x / 总名义上限 ${n(settings.maxTotalNotionalMultiple, 1)}倍权益`,
-    `加仓 ${settings.allowPyramiding ? "开启" : "关闭"} / 最多 ${settings.maxOpenPositions} 仓 / 新开仓 ${settings.newEntriesPaused ? "手动暂停" : "未手动暂停"}`,
+    `配置版本 ${settings.revision} / 风险偏好 ${riskProfileChinese(settings.riskProfile)}`,
+    `单笔风险 ${controlModeChinese(settings.riskMode)}：${pct(settings.riskMinPct)}～${pct(settings.riskMaxPct)}；当前限制 ${pct(settings.riskPerTradePct)}`,
+    `总风险 ${controlModeChinese(settings.totalRiskMode)}：${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
+    `保证金 ${controlModeChinese(settings.marginMode)}：${pct(settings.marginMinUsagePct)}～${pct(settings.marginMaxUsagePct)}；当前上限 ${pct(settings.maxMarginUsagePct)}`,
+    `杠杆 ${controlModeChinese(settings.leverageMode)}：${n(settings.leverageMin, 0)}x～${n(settings.leverageMax, 0)}x；当前上限 ${n(settings.userMaxLeverage, 1)}x（账户实际可用上限未知）`,
+    `名义仓位 ${controlModeChinese(settings.notionalMode)}：${n(settings.notionalMinMultiple, 1)}～${n(settings.notionalMaxMultiple, 1)}倍权益；当前上限 ${n(settings.maxTotalNotionalMultiple, 1)}倍`,
+    `加仓 ${settings.allowPyramiding ? "开启" : "关闭"} / 仓位区间 ${settings.positionLimitMin}～${settings.positionLimitMax} / 当前最多 ${settings.maxOpenPositions} 仓 / 新开仓 ${settings.newEntriesPaused ? "手动暂停" : "未手动暂停"}`,
+    `日损 ${controlModeChinese(settings.dailyLossMode)}：${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}；当前 ${pct(settings.maxDailyLossPct)} / 连亏当前 ${settings.maxConsecutiveLosses} 笔暂停`,
     `交易所约束来源：${PAPER_EXCHANGE_CONSTRAINTS.source}；${PAPER_EXCHANGE_CONSTRAINTS.note}`,
     "",
     "多层市场环境 / Feature Registry",
