@@ -15,7 +15,8 @@ const RULES = Object.freeze({
   "futures-market": Object.freeze({
     "detail-merged": ["contract_code"],
     "kline": ["contract_code", "period", "size"],
-    "depth": ["contract_code", "type"]
+    "depth": ["contract_code", "type"],
+    "query-elements": ["contract_code"]
   }),
   "funding-rate": Object.freeze({
     "current": ["contract_code"],

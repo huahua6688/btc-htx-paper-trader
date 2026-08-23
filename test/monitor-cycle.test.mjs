@@ -26,8 +26,9 @@ test("monitor cycle stores decisions, opens a paper position, then closes it at 
       analyze: (value) => value,
       now: () => "2026-08-21T01:15:01.000Z"
     });
-    assert.equal(second.actions[0].type, "CLOSE");
-    assert.equal(second.actions[0].exit.exitReason, "TP");
+    const closeAction = second.actions.find((action) => action.type === "CLOSE");
+    assert.ok(closeAction, "本轮应在持仓管理后触发止盈平仓");
+    assert.equal(closeAction.exit.exitReason, "TP");
     assert.equal(db.getOpenPosition(), null);
     assert.equal(db.countSnapshots(), 2);
     assert.equal(db.getLatestMonitorRun().status, "OK");
@@ -97,6 +98,57 @@ test("monitor failure is recorded and fails safely", async () => {
     }), /public feed unavailable/);
     assert.equal(db.getLatestMonitorRun().status, "ERROR");
     assert.equal(db.getOpenPosition(), null);
+  } finally {
+    db.close();
+  }
+});
+
+test("stale core price never triggers stop, target, management or a new position", async () => {
+  const db = new PaperDatabase(":memory:");
+  try {
+    const opening = paperReport({ generatedAt: "2026-08-21T00:30:00.000Z" });
+    const opened = await runMonitorCycle(db, {
+      collect: async () => opening,
+      analyze: (value) => value,
+      now: () => opening.generatedAt
+    });
+    assert.ok(opened.actions.some((item) => item.type === "OPEN"));
+    const stale = paperReport({
+      generatedAt: "2026-08-21T02:00:00.000Z",
+      currentPrice: 80,
+      latest15mBar: { timestamp: new Date("2026-08-21T01:00:00.000Z").getTime(), open: 100, high: 120, low: 70, close: 80 },
+      completed15mBar: { timestamp: new Date("2026-08-21T00:45:00.000Z").getTime(), open: 100, high: 120, low: 70, close: 80 }
+    });
+    const result = await runMonitorCycle(db, {
+      collect: async () => stale,
+      analyze: (value) => value,
+      now: () => stale.generatedAt
+    });
+    assert.equal(db.getOpenPositions().length, 1);
+    assert.equal(result.actions.some((item) => item.type === "CLOSE"), false);
+    assert.equal(result.actions.some((item) => item.type === "OPEN"), false);
+    assert.ok(result.actions.some((item) => item.type === "POSITION_HELD" && item.management.dataSafe === false));
+  } finally {
+    db.close();
+  }
+});
+
+test("a Telegram-style settings update between sizing and insert atomically cancels the entry", async () => {
+  const db = new PaperDatabase(":memory:");
+  try {
+    const originalOpen = db.openPosition.bind(db);
+    db.openPosition = (candidate, snapshotId, options) => {
+      db.updateRuntimeSettings({ riskProfile: "CONSERVATIVE" }, { source: "TELEGRAM_ADMIN_CHAT", sourceEventId: "telegram:race" });
+      return originalOpen(candidate, snapshotId, options);
+    };
+    const report = paperReport();
+    const result = await runMonitorCycle(db, {
+      collect: async () => report,
+      analyze: (value) => value,
+      now: () => report.generatedAt
+    });
+    assert.equal(db.getOpenPosition(), null);
+    assert.ok(result.actions.some((item) => item.type === "NO_ENTRY" && item.reasons.join(" ").includes("设置版本已变化")));
   } finally {
     db.close();
   }

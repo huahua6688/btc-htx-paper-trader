@@ -2,7 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { HEALTH_CONFIG, PAPER_CONFIG, TELEGRAM_CONFIG } from "../src/config.mjs";
+import {
+  HEALTH_CONFIG,
+  PAPER_CONFIG,
+  PAPER_EXCHANGE_CONSTRAINTS,
+  RUNTIME_SETTINGS_DEFAULTS,
+  TELEGRAM_CONFIG,
+  resolveDatabaseLocation
+} from "../src/config.mjs";
 import { resolveCliPath } from "../src/htx-cli.mjs";
 
 test("V1.2 risk, scheduling and dynamic opportunity defaults match the specification", () => {
@@ -14,6 +21,7 @@ test("V1.2 risk, scheduling and dynamic opportunity defaults match the specifica
   assert.equal(PAPER_CONFIG.maxDailyLossPct, 0.03);
   assert.equal(PAPER_CONFIG.maxConsecutiveLosses, 3);
   assert.equal(PAPER_CONFIG.minimumRiskReward, 2);
+  assert.equal(PAPER_CONFIG.slippageRate, 0.0002);
   assert.equal(PAPER_CONFIG.extremePressureMin, 76);
   assert.equal(PAPER_CONFIG.minimumBiasScore, 60);
   assert.equal(PAPER_CONFIG.minimumImmediateEntryScore, 67);
@@ -22,7 +30,23 @@ test("V1.2 risk, scheduling and dynamic opportunity defaults match the specifica
   assert.equal(TELEGRAM_CONFIG.apiBaseUrl, "https://api.telegram.org");
   assert.equal(TELEGRAM_CONFIG.dailySummaryHour, 23);
   assert.equal(TELEGRAM_CONFIG.dailySummaryMinute, 55);
+  assert.equal(TELEGRAM_CONFIG.controlPollIntervalMs, 5_000);
+  assert.equal(RUNTIME_SETTINGS_DEFAULTS.allowPyramiding, false);
+  assert.equal(RUNTIME_SETTINGS_DEFAULTS.userMaxLeverage, 5);
+  assert.equal(PAPER_EXCHANGE_CONSTRAINTS.maxLeverage, 20);
+  assert.equal(PAPER_EXCHANGE_CONSTRAINTS.liquidationFormulaAvailable, false);
   assert.equal(Object.isFrozen(PAPER_CONFIG), true);
+});
+
+test("database path resolution is explicit and consistent for monitor, status and report", () => {
+  const cli = resolveDatabaseLocation({ argv: ["node", "status", "--db=./explicit.sqlite"], environment: {}, platform: "win32", pathExists: () => false });
+  assert.equal(cli.source, "--db");
+  assert.match(cli.path, /explicit\.sqlite$/);
+  const env = resolveDatabaseLocation({ argv: [], environment: { PAPER_DB_PATH: "./env.sqlite" }, platform: "linux", pathExists: () => true });
+  assert.equal(env.source, "PAPER_DB_PATH");
+  assert.match(env.path, /env\.sqlite$/);
+  const vps = resolveDatabaseLocation({ argv: [], environment: {}, platform: "linux", pathExists: (path) => path === "/var/lib/btc-htx-paper/paper-trading.sqlite" });
+  assert.deepEqual(vps, { path: "/var/lib/btc-htx-paper/paper-trading.sqlite", source: "VPS_PERSISTENT_DEFAULT" });
 });
 
 test("npm exposes monitor, status, report, tests, and the safety check", () => {

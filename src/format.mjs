@@ -13,7 +13,7 @@ export function formatChinese(report) {
     ...(report.decision === "WAIT" && report.candidateDecision !== "WAIT"
       ? [`当前方向偏好：${report.candidateDecision}，但尚不适合入场`]
       : []),
-    `置信度：${report.confidencePct}%`,
+    `${report.opportunityIndex != null ? "机会指数" : "方向强度指数"}：${report.opportunityIndex ?? report.confidencePct}/100（排序指标，不是成功概率）`,
     `双向机会分：做多 ${report.opportunities?.LONG?.score ?? "—"} / 做空 ${report.opportunities?.SHORT?.score ?? "—"}`,
     `市场状态：${report.strategy?.marketRegime ?? "—"}`,
     "",

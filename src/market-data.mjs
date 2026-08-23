@@ -16,8 +16,11 @@ export const MARKET_TASKS = Object.freeze([
   ["liquidations", "liquidation-stream", "recent", { contract: "BTC-USDT" }],
   ["markPrice", "mark-price", "mark-price-kline", { contract_code: "BTC-USDT", period: "60min", size: 24 }],
   ["premium", "mark-price", "premium-kline", { contract_code: "BTC-USDT", period: "60min", size: 24 }],
-  ["basis", "mark-price", "basis", { contract_code: "BTC-USDT", period: "60min", basis_price_type: "close", size: 24 }]
+  ["basis", "mark-price", "basis", { contract_code: "BTC-USDT", period: "60min", basis_price_type: "close", size: 24 }],
+  ["contractElements", "futures-market", "query-elements", { contract_code: "BTC-USDT" }]
 ]);
+
+export const CORE_MARKET_TASK_KEYS = Object.freeze(new Set(["ticker", "kline15m", "kline1h", "kline4h", "kline1d"]));
 
 export async function collectMarketSnapshot({ concurrency = 3, runner = runPublicCommand } = {}) {
   const output = {};
@@ -27,7 +30,14 @@ export async function collectMarketSnapshot({ concurrency = 3, runner = runPubli
       const task = MARKET_TASKS[cursor];
       cursor += 1;
       const [key, skill, subcommand, params] = task;
-      output[key] = await runner(skill, subcommand, params);
+      try {
+        output[key] = await runner(skill, subcommand, params);
+      } catch (error) {
+        if (CORE_MARKET_TASK_KEYS.has(key)) throw error;
+        output[key] = null;
+        output.collectionWarnings ??= [];
+        output.collectionWarnings.push(`${key}: ${error.message}`);
+      }
     }
   });
   await Promise.all(workers);

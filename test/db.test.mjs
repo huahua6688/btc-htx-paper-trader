@@ -40,7 +40,7 @@ test("SQLite enforces one open paper position", () => {
   try {
     const snapshotId = db.insertSnapshot(paperReport());
     db.openPosition(directCandidate(), snapshotId);
-    assert.throws(() => db.openPosition(directCandidate(), snapshotId), /already open/);
+    assert.throws(() => db.openPosition(directCandidate(), snapshotId), /已有模拟仓位|already open/);
   } finally {
     db.close();
   }

@@ -1,6 +1,6 @@
 import { TELEGRAM_CONFIG } from "./config.mjs";
 import { NotificationStateStore } from "./notification-state.mjs";
-import { calculatePerformance, getDailyRiskState } from "./paper-engine.mjs";
+import { calculateAccountState, calculatePerformance, getDailyRiskState } from "./paper-engine.mjs";
 import { sendTelegramMessage, telegramEnabled } from "./telegram-client.mjs";
 import {
   formatCloseTelegram,
@@ -86,6 +86,7 @@ export class TelegramNotifier {
       performance: calculatePerformance(db),
       dailyRisk: getDailyRiskState(db, result.report.generatedAt),
       openPosition: db.getOpenPosition(),
+      accountState: calculateAccountState(db, result.report.currentPrice),
       generatedAt: result.report.generatedAt
     });
     const sent = await this.sendSafely("daily-summary", text);
@@ -96,10 +97,10 @@ export class TelegramNotifier {
     if (!this.enabled) return;
     try {
       for (const action of result.actions) {
-        if (action.type === "OPEN") {
+        if (["OPEN", "ADD_POSITION"].includes(action.type)) {
           await this.sendSafely(action.position.side === "LONG" ? "paper-long" : "paper-short", formatOpenTelegram(action.position));
         } else if (action.type === "CLOSE") {
-          await this.sendSafely(action.exit.exitReason === "TP" ? "paper-tp" : "paper-sl", formatCloseTelegram(action.position));
+          await this.sendSafely(["TP", "EARLY_PROFIT"].includes(action.exit.exitReason) ? "paper-tp" : "paper-sl", formatCloseTelegram(action.position, action.exit));
         } else if (action.type === "NO_ENTRY" && action.dailyRisk?.paused) {
           await this.notifyRiskPause(action.dailyRisk);
         }

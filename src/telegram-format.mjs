@@ -1,37 +1,80 @@
-const number = (value, digits = 2) => Number.isFinite(Number(value))
+const number = (value, digits = 2) => value !== null && value !== undefined && Number.isFinite(Number(value))
   ? Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })
   : "—";
 const profitFactor = (value) => value === Infinity ? "∞" : value === null ? "—" : number(value, 2);
+const pct = (value, digits = 2) => value === null || value === undefined ? "—" : `${number(Number(value) * 100, digits)}%`;
+
+function durationText(openedAt, closedAt) {
+  const milliseconds = new Date(closedAt).getTime() - new Date(openedAt).getTime();
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
+  const minutes = Math.round(milliseconds / 60_000);
+  if (minutes < 60) return `${minutes} 分钟`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+}
+
+function closeReason(position, exit) {
+  if (exit?.managementReason) return exit.managementReason;
+  const labels = {
+    TP: "价格触及模拟止盈",
+    SL: "价格触及模拟止损",
+    LIQUIDATION: "价格触及 Paper 估算强平区域",
+    EARLY_PROFIT: "市场结构明显变化，提前保护利润",
+    SIGNAL_INVALIDATED: "原开仓逻辑连续确认失效，提前控制亏损"
+  };
+  return labels[position.exit_reason] ?? position.exit_reason ?? "模拟仓位结束";
+}
 
 export function formatOpenTelegram(position) {
   const long = position.side === "LONG";
+  const portfolio = position.portfolioAfter ?? {};
+  const costs = Number(position.fee_estimate_cny ?? 0)
+    + Number(position.funding_estimate_cny ?? 0)
+    + Number(position.slippage_estimate_cny ?? 0);
   return [
-    `${long ? "🟢 模拟开多" : "🔴 模拟开空"} #${position.id}`,
-    `时间：${position.opened_at}`,
-    `Entry：${number(position.entry_price, 1)} USDT`,
-    `Stop Loss：${number(position.stop_loss, 1)} USDT`,
-    `Take Profit：${number(position.take_profit, 1)} USDT`,
-    `净 RR：${number(position.rr, 2)}`,
-    `数量：${number(position.quantity_btc, 8)} BTC`,
-    `最大风险：${number(position.risk_cny)} CNY`,
-    "开仓理由：",
+    `${long ? "🟢 模拟开多" : "🔴 模拟开空"}`,
+    `BTC 当前价格：${number(position.signal_entry_price ?? position.entry_price, 1)} USDT`,
+    `方向：${long ? "做多" : "做空"}；机会评分 ${number(position.opportunity_score, 1)}`,
+    `账户权益：${number(position.account_equity_cny)} CNY`,
+    `本次保证金：${number(position.margin_cny)} CNY（账户 ${pct(position.margin_usage_pct)}）`,
+    `本次实际杠杆：${number(position.leverage, 2)}x`,
+    `名义仓位：${number(position.notional_cny)} CNY`,
+    `BTC 数量：${number(position.quantity_btc, 8)}`,
+    `模拟入场：${number(position.entry_price, 1)} USDT`,
+    `止损：${number(position.stop_loss, 1)} USDT（${number(position.stop_distance_pct, 2)}%）`,
+    `止盈：${number(position.take_profit, 1)} USDT（${number(position.take_profit_distance_pct, 2)}%）`,
+    `净 RR：1 : ${number(position.net_rr ?? position.rr, 2)}`,
+    `预计止损亏损：${number(position.expected_loss_cny ?? position.risk_cny)} CNY（账户 ${pct(position.risk_pct)}）`,
+    `预计止盈盈利：${number(position.expected_profit_cny)} CNY`,
+    `预计手续费 / Funding / 滑点：${number(position.fee_estimate_cny)} / ${number(position.funding_estimate_cny, 4)} / ${number(position.slippage_estimate_cny, 4)} CNY`,
+    `预计总成本：${number(costs, 4)} CNY`,
+    `当前组合总风险：${number(portfolio.totalRiskCny ?? position.expected_loss_cny)} CNY（${pct(portfolio.totalRiskPct ?? position.risk_pct)}）`,
+    `Paper 估算强平：${number(position.liquidation_price_estimate, 1)} USDT（距离 ${number(position.liquidation_distance_pct, 2)}%，非 HTX 实际强平价）`,
+    "开仓原因：",
     ...(position.openingReasons?.length ? position.openingReasons.slice(0, 5).map((item) => `- ${item}`) : ["- 无"]),
-    "模式：Paper Trading；不会真实下单。"
+    "仅为 Paper Trading；不会真实下单。"
   ].join("\n");
 }
 
-export function formatCloseTelegram(position) {
-  const takeProfit = position.exit_reason === "TP";
+export function formatCloseTelegram(position, exit = null) {
+  const takeProfit = ["TP", "EARLY_PROFIT"].includes(position.exit_reason);
   const fees = Number(position.entry_fee_cny) + Number(position.exit_fee_cny);
+  const slippage = Number(position.entry_slippage_cny ?? 0) + Number(position.exit_slippage_cny ?? 0);
+  const returnPct = Number(position.account_equity_cny) > 0
+    ? Number(position.net_pnl_cny) / Number(position.account_equity_cny)
+    : null;
   return [
-    `${takeProfit ? "✅ 模拟止盈" : "🛑 模拟止损"} #${position.id} ${position.side}`,
-    `时间：${position.closed_at}`,
-    `Entry / Exit：${number(position.entry_price, 1)} / ${number(position.exit_price, 1)} USDT`,
+    `${takeProfit ? "✅ 模拟平仓（盈利）" : "🛑 模拟平仓（风险控制）"} #${position.id}`,
+    `平仓原因：${closeReason(position, exit)}`,
+    `入场价：${number(position.entry_price, 1)} USDT`,
+    `平仓价：${number(position.exit_price, 1)} USDT`,
+    `持仓时间：${durationText(position.opened_at, position.closed_at)}`,
     `毛收益：${number(position.gross_pnl_cny)} CNY`,
     `手续费：-${number(fees)} CNY`,
+    `滑点成本：-${number(slippage, 4)} CNY`,
     `Funding：${number(position.funding_cny, 4)} CNY`,
     `净收益：${number(position.net_pnl_cny)} CNY`,
-    "模式：Paper Trading；不会真实下单。"
+    `本次账户收益率：${returnPct === null ? "—" : pct(returnPct)}`,
+    "仅为 Paper Trading；不会真实下单。"
   ].join("\n");
 }
 
@@ -44,7 +87,7 @@ export function formatRiskPauseTelegram(dailyRisk) {
     `连续亏损：${dailyRisk.consecutiveLosses} 笔`,
     "原因：",
     ...dailyRisk.pauseReasons.map((item) => `- ${item}`),
-    "现有模拟仓位仍按原 SL/TP 管理；不会真实下单。"
+    "现有模拟仓位仍由动态仓位管理继续控制；不会真实下单。"
   ].join("\n");
 }
 
@@ -55,7 +98,7 @@ export function formatHealthTelegram(result, recovered = false) {
       `时间：${result.checkedAt}`,
       `最近 monitor：${result.monitor?.status ?? "UNKNOWN"}`,
       `快照数：${result.snapshot?.count ?? "—"}`,
-      "Telegram 和健康检查不会改变 Paper Trading 逻辑。"
+      "Telegram 和健康检查不会改变市场方向逻辑。"
     ].join("\n");
   }
   return [
@@ -68,11 +111,11 @@ export function formatHealthTelegram(result, recovered = false) {
   ].join("\n");
 }
 
-export function formatDailySummaryTelegram({ performance, dailyRisk, openPosition, generatedAt }) {
+export function formatDailySummaryTelegram({ performance, dailyRisk, openPosition, generatedAt, accountState = null }) {
   return [
     "📊 BTC/USDT Paper Trading 每日汇总",
     `时间：${generatedAt}`,
-    `当前模拟资金：${number(performance.cashCny)} CNY`,
+    `当前模拟资金/权益：${number(accountState?.equityCny ?? performance.cashCny)} CNY`,
     `今日盈亏：${number(dailyRisk.dailyPnlCny)} CNY`,
     `累计盈亏：${number(performance.cumulativePnlCny)} CNY（${number(performance.cumulativeReturnPct)}%）`,
     `总交易次数：${performance.totalTrades}`,
