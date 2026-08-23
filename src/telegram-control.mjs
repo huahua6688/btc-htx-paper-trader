@@ -1,5 +1,5 @@
 import { RUNTIME_SETTINGS_DEFAULTS, TELEGRAM_CONFIG } from "./config.mjs";
-import { calculateAccountState, calculatePerformance, getDailyRiskState } from "./paper-engine.mjs";
+import { calculateAccountState, calculatePerformance, calculateUnrealized, getDailyRiskState } from "./paper-engine.mjs";
 import { controlModeChinese, RANGE_DEFINITIONS, riskProfileChinese } from "./runtime-settings.mjs";
 import {
   answerTelegramCallback,
@@ -17,10 +17,15 @@ const pct = (value, digits = 2) => value === null || value === undefined ? "—"
 function mainButtons(settings = { newEntriesPaused: false }) {
   return { inline_keyboard: [
     [{ text: "📊 当前仓位", callback_data: "paper:view:positions" }, { text: "🧠 当前判断", callback_data: "paper:view:decision" }],
-    [{ text: "🔬 详细分析", callback_data: "paper:view:details" }, { text: "🧪 研究页面", callback_data: "paper:view:research" }],
+    [{ text: "🔬 详细分析", callback_data: "paper:view:details" }, { text: "🧪 Feature Registry", callback_data: "paper:view:research" }],
     [{ text: "💰 账户状态", callback_data: "paper:view:account" }, { text: "📈 今日表现", callback_data: "paper:view:today" }],
-    [{ text: "⚙️ 风险设置", callback_data: "paper:view:risk" }, { text: "🎚 杠杆设置", callback_data: "paper:view:leverage" }],
+    [{ text: "⚙️ 风险", callback_data: "paper:view:risk" }, { text: "🎚 杠杆", callback_data: "paper:view:leverage" }, { text: "💵 保证金", callback_data: "paper:view:margin" }],
     [{ text: "➕ 加仓设置", callback_data: "paper:view:pyramiding" }, { text: "📋 最近交易", callback_data: "paper:view:recent" }],
+    [{ text: "🔄 持仓模式", callback_data: "paper:view:position-mode" }],
+    [{ text: "⏱ 交易周期", callback_data: "paper:view:cycle" }, { text: "📐 指标 Profile", callback_data: "paper:view:profile" }],
+    [{ text: "🧠 Strategy Learning", callback_data: "paper:view:learning" }, { text: "👑 Champion", callback_data: "paper:view:champion" }],
+    [{ text: "👥 Challenger / Shadow", callback_data: "paper:view:shadow" }],
+    [{ text: "📊 Historical Similarity", callback_data: "paper:view:similarity" }, { text: "📚 Research Results", callback_data: "paper:view:results" }],
     [{ text: "✨ 一键启用新版自动区间", callback_data: "paper:preset:autoRanges" }],
     [settings.newEntriesPaused
       ? { text: "▶️ 取消手动暂停", callback_data: "paper:set:newEntriesPaused:false" }
@@ -35,6 +40,7 @@ function settingsText(settings) {
     "⚙️ Paper Trading 控制面板",
     `配置版本：${settings.revision}`,
     `手动新开仓开关：${settings.newEntriesPaused ? "已暂停" : "允许评估（仍须通过自动风控）"}`,
+    `持仓模式：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
     `风险偏好：${riskProfileChinese(settings.riskProfile)}`,
     `单笔风险：${controlModeChinese(settings.riskMode)}；区间 ${pct(settings.riskMinPct)}～${pct(settings.riskMaxPct)}；当前限制 ${pct(settings.riskPerTradePct)}`,
     `总风险：${controlModeChinese(settings.totalRiskMode)}；区间 ${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
@@ -45,6 +51,7 @@ function settingsText(settings) {
     `加仓：${settings.allowPyramiding ? "开启" : "关闭"}；仓位区间 ${settings.positionLimitMin}～${settings.positionLimitMax}；当前最多 ${settings.maxOpenPositions} 仓`,
     `日损：${controlModeChinese(settings.dailyLossMode)}；区间 ${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}；当前 ${pct(settings.maxDailyLossPct)}`,
     `连亏：${controlModeChinese(settings.lossStreakMode)}；区间 ${settings.lossStreakMin}～${settings.lossStreakMax}；当前 ${settings.maxConsecutiveLosses} 笔暂停`,
+    `运行周期：每 ${settings.monitorIntervalMinutes} 分钟；Indicator Profile：${settings.indicatorProfile}`,
     "旧数据库保留原值；需要时点“一键启用新版自动区间”，无需逐项修改。",
     "按钮修改本地 SQLite；回调会编辑本消息，不再每按一次新增一条。"
   ].join("\n");
@@ -53,21 +60,47 @@ function settingsText(settings) {
 function positionText(db) {
   const snapshot = db.getLatestSnapshot();
   const state = calculateAccountState(db, snapshot?.price);
-  if (!state.positions.length) return "📊 当前模拟仓位\n无持仓。";
   const rows = [
     "📊 当前模拟仓位",
-    `方向：${state.positions[0].side}；共 ${state.positions.length} 笔受控仓位`,
-    `平均入场：${n(state.averageEntryPrice, 1)} USDT`,
-    `总数量：${n(state.totalQuantityBtc, 8)} BTC`,
-    `总名义仓位：${n(state.totalNotionalCny)} CNY`,
-    `保证金：${n(state.marginUsedCny)} CNY；有效杠杆 ${n(state.effectiveLeverage)}x`,
-    `未实现盈亏：${n(state.unrealizedPnlCny)} CNY`,
-    `当前总风险：${n(state.totalRiskCny)} CNY（${pct(state.totalRiskPct)}）`
+    `账户权益：${n(state.equityCny)} CNY；可用资金 ${n(state.availableFundsCny)} CNY`,
+    `LONG 名义：${n(state.longNotionalCny)} CNY；SHORT 名义：${n(state.shortNotionalCny)} CNY`,
+    `Gross Notional：${n(state.grossNotionalCny)} CNY（多空不抵消）`,
+    `总保证金：${n(state.marginUsedCny)} CNY；账户有效杠杆 ${n(state.effectiveLeverage)}x`,
+    `未实现盈亏：${n(state.unrealizedPnlCny)} CNY；总风险 ${n(state.totalRiskCny)} CNY（${pct(state.totalRiskPct)}）`
   ];
-  for (const position of state.positions) {
-    rows.push(`#${position.id}：入场 ${n(position.entry_price, 1)} / SL ${n(position.stop_loss, 1)} / TP ${n(position.take_profit, 1)}`);
+  if (!state.positionGroups.length) rows.push("", "无持仓。");
+  for (const group of state.positionGroups) {
+    rows.push("", `${group.side === "LONG" ? "🟢 LONG" : "🔴 SHORT"} GROUP #${group.groupId}`);
+    for (const position of group.positions) {
+      rows.push(
+        `#${position.id} Entry ${n(position.entry_price, 1)} / SL ${n(position.stop_loss, 1)} / TP ${n(position.take_profit, 1)}`,
+        `Margin ${n(position.margin_cny)} CNY / Leverage ${n(position.leverage)}x / PnL ${n(calculateUnrealized(position, snapshot?.price))} CNY / Risk ${n(position.expected_loss_cny ?? position.risk_cny)} CNY`
+      );
+      if (position.legacy_contract_math_status === "LEGACY_UNKNOWN") {
+        rows.push("⚠️ 旧仓合约数据缺失；风控按名义仓位=保证金的保守 1x 估算，界面不伪造历史杠杆/强平价。");
+      }
+    }
   }
   return rows.join("\n");
+}
+
+function positionModePanel(settings) {
+  return {
+    text: [
+      "🔄 持仓模式",
+      `当前：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
+      "NET：出现相反方向新机会时仍保持原单向限制。",
+      "HEDGE：LONG 与 SHORT 可各自独立持仓；关闭加仓只禁止同方向增加新腿。",
+      `所有方向合计最多 ${settings.maxOpenPositions} 个实际仓位；风险、保证金和名义仓位按多空绝对值相加。`,
+      ...(settings.positionMode === "HEDGE" && settings.maxOpenPositions < 2 ? ["⚠️ 当前最大仓位数小于 2；如需同时多空，请在“加仓设置→仓位数量区间”提高。"] : [])
+    ].join("\n"),
+    markup: { inline_keyboard: [
+      [{ text: settings.positionMode === "NET" ? "✅ 单向 NET" : "单向 NET", callback_data: "paper:set:positionMode:NET" },
+        { text: settings.positionMode === "HEDGE" ? "✅ 双向 HEDGE" : "双向 HEDGE", callback_data: "paper:set:positionMode:HEDGE" }],
+      [{ text: "仓位数量区间", callback_data: "paper:view:range-positions" }],
+      [{ text: "返回", callback_data: "paper:view:main" }]
+    ] }
+  };
 }
 
 function decisionText(db) {
@@ -110,11 +143,110 @@ function researchText(db) {
     `最近一轮数据源缺失：${missing}/${latestQuality.length || 0}`,
     ...research.slice(0, 10).map((item) => [
       `- [${item.time_layer}] ${item.display_name}`,
-      `  状态 ${item.status} / 权重 ${n(item.current_weight, 2)} / 来源 ${item.data_source}`,
+      `  状态 ${item.availability_status ?? item.status} / 生产状态 ${item.status} / 权重 ${n(item.current_weight, 2)} / 来源 ${item.data_source}`,
       `  历史 ${item.historical_coverage_start ?? "未记录"} → ${item.historical_coverage_end ?? "未记录"} / OOS增量 ${n(item.oos_incremental_contribution, 3)}`
     ].join("\n")),
     "",
     "只有成本后严格样本外、walk-forward 和增量贡献稳定通过，才允许晋级 enabled。"
+  ].join("\n");
+}
+
+function indicatorProfilePanel(settings) {
+  const labels = { SHORT_SWING: "短波段", STANDARD_SWING: "标准波段", LONG_SWING: "长波段", AUTO: "自动" };
+  return {
+    text: [
+      "📐 Indicator Profile",
+      `当前：${labels[settings.indicatorProfile] ?? settings.indicatorProfile}`,
+      "Profile 统一管理 EMA / RSI / MACD / ATR 和多周期权重，不会修改冻结 V1.2 Champion；仅供新 Research/Shadow Challenger 下一轮读取。",
+      "自动模式按已识别 Market Regime 选择 Profile。恢复默认即 AUTO。"
+    ].join("\n"),
+    markup: { inline_keyboard: [
+      [{ text: "短波段", callback_data: "paper:set:indicatorProfile:SHORT_SWING" }, { text: "标准波段", callback_data: "paper:set:indicatorProfile:STANDARD_SWING" }],
+      [{ text: "长波段", callback_data: "paper:set:indicatorProfile:LONG_SWING" }, { text: "自动/恢复默认", callback_data: "paper:set:indicatorProfile:AUTO" }],
+      [{ text: "返回", callback_data: "paper:view:main" }]
+    ] }
+  };
+}
+
+function cyclePanel(settings) {
+  return {
+    text: [
+      "⏱ Monitor 运行周期",
+      `当前：每 ${settings.monitorIntervalMinutes} 分钟`,
+      "修改写入 SQLite；monitor 每轮结束后重新读取，下一轮生效，无需重启。持仓风险动作仍只使用新鲜核心价格/K线。"
+    ].join("\n"),
+    markup: { inline_keyboard: [
+      [{ text: "5分钟", callback_data: "paper:set:monitorIntervalMinutes:5" }, { text: "15分钟", callback_data: "paper:set:monitorIntervalMinutes:15" }],
+      [{ text: "1小时", callback_data: "paper:set:monitorIntervalMinutes:60" }, { text: "4小时", callback_data: "paper:set:monitorIntervalMinutes:240" }],
+      [{ text: "返回", callback_data: "paper:view:main" }]
+    ] }
+  };
+}
+
+function marginPanel(settings) {
+  return {
+    text: [
+      "💵 保证金设置",
+      `模式：${controlModeChinese(settings.marginMode)}`,
+      `允许区间：${pct(settings.marginMinUsagePct)}～${pct(settings.marginMaxUsagePct)}`,
+      `手动值：${pct(settings.marginManualUsagePct)}`,
+      `当前上限：${pct(settings.maxMarginUsagePct)}`,
+      "保证金只用于反推动态杠杆；不会改变已确定的最大亏损。"
+    ].join("\n"),
+    markup: { inline_keyboard: [
+      [{ text: "调整完整区间", callback_data: "paper:view:range-margin" }],
+      [{ text: "返回", callback_data: "paper:view:main" }]
+    ] }
+  };
+}
+
+function championText(db) {
+  const champion = db.getStrategyVersions().find((item) => item.role === "CHAMPION");
+  const snapshot = db.getLatestSnapshot();
+  return [
+    "👑 Paper Champion",
+    `版本：${champion?.version ?? "未登记"}`,
+    `状态：${champion?.lifecycle_status ?? "—"}`,
+    `SHA-256：${champion?.strategy_hash ?? "—"}`,
+    `最近判断：${snapshot?.decision ?? "尚无"}`,
+    "冻结 Champion 不允许原地改参数；新版本只能从 Challenger 完整验证后晋级，并保留回滚点。"
+  ].join("\n");
+}
+
+function shadowText(db) {
+  const challengers = db.getStrategyVersions().filter((item) => item.role === "CHALLENGER");
+  return [
+    "👥 Challenger / Shadow",
+    ...(challengers.length ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${item.strategy_hash.slice(0, 16)}…`) : ["尚无已登记且通过前置验证的 Challenger。"]),
+    "Shadow 使用独立 SQLite，不能影响 Champion 账户。未证明净 edge 的候选不会晋级。"
+  ].join("\n");
+}
+
+function learningText(db) {
+  const versions = db.getStrategyVersions();
+  const runs = db.getResearchRuns({ limit: 8 });
+  return [
+    "🧠 Strategy Learning",
+    "闭环：Candidate → Replay → Walk-forward/Purged OOS → untouched Final OOS → Monte Carlo → Shadow → Promotion Gate。",
+    `已登记策略版本：${versions.length}；已持久化研究运行：${runs.length}`,
+    ...(runs.slice(0, 5).map((item) => `- ${item.run_type}：${item.status}（${item.finished_at}）`)),
+    "自动学习不会按单笔输赢即时调参，也不会用已使用 Final OOS 继续选策略。"
+  ].join("\n");
+}
+
+function similarityText(db) {
+  const run = db.getResearchRuns({ limit: 1, runType: "HISTORICAL_SIMILARITY" })[0];
+  return [
+    "📊 Historical Similarity",
+    run ? `最近运行：${run.finished_at}\n状态：${run.status}\n${JSON.stringify(run.summary)}` : "数据库内尚无新的相似行情运行摘要；不会伪造概率。样本不足时必须显示 insufficient evidence。"
+  ].join("\n");
+}
+
+function researchResultsText(db) {
+  const runs = db.getResearchRuns({ limit: 10 });
+  return [
+    "📚 Research Results",
+    ...(runs.length ? runs.map((item) => `- ${item.run_type} / ${item.status} / ${item.finished_at}`) : ["尚无写入生产 SQLite 的研究摘要；research-output 原始产物不会被假装成数据库结果。"])
   ].join("\n");
 }
 
@@ -187,10 +319,11 @@ function pyramidingPanel(settings) {
   return {
     text: [
       "➕ 加仓设置",
+      `持仓模式：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
       `加仓：${settings.allowPyramiding ? "开启" : "关闭"}`,
       `仓位模式：${controlModeChinese(settings.positionLimitMode)}；${settings.positionLimitMin}～${settings.positionLimitMax}；当前 ${settings.maxOpenPositions}`,
       `组合总风险：${controlModeChinese(settings.totalRiskMode)}；${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
-      "开启后仍要求同方向、有利进展、新高质量信号及组合风险/保证金/名义仓位全部通过。仓位数量也有完整最低/最高/手动区间。"
+      "开启后仍要求同方向、有利进展、新高质量信号及组合风险/保证金/名义仓位全部通过。HEDGE 下关闭加仓不影响独立的相反方向首仓。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "关闭加仓", callback_data: "paper:set:allowPyramiding:false" }, { text: "开启加仓", callback_data: "paper:set:allowPyramiding:true" }],
@@ -208,7 +341,7 @@ const RANGE_PANEL_META = Object.freeze({
   leverage: Object.freeze({ title: "用户杠杆限制", effectiveLabel: "当前最高允许", step: 5, format: (value) => `${n(value, 0)}x`, back: "leverage", note: "自动模式只把最高值当上限；实际杠杆由止损、名义仓位和保证金反推，不会自动用满。" }),
   margin: Object.freeze({ title: "保证金使用比例", effectiveLabel: "当前使用上限", step: 0.05, format: pct, back: "leverage", note: "限制模拟仓位最多占用多少账户权益作为保证金。" }),
   notional: Object.freeze({ title: "总名义仓位", effectiveLabel: "当前总上限", step: 0.5, format: (value) => `${n(value, 1)} 倍权益`, back: "leverage", note: "杠杆不能让名义仓位突破这里的限制。" }),
-  positions: Object.freeze({ title: "同时仓位数量", effectiveLabel: "当前最多", step: 1, format: (value) => `${n(value, 0)} 仓`, back: "pyramiding", note: "关闭加仓时，无论此处设置如何，实际仍只允许 1 个 BTC 仓位组。" })
+  positions: Object.freeze({ title: "同时仓位数量", effectiveLabel: "当前最多", step: 1, format: (value) => `${n(value, 0)} 仓`, back: "pyramiding", note: "统计 LONG + SHORT 所有实际 OPEN 腿；NET 且关闭加仓时为 1，HEDGE 关闭加仓时仍可各有一条 LONG/SHORT。" })
 });
 
 function rangeControlPanel(settings, name) {
@@ -251,7 +384,7 @@ function recentText(db) {
 
 function parseSettingValue(key, raw) {
   if (["allowPyramiding", "newEntriesPaused"].includes(key)) return raw === "true";
-  if (key === "riskProfile" || Object.values(RANGE_DEFINITIONS).some((definition) => definition.mode === key)) return raw;
+  if (["riskProfile", "indicatorProfile", "positionMode"].includes(key) || Object.values(RANGE_DEFINITIONS).some((definition) => definition.mode === key)) return raw;
   return Number(raw);
 }
 
@@ -271,6 +404,9 @@ function panelNameForSetting(key) {
     if ([definition.mode, definition.minimum, definition.maximum, definition.manual, definition.effective].includes(key)) return `range-${name}`;
   }
   if (key === "riskProfile") return "risk";
+  if (key === "indicatorProfile") return "profile";
+  if (key === "monitorIntervalMinutes") return "cycle";
+  if (key === "positionMode") return "position-mode";
   if (/position|Pyramiding/i.test(key)) return "pyramiding";
   return "main";
 }
@@ -325,7 +461,16 @@ export class TelegramControlPanel {
     if (name === "today") return { text: todayText(this.db), markup: main };
     if (name === "risk") return riskPanel(settings);
     if (name === "leverage") return leveragePanel(settings);
+    if (name === "margin") return marginPanel(settings);
     if (name === "pyramiding") return pyramidingPanel(settings);
+    if (name === "position-mode") return positionModePanel(settings);
+    if (name === "profile") return indicatorProfilePanel(settings);
+    if (name === "cycle") return cyclePanel(settings);
+    if (name === "champion") return { text: championText(this.db), markup: main };
+    if (name === "shadow") return { text: shadowText(this.db), markup: main };
+    if (name === "learning") return { text: learningText(this.db), markup: main };
+    if (name === "similarity") return { text: similarityText(this.db), markup: main };
+    if (name === "results") return { text: researchResultsText(this.db), markup: main };
     if (name.startsWith("range-")) return rangeControlPanel(settings, name.slice("range-".length));
     if (name === "recent") return { text: recentText(this.db), markup: main };
     return { text: settingsText(settings), markup: main };
@@ -344,8 +489,11 @@ export class TelegramControlPanel {
       if (value < Number(current[range.minimum])) throw new Error("最高值不能低于最低值");
       if (value < Number(current[range.manual])) patch[range.manual] = value;
     }
-    if (key === "allowPyramiding" && value === false && current.maxOpenPositions !== 1) patch.maxOpenPositions = 1;
-    if (key === "maxOpenPositions" && value > 1 && !current.allowPyramiding) {
+    if (key === "positionMode" && value === "NET" && new Set(this.db.getOpenPositions().map((position) => position.side)).size > 1) {
+      throw new Error("当前同时存在 LONG 与 SHORT；请先自然平掉一侧，再切换 NET，系统不会自动抵消仓位");
+    }
+    if (key === "allowPyramiding" && value === false && current.positionMode === "NET" && current.maxOpenPositions !== 1) patch.maxOpenPositions = 1;
+    if (key === "maxOpenPositions" && value > 1 && !current.allowPyramiding && current.positionMode === "NET") {
       throw new Error("请先开启加仓，再提高最大仓位数");
     }
     return this.db.updateRuntimeSettings(patch, {

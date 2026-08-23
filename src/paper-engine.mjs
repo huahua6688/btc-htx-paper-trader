@@ -95,16 +95,36 @@ export function calculateAccountState(db, currentPrice = db.getLatestSnapshot()?
   const equityCny = cashCny + unrealizedPnlCny;
   const marginUsedCny = positions.reduce((sum, position) => sum + Number(position.margin_cny ?? position.notional_cny), 0);
   const totalNotionalCny = positions.reduce((sum, position) => sum + Number(position.notional_cny), 0);
+  const longNotionalCny = positions.filter((position) => position.side === "LONG")
+    .reduce((sum, position) => sum + Number(position.notional_cny), 0);
+  const shortNotionalCny = positions.filter((position) => position.side === "SHORT")
+    .reduce((sum, position) => sum + Number(position.notional_cny), 0);
   const totalQuantityBtc = positions.reduce((sum, position) => sum + Number(position.quantity_btc), 0);
-  const weightedEntry = totalQuantityBtc > 0
-    ? positions.reduce((sum, position) => sum + Number(position.entry_price) * Number(position.quantity_btc), 0) / totalQuantityBtc
-    : null;
-  const weightedStop = totalQuantityBtc > 0
-    ? positions.reduce((sum, position) => sum + Number(position.stop_loss) * Number(position.quantity_btc), 0) / totalQuantityBtc
-    : null;
-  const weightedTarget = totalQuantityBtc > 0
-    ? positions.reduce((sum, position) => sum + Number(position.take_profit) * Number(position.quantity_btc), 0) / totalQuantityBtc
-    : null;
+  const groupMap = new Map();
+  for (const position of positions) {
+    const key = `${position.side}:${position.position_group_id}`;
+    if (!groupMap.has(key)) groupMap.set(key, []);
+    groupMap.get(key).push(position);
+  }
+  const positionGroups = [...groupMap.values()].map((legs) => {
+    const quantityBtc = legs.reduce((sum, leg) => sum + Number(leg.quantity_btc), 0);
+    const weighted = (field) => quantityBtc > 0
+      ? legs.reduce((sum, leg) => sum + Number(leg[field]) * Number(leg.quantity_btc), 0) / quantityBtc
+      : null;
+    return {
+      groupId: Number(legs[0].position_group_id),
+      side: legs[0].side,
+      positionCount: legs.length,
+      quantityBtc: round(quantityBtc, 8),
+      averageEntryPrice: finite(weighted("entry_price")) ? round(weighted("entry_price"), 2) : null,
+      overallStopLoss: finite(weighted("stop_loss")) ? round(weighted("stop_loss"), 2) : null,
+      overallTakeProfit: finite(weighted("take_profit")) ? round(weighted("take_profit"), 2) : null,
+      marginCny: round(legs.reduce((sum, leg) => sum + Number(leg.margin_cny ?? leg.notional_cny), 0), 4),
+      notionalCny: round(legs.reduce((sum, leg) => sum + Number(leg.notional_cny), 0), 4),
+      positions: legs
+    };
+  });
+  const oneGroupOnly = positionGroups.length === 1 ? positionGroups[0] : null;
   const totalRiskCny = positions.reduce((sum, position) => {
     if (!finite(currentPrice)) return sum + Number(position.expected_loss_cny ?? position.risk_cny);
     const direction = position.side === "LONG" ? 1 : -1;
@@ -122,14 +142,19 @@ export function calculateAccountState(db, currentPrice = db.getLatestSnapshot()?
     realizedPnlCny: round(cashCny - Number(account.initial_capital_cny), 4),
     unrealizedPnlCny: round(unrealizedPnlCny, 4),
     marginUsedCny: round(marginUsedCny, 4),
+    longNotionalCny: round(longNotionalCny, 4),
+    shortNotionalCny: round(shortNotionalCny, 4),
+    grossNotionalCny: round(totalNotionalCny, 4),
     totalNotionalCny: round(totalNotionalCny, 4),
     effectiveLeverage: marginUsedCny > 0 ? round(totalNotionalCny / marginUsedCny, 4) : 0,
     totalRiskCny: round(totalRiskCny, 4),
     totalRiskPct: equityCny > 0 ? round(totalRiskCny / equityCny, 6) : 0,
     totalQuantityBtc: round(totalQuantityBtc, 8),
-    averageEntryPrice: finite(weightedEntry) ? round(weightedEntry, 2) : null,
-    overallStopLoss: finite(weightedStop) ? round(weightedStop, 2) : null,
-    overallTakeProfit: finite(weightedTarget) ? round(weightedTarget, 2) : null,
+    averageEntryPrice: oneGroupOnly?.averageEntryPrice ?? null,
+    overallStopLoss: oneGroupOnly?.overallStopLoss ?? null,
+    overallTakeProfit: oneGroupOnly?.overallTakeProfit ?? null,
+    legacyFallbackCount: positions.filter((position) => position.legacy_contract_math_status === "LEGACY_UNKNOWN").length,
+    positionGroups,
     positions
   };
 }
@@ -140,7 +165,8 @@ export function buildPaperCandidate(
   runtimeSettings = RUNTIME_SETTINGS_DEFAULTS,
   exchangeConstraints = resolveExchangeConstraints({}, PAPER_EXCHANGE_CONSTRAINTS),
   openPositions = [],
-  config = PAPER_CONFIG
+  config = PAPER_CONFIG,
+  portfolioPositions = openPositions
 ) {
   const side = report.decision;
   if (!["LONG", "SHORT"].includes(side)) return null;
@@ -152,12 +178,15 @@ export function buildPaperCandidate(
 
   const accountEquityCny = Number(accountOrState.equityCny ?? accountOrState.cash_cny);
   if (!(accountEquityCny > 0)) return null;
-  const existingMargin = openPositions.reduce((sum, item) => sum + Number(item.margin_cny ?? item.notional_cny), 0);
-  const existingNotional = openPositions.reduce((sum, item) => sum + Number(item.notional_cny), 0);
-  const existingRisk = openPositions.reduce((sum, item) => sum + Number(item.expected_loss_cny ?? item.risk_cny), 0);
-  const availableRisk = Math.max(0, accountEquityCny * runtimeSettings.maxTotalRiskPct - existingRisk);
-  const availableMargin = Math.max(0, accountEquityCny * runtimeSettings.maxMarginUsagePct - existingMargin);
-  const availableNotional = Math.max(0, accountEquityCny * runtimeSettings.maxTotalNotionalMultiple - existingNotional);
+  const portfolioMargin = portfolioPositions.reduce((sum, item) => sum + Number(item.margin_cny ?? item.notional_cny), 0);
+  const portfolioNotional = portfolioPositions.reduce((sum, item) => sum + Number(item.notional_cny), 0);
+  const portfolioRisk = portfolioPositions.reduce((sum, item) => sum + Number(item.expected_loss_cny ?? item.risk_cny), 0);
+  const groupMargin = openPositions.reduce((sum, item) => sum + Number(item.margin_cny ?? item.notional_cny), 0);
+  const groupNotional = openPositions.reduce((sum, item) => sum + Number(item.notional_cny), 0);
+  const groupRisk = openPositions.reduce((sum, item) => sum + Number(item.expected_loss_cny ?? item.risk_cny), 0);
+  const availableRisk = Math.max(0, accountEquityCny * runtimeSettings.maxTotalRiskPct - portfolioRisk);
+  const availableMargin = Math.max(0, accountEquityCny * runtimeSettings.maxMarginUsagePct - portfolioMargin);
+  const availableNotional = Math.max(0, accountEquityCny * runtimeSettings.maxTotalNotionalMultiple - portfolioNotional);
   if (!(availableRisk > 0) || !(availableMargin > 0) || !(availableNotional > 0)) return null;
 
   const opportunityScore = Number(report.opportunities?.[side]?.score ?? 0);
@@ -245,9 +274,9 @@ export function buildPaperCandidate(
     ? (openPositions.reduce((sum, item) => sum + Number(item.entry_price) * Number(item.quantity_btc), 0)
       + perBtc.entryFill * quantityBtc) / totalQuantity
     : perBtc.entryFill;
-  const totalRiskCny = existingRisk + expectedLossCny;
-  const totalMarginCny = existingMargin + marginCny;
-  const totalNotionalCny = existingNotional + notionalCny;
+  const totalRiskCny = groupRisk + expectedLossCny;
+  const totalMarginCny = groupMargin + marginCny;
+  const totalNotionalCny = groupNotional + notionalCny;
   const weightedStop = totalQuantity > 0
     ? (openPositions.reduce((sum, item) => sum + Number(item.stop_loss) * Number(item.quantity_btc), 0)
       + stopLoss * quantityBtc) / totalQuantity
@@ -285,6 +314,23 @@ export function buildPaperCandidate(
     liquidationDistancePct: portfolioLiquidation.distancePct,
     liquidationSource: portfolioLiquidation.source
   };
+  const accountAfter = {
+    positionCount: portfolioPositions.length + 1,
+    totalRiskCny: round(portfolioRisk + expectedLossCny, 4),
+    totalRiskPct: round((portfolioRisk + expectedLossCny) / accountEquityCny, 6),
+    totalMarginCny: round(portfolioMargin + marginCny, 4),
+    totalMarginPct: round((portfolioMargin + marginCny) / accountEquityCny, 6),
+    totalNotionalCny: round(portfolioNotional + notionalCny, 4),
+    effectiveLeverage: round((portfolioNotional + notionalCny) / (portfolioMargin + marginCny), 4),
+    longNotionalCny: round(
+      portfolioPositions.filter((item) => item.side === "LONG").reduce((sum, item) => sum + Number(item.notional_cny), 0)
+        + (side === "LONG" ? notionalCny : 0), 4
+    ),
+    shortNotionalCny: round(
+      portfolioPositions.filter((item) => item.side === "SHORT").reduce((sum, item) => sum + Number(item.notional_cny), 0)
+        + (side === "SHORT" ? notionalCny : 0), 4
+    )
+  };
   const directionReasons = (side === "LONG" ? report.bullishReasons : report.bearishReasons) ?? [];
   return {
     symbol: report.symbol,
@@ -320,6 +366,8 @@ export function buildPaperCandidate(
     liquidationSource: portfolioLiquidation.source,
     opportunityScore,
     exchangeConstraints,
+    accountAfter,
+    groupAfter: portfolioAfter,
     portfolioAfter,
     isAddOn: openPositions.length > 0,
     openingReasons: [
@@ -381,29 +429,33 @@ export function evaluatePaperEntry(db, report, config = PAPER_CONFIG, marketData
   const reasons = [];
   const settings = db.getRuntimeSettings();
   const openPositions = db.getOpenPositions();
+  const sameSidePositions = openPositions.filter((position) => position.side === report.decision);
+  const oppositeSidePositions = openPositions.filter((position) => position.side !== report.decision);
   if (!["LONG", "SHORT"].includes(report.decision)) reasons.push("当前决策不是 LONG/SHORT");
   if (report.riskGates?.length) reasons.push(...report.riskGates);
   const dailyRisk = getDailyRiskState(db, report.generatedAt, settings);
   if (dailyRisk.paused) reasons.push(...dailyRisk.pauseReasons);
-  if (openPositions.length) {
-    if (!settings.allowPyramiding) reasons.push("已有 BTC 模拟仓位，加仓已关闭");
-    if (openPositions.length >= settings.maxOpenPositions) reasons.push("已达到最大同时仓位数");
-    if (openPositions.some((position) => position.side !== report.decision)) reasons.push("已有相反方向仓位，本轮禁止机械反手");
-    const aggregate = aggregateOpenPosition(openPositions);
+  if (openPositions.length >= settings.maxOpenPositions) reasons.push("已达到最大同时仓位数");
+  if (settings.positionMode === "NET" && oppositeSidePositions.length) {
+    reasons.push("NET 模式已有相反方向仓位，本轮禁止开仓");
+  }
+  if (sameSidePositions.length) {
+    if (!settings.allowPyramiding) reasons.push("已有同方向 BTC 模拟仓位，加仓已关闭");
+    const aggregate = aggregateOpenPosition(sameSidePositions);
     const favorable = report.decision === "LONG"
       ? report.currentPrice > aggregate.averageEntry + aggregate.averageInitialRiskDistance * 0.5
       : report.currentPrice < aggregate.averageEntry - aggregate.averageInitialRiskDistance * 0.5;
     const score = Number(report.opportunities?.[report.decision]?.score ?? 0);
     if (!favorable) reasons.push("已有仓位尚未获得足够有利进展，禁止加仓");
     if (score < config.minimumImmediateEntryScore + 5) reasons.push("新机会质量不足以支持受控加仓");
-    const newestBar = Math.max(...openPositions.map((item) => Number(item.entry_bar_ts)));
+    const newestBar = Math.max(...sameSidePositions.map((item) => Number(item.entry_bar_ts)));
     if (Number(report.latest15mBar?.timestamp) <= newestBar) reasons.push("同一行情周期禁止重复加仓");
   }
   let candidate = null;
   if (!reasons.length) {
     const accountState = calculateAccountState(db, report.currentPrice, config);
     const constraints = resolveExchangeConstraints(marketData);
-    candidate = buildPaperCandidate(report, accountState, settings, constraints, openPositions, config);
+    candidate = buildPaperCandidate(report, accountState, settings, constraints, sameSidePositions, config, openPositions);
     if (!candidate) reasons.push("没有满足净 RR、合约步进、总风险、保证金、名义仓位与强平缓冲的有效仓位");
   }
   return {

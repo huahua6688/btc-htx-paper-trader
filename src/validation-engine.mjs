@@ -5,6 +5,7 @@ import { buildPointInTimeMarket, firstReplayableIndex } from "./replay-market.mj
 import { runHistoricalReplay } from "./replay-engine.mjs";
 import { buildHistoricalFeatureMatrix, SIMILARITY_HORIZONS } from "./similarity-engine.mjs";
 import { BAR_MS, hashObject, mean, round } from "./research-utils.mjs";
+import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PURGE_BARS = SIMILARITY_HORIZONS["7d"];
@@ -41,7 +42,9 @@ export function runLookaheadAudit(dataset, {
     for (const strategy of strategies) {
       const analyze = strategy === "champion"
         ? (market) => analyzeSnapshot(market)
-        : (market) => analyzeChallenger(market, parameters, undefined, { useCache: false });
+        : strategy === "research-v2"
+          ? (market) => analyzeResearchChallengerV2(market, parameters, undefined, { useCache: false })
+          : (market) => analyzeChallenger(market, parameters, undefined, { useCache: false });
       const full = analyze(fullMarket);
       const prefix = analyze(prefixMarket);
       checks.push({
@@ -114,15 +117,17 @@ export async function runValidationEngine(dataset, {
   baselineParameters = { ...CHALLENGER_BASE_PARAMETERS, version: "challenger-baseline-no-regime-v1", regimeFilterEnabled: false },
   candidateParameters = CHALLENGER_BASE_PARAMETERS,
   walkForwardWindows = 4,
-  outputDirectory
+  outputDirectory,
+  baselineStrategy = "challenger",
+  candidateStrategy = "challenger"
 } = {}) {
   const windows = buildWalkForwardWindows(dataset, walkForwardWindows);
   const matrix = buildHistoricalFeatureMatrix(dataset);
-  const lookahead = runLookaheadAudit(dataset, { parameters: candidateParameters });
+  const lookahead = runLookaheadAudit(dataset, { strategies: [candidateStrategy], parameters: candidateParameters });
   const results = [];
   for (const window of windows) {
     const baseline = await runHistoricalReplay(dataset, {
-      strategy: "challenger",
+      strategy: baselineStrategy,
       parameters: baselineParameters,
       from: window.testStart,
       to: window.testEnd,
@@ -130,7 +135,7 @@ export async function runValidationEngine(dataset, {
       outputDirectory: outputDirectory ? `${outputDirectory}/window-${window.index}/baseline` : undefined
     });
     const candidate = await runHistoricalReplay(dataset, {
-      strategy: "challenger",
+      strategy: candidateStrategy,
       parameters: candidateParameters,
       from: window.testStart,
       to: window.testEnd,
@@ -151,12 +156,14 @@ export async function runValidationEngine(dataset, {
     });
   }
   const missingMarket = buildPointInTimeMarket(dataset.candles, [], Math.max(firstReplayableIndex(dataset.candles), dataset.candles.length - 1000));
-  const missingReport = analyzeChallenger(missingMarket, candidateParameters);
+  const missingReport = candidateStrategy === "research-v2"
+    ? analyzeResearchChallengerV2(missingMarket, candidateParameters)
+    : analyzeChallenger(missingMarket, candidateParameters);
   const missingDataPolicy = {
     passed: missingReport.derivatives.fundingRatePct === null,
     fundingWasMissing: true,
     fundingWasForwardFilled: false,
-    decisionRemainedPaperOnly: missingReport.mode === "RESEARCH_CHALLENGER_PAPER_ONLY"
+    decisionRemainedPaperOnly: /PAPER_ONLY/.test(missingReport.mode)
   };
   const positiveWindows = results.filter((item) => item.incremental.tradeSharpe > 0 && item.incremental.netReturnPct >= 0).length;
   const outOfSampleTrades = results.reduce((sum, item) => sum + item.candidate.tradeCount, 0);
@@ -211,6 +218,8 @@ export async function runValidationEngine(dataset, {
     baselineVsFeature: {
       baseline: baselineParameters,
       candidate: candidateParameters,
+      baselineStrategy,
+      candidateStrategy,
       changedParameters,
       featureUnderTest: Object.keys(changedParameters).length === 1 ? Object.keys(changedParameters)[0] : "candidate_parameter_bundle",
       interpretation: "The experiment runner computed this parameter diff. Both sides consume identical OOS events and use separate Paper accounts."

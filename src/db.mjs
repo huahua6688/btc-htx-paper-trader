@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { PAPER_CONFIG, RUNTIME_SETTINGS_DEFAULTS } from "./config.mjs";
@@ -31,8 +31,32 @@ const hydratePosition = (row) => row ? {
   portfolioAfter: parseJson(row.portfolio_after_json, {}),
   management: parseJson(row.management_json, {})
 } : null;
+const hydratePositionGroup = (row, positions = []) => row ? {
+  ...row,
+  metadata: parseJson(row.metadata_json, {}),
+  positions
+} : null;
+
+export const POSITION_GROUP_MIGRATION_VERSION = "2026-08-23-position-groups-v2";
+
+export function positionGroupBackupPath(path) {
+  return path === ":memory:" ? null : `${path}.${POSITION_GROUP_MIGRATION_VERSION}.bak`;
+}
+
+function backupDatabaseBeforePositionGroupMigration(path) {
+  if (path === ":memory:" || !existsSync(path) || statSync(path).size === 0) return null;
+  const backupPath = positionGroupBackupPath(path);
+  if (!existsSync(backupPath)) {
+    copyFileSync(path, backupPath);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(`${path}${suffix}`)) copyFileSync(`${path}${suffix}`, `${backupPath}${suffix}`);
+    }
+  }
+  return backupPath;
+}
 
 const RUNTIME_FIELDS = Object.freeze([
+  ["positionMode", "position_mode", "text"],
   ["riskProfile", "risk_profile", "text"],
   ["riskMode", "risk_mode", "text"], ["riskMinPct", "risk_min_pct"], ["riskMaxPct", "risk_max_pct"], ["riskManualPct", "risk_manual_pct"], ["riskPerTradePct", "risk_per_trade_pct"],
   ["marginMode", "margin_mode", "text"], ["marginMinUsagePct", "margin_min_usage_pct"], ["marginMaxUsagePct", "margin_max_usage_pct"], ["marginManualUsagePct", "margin_manual_usage_pct"], ["maxMarginUsagePct", "max_margin_usage_pct"],
@@ -43,7 +67,9 @@ const RUNTIME_FIELDS = Object.freeze([
   ["totalRiskMode", "total_risk_mode", "text"], ["totalRiskMinPct", "total_risk_min_pct"], ["totalRiskMaxPct", "total_risk_max_pct"], ["totalRiskManualPct", "total_risk_manual_pct"], ["maxTotalRiskPct", "max_total_risk_pct"],
   ["dailyLossMode", "daily_loss_mode", "text"], ["dailyLossMinPct", "daily_loss_min_pct"], ["dailyLossMaxPct", "daily_loss_max_pct"], ["dailyLossManualPct", "daily_loss_manual_pct"], ["maxDailyLossPct", "max_daily_loss_pct"],
   ["lossStreakMode", "loss_streak_mode", "text"], ["lossStreakMin", "loss_streak_min"], ["lossStreakMax", "loss_streak_max"], ["lossStreakManual", "loss_streak_manual"], ["maxConsecutiveLosses", "max_consecutive_losses"],
-  ["newEntriesPaused", "new_entries_paused", "boolean"]
+  ["newEntriesPaused", "new_entries_paused", "boolean"],
+  ["indicatorProfile", "indicator_profile", "text"],
+  ["monitorIntervalMinutes", "monitor_interval_minutes"]
 ]);
 
 function runtimeFromRow(row) {
@@ -70,6 +96,7 @@ export class PaperDatabase {
     this.config = config;
     this.readOnly = readOnly;
     if (path !== ":memory:" && !readOnly) mkdirSync(dirname(path), { recursive: true });
+    this.positionGroupMigrationBackup = readOnly ? null : backupDatabaseBeforePositionGroupMigration(path);
     this.db = new DatabaseSync(path, { readOnly });
     this.db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     if (!readOnly) {
@@ -170,6 +197,34 @@ export class PaperDatabase {
       );
       CREATE INDEX IF NOT EXISTS positions_closed_at_idx ON positions(closed_at);
 
+      CREATE TABLE IF NOT EXISTS position_groups (
+        group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+        status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED')),
+        created_at TEXT NOT NULL,
+        closed_at TEXT,
+        migration_source TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS position_groups_status_side_idx ON position_groups(status, side);
+
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL,
+        details_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS position_group_migration_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        occurred_at TEXT NOT NULL,
+        migration_version TEXT NOT NULL,
+        changed_positions INTEGER NOT NULL,
+        created_groups INTEGER NOT NULL,
+        repaired_groups INTEGER NOT NULL,
+        details_json TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS trade_setups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
@@ -258,6 +313,8 @@ export class PaperDatabase {
         loss_streak_manual INTEGER NOT NULL,
         max_consecutive_losses INTEGER NOT NULL,
         new_entries_paused INTEGER NOT NULL CHECK (new_entries_paused IN (0, 1)),
+        indicator_profile TEXT NOT NULL DEFAULT 'AUTO',
+        monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
         revision INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         updated_by TEXT NOT NULL
@@ -294,6 +351,7 @@ export class PaperDatabase {
         oos_incremental_contribution REAL,
         recent_validity TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('enabled', 'research-only', 'disabled')),
+        availability_status TEXT NOT NULL DEFAULT 'research-only' CHECK (availability_status IN ('enabled', 'research-only', 'disabled', 'blocked')),
         evidence_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -338,6 +396,51 @@ export class PaperDatabase {
         UNIQUE(snapshot_id, source_key)
       );
       CREATE INDEX IF NOT EXISTS market_data_quality_source_idx ON market_data_quality(source_key, id);
+
+      CREATE TABLE IF NOT EXISTS strategy_versions (
+        version TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK (role IN ('CHAMPION', 'CHALLENGER', 'ARCHIVED')),
+        lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('FROZEN', 'CANDIDATE', 'VALIDATING', 'SHADOW', 'REJECTED', 'CHAMPION', 'ROLLED_BACK')),
+        strategy_hash TEXT NOT NULL,
+        code_sha256 TEXT NOT NULL,
+        parameters_json TEXT NOT NULL,
+        feature_set_json TEXT NOT NULL,
+        dataset_manifest_hash TEXT,
+        training_range_json TEXT,
+        development_range_json TEXT,
+        oos_range_json TEXT,
+        final_holdout_json TEXT,
+        performance_json TEXT NOT NULL,
+        promotion_reason TEXT,
+        rollback_version TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS strategy_version_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        occurred_at TEXT NOT NULL,
+        version TEXT NOT NULL REFERENCES strategy_versions(version),
+        old_role TEXT,
+        new_role TEXT NOT NULL,
+        old_status TEXT,
+        new_status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        evidence_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS research_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_type TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('PASSED', 'FAILED', 'PARTIAL', 'BLOCKED')),
+        artifact_path TEXT,
+        data_manifest_hash TEXT,
+        strategy_version TEXT,
+        summary_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS research_runs_type_idx ON research_runs(run_type, id);
     `);
 
     const migrations = [
@@ -352,12 +455,18 @@ export class PaperDatabase {
       ["exchange_constraints_json", "TEXT"], ["portfolio_after_json", "TEXT"],
       ["exit_trigger_price", "REAL"], ["last_management_bar_ts", "INTEGER"],
       ["opposite_signal_count", "INTEGER NOT NULL DEFAULT 0"], ["management_json", "TEXT NOT NULL DEFAULT '{}'"],
-      ["position_group_id", "INTEGER"]
+      ["position_group_id", "INTEGER"], ["legacy_contract_math_status", "TEXT NOT NULL DEFAULT 'CURRENT'"]
     ];
     for (const [name, definition] of migrations) this.ensureColumn("positions", name, definition);
     this.ensureColumn("feature_validation_runs", "validation_stage", "TEXT NOT NULL DEFAULT 'HISTORICAL_OOS'");
     this.ensureColumn("feature_validation_runs", "candidate_version", "TEXT NOT NULL DEFAULT 'unversioned'");
+    if (this.ensureColumn("feature_registry", "availability_status", "TEXT NOT NULL DEFAULT 'research-only'")) {
+      this.db.exec("UPDATE feature_registry SET availability_status = status");
+    }
     this.ensureColumn("runtime_settings", "revision", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runtime_settings", "position_mode", "TEXT NOT NULL DEFAULT 'NET'");
+    this.ensureColumn("runtime_settings", "indicator_profile", "TEXT NOT NULL DEFAULT 'AUTO'");
+    this.ensureColumn("runtime_settings", "monitor_interval_minutes", "INTEGER NOT NULL DEFAULT 5");
     const rangeMigrations = [
       ["risk_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["risk_min_pct", "REAL NOT NULL DEFAULT 0.005"], ["risk_max_pct", "REAL NOT NULL DEFAULT 0.05"], ["risk_manual_pct", "REAL NOT NULL DEFAULT 0.01"],
       ["margin_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["margin_min_usage_pct", "REAL NOT NULL DEFAULT 0.10"], ["margin_max_usage_pct", "REAL NOT NULL DEFAULT 0.80"], ["margin_manual_usage_pct", "REAL NOT NULL DEFAULT 0.25"],
@@ -404,9 +513,11 @@ export class PaperDatabase {
           daily_loss_mode = 'MANUAL', loss_streak_mode = 'MANUAL'
       `);
     }
+    this.repairPositionGroups({ markMigration: true });
     this.db.exec("DROP INDEX IF EXISTS one_open_position_idx;");
     this.db.exec("DROP INDEX IF EXISTS one_entry_per_side_bar_idx;");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS one_entry_per_side_bar_idx ON positions(side, entry_bar_ts) WHERE status = 'OPEN';");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS one_open_position_group_per_side_idx ON position_groups(side) WHERE status = 'OPEN';");
 
     const now = new Date().toISOString();
     this.db.prepare(`
@@ -429,8 +540,8 @@ export class PaperDatabase {
         feature_key, display_name, data_source, time_layer, current_weight,
         applicable_regimes_json, historical_coverage_start, historical_coverage_end,
         prediction_horizon, oos_incremental_contribution, recent_validity, status,
-        evidence_json, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        availability_status, evidence_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(feature_key) DO NOTHING
     `);
     for (const feature of FEATURE_REGISTRY_SEEDS) {
@@ -438,9 +549,177 @@ export class PaperDatabase {
         feature.key, feature.name, feature.source, feature.layer, feature.currentWeight,
         json(feature.applicableRegimes), feature.historicalCoverageStart, feature.historicalCoverageEnd,
         feature.predictionHorizon, feature.oosIncrementalContribution, feature.recentValidity,
-        feature.status, json(feature.evidence), now
+        feature.status, feature.status, json(feature.evidence), now
       );
     }
+    this.db.prepare(`
+      INSERT INTO strategy_versions(
+        version, role, lifecycle_status, strategy_hash, code_sha256, parameters_json,
+        feature_set_json, performance_json, promotion_reason, rollback_version, created_at, updated_at
+      ) VALUES ('V1.2-FROZEN', 'CHAMPION', 'FROZEN', ?, ?, ?, ?, '{}', ?, NULL, ?, ?)
+      ON CONFLICT(version) DO NOTHING
+    `).run(
+      '9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6',
+      '9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6',
+      json({ version: 'V1.2', frozen: true, source: 'analysis-engine.mjs' }),
+      json(['HTX_PUBLIC_V1_2_FEATURE_SET']),
+      'Initial frozen Paper Champion; historical score must not be cosmetically changed.', now, now
+    );
+  }
+
+  repairPositionGroups({
+    markMigration = false,
+    occurredAt = new Date().toISOString()
+  } = {}) {
+    if (this.readOnly) throw new Error("只读数据库不能执行 Position Group 修复");
+    return this.transaction(() => {
+      const migrationWasApplied = Boolean(this.db.prepare(
+        "SELECT 1 FROM schema_migrations WHERE version = ?"
+      ).get(POSITION_GROUP_MIGRATION_VERSION));
+      const positions = this.db.prepare("SELECT * FROM positions ORDER BY id").all();
+      let groups = this.db.prepare("SELECT * FROM position_groups ORDER BY group_id").all();
+      let changedPositions = 0;
+      let createdGroups = 0;
+      let repairedGroups = 0;
+      const changes = [];
+
+      const refreshGroups = () => {
+        groups = this.db.prepare("SELECT * FROM position_groups ORDER BY group_id").all();
+      };
+      const createGroup = ({ side, status, createdAt, closedAt = null, preferredId = null, source }) => {
+        const preferredFree = preferredId !== null
+          && !this.db.prepare("SELECT 1 FROM position_groups WHERE group_id = ?").get(preferredId);
+        const statement = preferredFree
+          ? this.db.prepare(`
+              INSERT INTO position_groups(group_id, symbol, side, status, created_at, closed_at, migration_source, metadata_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
+            `)
+          : this.db.prepare(`
+              INSERT INTO position_groups(symbol, side, status, created_at, closed_at, migration_source, metadata_json)
+              VALUES (?, ?, ?, ?, ?, ?, '{}')
+            `);
+        const args = preferredFree
+          ? [preferredId, this.config.symbol, side, status, createdAt, closedAt, source]
+          : [this.config.symbol, side, status, createdAt, closedAt, source];
+        const result = statement.run(...args);
+        createdGroups += 1;
+        refreshGroups();
+        return preferredFree ? Number(preferredId) : Number(result.lastInsertRowid);
+      };
+
+      // 每个方向只允许一个 OPEN group。同方向加仓归入它；另一方向永远使用独立 group。
+      for (const side of ["LONG", "SHORT"]) {
+        const openPositions = positions.filter((position) => position.status === "OPEN" && position.side === side);
+        if (!openPositions.length) continue;
+        const linkedValidGroups = [...new Set(openPositions.map((position) => Number(position.position_group_id))
+          .filter((id) => Number.isInteger(id) && groups.some((group) => Number(group.group_id) === id && group.side === side)))];
+        let canonicalId = linkedValidGroups[0] ?? null;
+        if (canonicalId === null) {
+          const preferred = openPositions.map((position) => Number(position.position_group_id))
+            .find((id) => Number.isInteger(id) && id > 0 && !groups.some((group) => Number(group.group_id) === id));
+          canonicalId = createGroup({
+            side,
+            status: "OPEN",
+            createdAt: openPositions.map((position) => position.opened_at).sort()[0] ?? occurredAt,
+            preferredId: preferred ?? Number(openPositions[0].id),
+            source: "LEGACY_OPEN_POSITION_REPAIR"
+          });
+        }
+        for (const group of groups.filter((item) => item.side === side && item.status === "OPEN" && Number(item.group_id) !== canonicalId)) {
+          this.db.prepare("UPDATE position_groups SET status = 'CLOSED', closed_at = COALESCE(closed_at, ?) WHERE group_id = ?")
+            .run(occurredAt, group.group_id);
+          repairedGroups += 1;
+        }
+        const canonical = this.db.prepare("SELECT * FROM position_groups WHERE group_id = ?").get(canonicalId);
+        if (canonical.status !== "OPEN" || canonical.closed_at !== null) {
+          this.db.prepare("UPDATE position_groups SET status = 'OPEN', closed_at = NULL WHERE group_id = ?").run(canonicalId);
+          repairedGroups += 1;
+        }
+        for (const position of openPositions) {
+          if (Number(position.position_group_id) !== canonicalId) {
+            this.db.prepare("UPDATE positions SET position_group_id = ? WHERE id = ?").run(canonicalId, position.id);
+            changedPositions += 1;
+            changes.push({ positionId: Number(position.id), oldGroupId: position.position_group_id, newGroupId: canonicalId, side });
+          }
+        }
+        refreshGroups();
+      }
+
+      // 历史已平仓腿也必须指向同方向 group；不改价格、数量或盈亏字段。
+      for (const position of positions.filter((item) => item.status === "CLOSED")) {
+        const linked = groups.find((group) => Number(group.group_id) === Number(position.position_group_id));
+        if (linked?.side === position.side) continue;
+        const preferred = Number(position.position_group_id);
+        const groupId = createGroup({
+          side: position.side,
+          status: "CLOSED",
+          createdAt: position.opened_at ?? occurredAt,
+          closedAt: position.closed_at ?? occurredAt,
+          preferredId: Number.isInteger(preferred) && preferred > 0 ? preferred : Number(position.id),
+          source: "LEGACY_CLOSED_POSITION_REPAIR"
+        });
+        this.db.prepare("UPDATE positions SET position_group_id = ? WHERE id = ?").run(groupId, position.id);
+        changedPositions += 1;
+        changes.push({ positionId: Number(position.id), oldGroupId: position.position_group_id, newGroupId: groupId, side: position.side });
+      }
+
+      const unknownMath = this.db.prepare(`
+        UPDATE positions SET legacy_contract_math_status = 'LEGACY_UNKNOWN'
+        WHERE (margin_cny IS NULL OR leverage IS NULL OR liquidation_price_estimate IS NULL)
+          AND legacy_contract_math_status <> 'LEGACY_UNKNOWN'
+      `).run();
+
+      refreshGroups();
+      for (const group of groups) {
+        const state = this.db.prepare(`
+          SELECT COUNT(*) AS total_count,
+                 SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_count,
+                 MIN(opened_at) AS first_opened_at,
+                 MAX(closed_at) AS last_closed_at
+          FROM positions WHERE position_group_id = ? AND side = ?
+        `).get(group.group_id, group.side);
+        const shouldOpen = Number(state.open_count ?? 0) > 0;
+        const nextStatus = shouldOpen ? "OPEN" : "CLOSED";
+        const nextClosedAt = shouldOpen ? null : (state.last_closed_at ?? group.closed_at ?? occurredAt);
+        const nextCreatedAt = state.first_opened_at ?? group.created_at;
+        if (group.status !== nextStatus || group.closed_at !== nextClosedAt || group.created_at !== nextCreatedAt) {
+          this.db.prepare("UPDATE position_groups SET status = ?, created_at = ?, closed_at = ? WHERE group_id = ?")
+            .run(nextStatus, nextCreatedAt, nextClosedAt, group.group_id);
+          repairedGroups += 1;
+        }
+      }
+
+      if (markMigration && !migrationWasApplied) {
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at, details_json) VALUES (?, ?, ?)")
+          .run(POSITION_GROUP_MIGRATION_VERSION, occurredAt, json({
+            backupPath: this.positionGroupMigrationBackup,
+            changedPositions,
+            createdGroups,
+            repairedGroups,
+            legacyUnknownPositions: Number(unknownMath.changes ?? 0)
+          }));
+      }
+      if (!migrationWasApplied || changedPositions || createdGroups || repairedGroups || Number(unknownMath.changes ?? 0)) {
+        this.db.prepare(`
+          INSERT INTO position_group_migration_audit(
+            occurred_at, migration_version, changed_positions, created_groups, repaired_groups, details_json
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(occurredAt, POSITION_GROUP_MIGRATION_VERSION, changedPositions, createdGroups, repairedGroups, json({
+          backupPath: this.positionGroupMigrationBackup,
+          legacyUnknownPositions: Number(unknownMath.changes ?? 0),
+          changes
+        }));
+      }
+      return {
+        migrationVersion: POSITION_GROUP_MIGRATION_VERSION,
+        backupPath: this.positionGroupMigrationBackup,
+        changedPositions,
+        createdGroups,
+        repairedGroups,
+        legacyUnknownPositions: Number(unknownMath.changes ?? 0),
+        groups: this.db.prepare("SELECT * FROM position_groups ORDER BY group_id").all()
+      };
+    });
   }
 
   transaction(work) {
@@ -547,12 +826,13 @@ export class PaperDatabase {
         this.db.prepare(`
           UPDATE feature_registry SET data_source = ?, current_weight = 0,
             historical_coverage_start = ?, historical_coverage_end = ?,
-            recent_validity = ?, status = 'research-only', evidence_json = ?, updated_at = ?
+            recent_validity = ?, status = 'research-only', availability_status = ?, evidence_json = ?, updated_at = ?
           WHERE feature_key = ?
         `).run(
           item.source ?? "UNAVAILABLE", item.historicalCoverageStart ?? null,
           item.historicalCoverageEnd ?? null,
-          item.status === "unavailable" ? "UNAVAILABLE_RELIABLE_SOURCE" : item.dataQuality,
+          ["unavailable", "blocked"].includes(item.status) ? "UNAVAILABLE_RELIABLE_SOURCE" : item.dataQuality,
+          item.status === "blocked" || item.status === "unavailable" ? "blocked" : "research-only",
           json({
             sourceAuditGeneratedAt: item.updatedAt,
             observations: item.observations,
@@ -606,7 +886,7 @@ export class PaperDatabase {
       }
       const evidence = { candidateVersion, productionEffect, productionAdapterTested, layerContractTested };
       this.db.prepare(`
-        UPDATE feature_registry SET status = 'enabled', current_weight = ?,
+        UPDATE feature_registry SET status = 'enabled', availability_status = 'enabled', current_weight = ?,
           recent_validity = 'CHAMPION_EXPLICITLY_APPROVED', evidence_json = ?, updated_at = ?
         WHERE feature_key = ?
       `).run(Number(proposedWeight), json(evidence), promotedAt, featureKey);
@@ -628,6 +908,80 @@ export class PaperDatabase {
   getFeaturePromotionAudit(featureKey) {
     return this.db.prepare("SELECT * FROM feature_promotion_audit WHERE feature_key = ? ORDER BY id").all(featureKey)
       .map((row) => ({ ...row, evidence: parseJson(row.evidence_json, {}) }));
+  }
+
+  registerStrategyVersion(record) {
+    const now = record.updatedAt ?? new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM strategy_versions WHERE version = ?").get(record.version);
+      if (existing && existing.strategy_hash !== record.strategyHash) throw new Error(`策略版本 ${record.version} 已存在且哈希不同，禁止覆盖`);
+      if (!existing) {
+        this.db.prepare(`
+          INSERT INTO strategy_versions(
+            version, role, lifecycle_status, strategy_hash, code_sha256, parameters_json,
+            feature_set_json, dataset_manifest_hash, training_range_json, development_range_json,
+            oos_range_json, final_holdout_json, performance_json, promotion_reason,
+            rollback_version, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          record.version, record.role ?? "CHALLENGER", record.lifecycleStatus ?? "CANDIDATE",
+          record.strategyHash, record.codeSha256 ?? record.strategyHash,
+          json(record.parameters ?? {}), json(record.featureSet ?? []), record.dataManifestHash ?? null,
+          json(record.trainingRange), json(record.developmentRange), json(record.oosRange),
+          json(record.finalHoldout), json(record.performance ?? {}), record.promotionReason ?? null,
+          record.rollbackVersion ?? null, record.createdAt ?? now, now
+        );
+      }
+      return this.getStrategyVersion(record.version);
+    });
+  }
+
+  getStrategyVersion(version) {
+    const row = this.db.prepare("SELECT * FROM strategy_versions WHERE version = ?").get(version);
+    return row ? {
+      ...row, parameters: parseJson(row.parameters_json, {}), featureSet: parseJson(row.feature_set_json, []),
+      trainingRange: parseJson(row.training_range_json), developmentRange: parseJson(row.development_range_json),
+      oosRange: parseJson(row.oos_range_json), finalHoldout: parseJson(row.final_holdout_json),
+      performance: parseJson(row.performance_json, {})
+    } : null;
+  }
+
+  getStrategyVersions({ limit = 20 } = {}) {
+    return this.db.prepare("SELECT version FROM strategy_versions ORDER BY updated_at DESC LIMIT ?").all(limit)
+      .map((row) => this.getStrategyVersion(row.version));
+  }
+
+  transitionStrategyVersion(version, { role, lifecycleStatus, reason, evidence = {}, occurredAt = new Date().toISOString() }) {
+    return this.transaction(() => {
+      const current = this.getStrategyVersion(version);
+      if (!current) throw new Error(`未知策略版本：${version}`);
+      if (current.lifecycle_status === "FROZEN" && (role !== current.role || lifecycleStatus !== current.lifecycle_status)) {
+        throw new Error("冻结 Champion 不允许原地修改角色或状态");
+      }
+      this.db.prepare("UPDATE strategy_versions SET role = ?, lifecycle_status = ?, updated_at = ? WHERE version = ?")
+        .run(role, lifecycleStatus, occurredAt, version);
+      this.db.prepare(`
+        INSERT INTO strategy_version_audit(occurred_at, version, old_role, new_role, old_status, new_status, reason, evidence_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(occurredAt, version, current.role, role, current.lifecycle_status, lifecycleStatus, reason, json(evidence));
+      return this.getStrategyVersion(version);
+    });
+  }
+
+  recordResearchRun(record) {
+    const result = this.db.prepare(`
+      INSERT INTO research_runs(run_type, started_at, finished_at, status, artifact_path, data_manifest_hash, strategy_version, summary_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.runType, record.startedAt, record.finishedAt, record.status, record.artifactPath ?? null,
+      record.dataManifestHash ?? null, record.strategyVersion ?? null, json(record.summary ?? {}));
+    return Number(result.lastInsertRowid);
+  }
+
+  getResearchRuns({ limit = 20, runType = null } = {}) {
+    const rows = runType
+      ? this.db.prepare("SELECT * FROM research_runs WHERE run_type = ? ORDER BY id DESC LIMIT ?").all(runType, limit)
+      : this.db.prepare("SELECT * FROM research_runs ORDER BY id DESC LIMIT ?").all(limit);
+    return rows.map((row) => ({ ...row, summary: parseJson(row.summary_json, {}) }));
   }
 
   getDataSourceStats(sourceKey) {
@@ -755,6 +1109,23 @@ export class PaperDatabase {
   }
   getOpenPosition() { return this.getOpenPositions()[0] ?? null; }
   getPosition(id) { return hydratePosition(this.db.prepare("SELECT * FROM positions WHERE id = ?").get(id)); }
+  getPositionGroup(groupId) {
+    const row = this.db.prepare("SELECT * FROM position_groups WHERE group_id = ?").get(groupId);
+    if (!row) return null;
+    const positions = this.db.prepare("SELECT * FROM positions WHERE position_group_id = ? ORDER BY id").all(groupId).map(hydratePosition);
+    return hydratePositionGroup(row, positions);
+  }
+  getPositionGroups({ status = null } = {}) {
+    const rows = status
+      ? this.db.prepare("SELECT * FROM position_groups WHERE status = ? ORDER BY group_id").all(status)
+      : this.db.prepare("SELECT * FROM position_groups ORDER BY group_id").all();
+    return rows.map((row) => this.getPositionGroup(row.group_id));
+  }
+  getOpenPositionGroups() { return this.getPositionGroups({ status: "OPEN" }); }
+  getPositionGroupMigrationAudit({ limit = 20 } = {}) {
+    return this.db.prepare("SELECT * FROM position_group_migration_audit ORDER BY id DESC LIMIT ?").all(limit)
+      .map((row) => ({ ...row, details: parseJson(row.details_json, {}) }));
+  }
 
   openPosition(candidate, snapshotId, { settingsUpdatedAt = null, settingsRevision = null } = {}) {
     return this.transaction(() => {
@@ -762,19 +1133,42 @@ export class PaperDatabase {
       if (settingsRevision !== null && settings.revision !== Number(settingsRevision)) throw new Error("运行时设置版本已变化，请下一轮重新计算仓位");
       if (settingsUpdatedAt && settings.updatedAt !== settingsUpdatedAt) throw new Error("运行时设置已变化，请下一轮重新计算仓位");
       const open = this.getOpenPositions();
-      if (open.length && !settings.allowPyramiding) throw new Error("已有模拟仓位且加仓已关闭");
+      const sameSide = open.filter((position) => position.side === candidate.side);
+      const oppositeSide = open.filter((position) => position.side !== candidate.side);
+      if (sameSide.length && !settings.allowPyramiding) throw new Error("已有模拟仓位（同方向）且加仓已关闭");
       if (open.length >= settings.maxOpenPositions) throw new Error("已达到最大同时仓位数");
-      if (open.some((position) => position.side !== candidate.side)) throw new Error("不允许同时持有 BTC 相反方向模拟仓位");
-      if (candidate.portfolioAfter) {
-        const equity = Number(candidate.accountEquityCny);
-        if (candidate.portfolioAfter.totalRiskCny > equity * settings.maxTotalRiskPct + 0.01) throw new Error("加仓后总风险超过上限");
-        if (candidate.portfolioAfter.totalMarginCny > equity * settings.maxMarginUsagePct + 0.01) throw new Error("加仓后保证金超过上限");
-        if (candidate.portfolioAfter.totalNotionalCny > equity * settings.maxTotalNotionalMultiple + 0.01) throw new Error("加仓后总名义仓位超过上限");
+      if (settings.positionMode === "NET" && oppositeSide.length) throw new Error("NET 模式不允许同时持有 BTC 相反方向模拟仓位");
+      const equity = Number(candidate.accountEquityCny);
+      const accountAfter = {
+        totalRiskCny: open.reduce((sum, position) => sum + Number(position.expected_loss_cny ?? position.risk_cny), 0)
+          + Number(candidate.expectedLossCny ?? candidate.riskCny),
+        totalMarginCny: open.reduce((sum, position) => sum + Number(position.margin_cny ?? position.notional_cny), 0)
+          + Number(candidate.marginCny ?? candidate.notionalCny),
+        totalNotionalCny: open.reduce((sum, position) => sum + Number(position.notional_cny), 0)
+          + Number(candidate.notionalCny)
+      };
+      const groupAfter = candidate.groupAfter ?? candidate.portfolioAfter;
+      if (Number.isFinite(equity) && equity > 0) {
+        if (accountAfter.totalRiskCny > equity * settings.maxTotalRiskPct + 0.01) throw new Error("开仓后总风险超过上限");
+        if (accountAfter.totalMarginCny > equity * settings.maxMarginUsagePct + 0.01) throw new Error("开仓后保证金超过上限");
+        if (accountAfter.totalNotionalCny > equity * settings.maxTotalNotionalMultiple + 0.01) throw new Error("开仓后总名义仓位超过上限");
       }
       const entryCost = numberOr(candidate.entryFeeCny) + numberOr(candidate.entrySlippageCny);
       const account = this.getAccount();
       const newBalance = Number(account.cash_cny) - entryCost;
-      const existingGroupId = open[0]?.position_group_id ?? open[0]?.id ?? null;
+      let groupId = sameSide[0]?.position_group_id ?? null;
+      if (groupId !== null) {
+        const group = this.db.prepare("SELECT * FROM position_groups WHERE group_id = ?").get(groupId);
+        if (!group || group.status !== "OPEN" || group.side !== candidate.side) {
+          throw new Error("Position Group 生命周期不一致；请先执行 positions:repair");
+        }
+      } else {
+        const groupResult = this.db.prepare(`
+          INSERT INTO position_groups(symbol, side, status, created_at, closed_at, migration_source, metadata_json)
+          VALUES (?, ?, 'OPEN', ?, NULL, 'PAPER_OPEN', '{}')
+        `).run(candidate.symbol, candidate.side, candidate.openedAt);
+        groupId = Number(groupResult.lastInsertRowid);
+      }
       const result = this.db.prepare(`
         INSERT INTO positions(
           position_group_id, snapshot_id, symbol, side, status, opened_at, entry_bar_ts, signal_entry_price, entry_price,
@@ -787,7 +1181,7 @@ export class PaperDatabase {
           opening_reasons_json, last_funding_at, last_management_bar_ts, management_json
         ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        existingGroupId, snapshotId, candidate.symbol, candidate.side, candidate.openedAt, candidate.entryBarTs,
+        groupId, snapshotId, candidate.symbol, candidate.side, candidate.openedAt, candidate.entryBarTs,
         candidate.signalEntryPrice ?? candidate.entry, candidate.entry,
         candidate.stopLoss, candidate.stopLoss, candidate.takeProfit, candidate.takeProfit,
         candidate.netRr ?? candidate.rr, candidate.netRr ?? candidate.rr, candidate.quantityBtc,
@@ -800,32 +1194,30 @@ export class PaperDatabase {
         candidate.slippageEstimateCny ?? 0, candidate.entryFeeCny, candidate.entrySlippageCny ?? 0,
         candidate.liquidationPriceEstimate ?? null, candidate.liquidationDistancePct ?? null,
         candidate.liquidationSource ?? "UNAVAILABLE", json(candidate.exchangeConstraints ?? {}),
-        json(candidate.portfolioAfter ?? {}), json(candidate.openingReasons), candidate.openedAt,
+        json(groupAfter ?? {}), json(candidate.openingReasons), candidate.openedAt,
         candidate.entryBarTs, json({ events: [] })
       );
       const positionId = Number(result.lastInsertRowid);
-      const groupId = existingGroupId ?? positionId;
-      this.db.prepare("UPDATE positions SET position_group_id = ? WHERE id = ?").run(groupId, positionId);
-      if (open.length && candidate.portfolioAfter) {
+      if (sameSide.length && groupAfter) {
         const groupEvent = {
           type: "PORTFOLIO_REBASED",
           at: candidate.openedAt,
           reason: "受控加仓后按净仓位重新计算平均成本、整体止损、整体止盈和账户风险暴露",
-          portfolioAfter: candidate.portfolioAfter
+          portfolioAfter: groupAfter
         };
-        for (const leg of [...open, this.getPosition(positionId)]) {
+        for (const leg of [...sameSide, this.getPosition(positionId)]) {
           const events = [...(leg.management?.events ?? []), groupEvent].slice(-100);
           this.db.prepare(`
-            UPDATE positions SET position_group_id = ?, stop_loss = ?, take_profit = ?,
-              liquidation_price_estimate = ?, liquidation_distance_pct = ?, liquidation_source = ?,
-              portfolio_after_json = ?, management_json = ? WHERE id = ? AND status = 'OPEN'
+            UPDATE positions SET position_group_id = ?, portfolio_after_json = ?, management_json = ?
+            WHERE id = ? AND status = 'OPEN'
           `).run(
-            groupId, candidate.portfolioAfter.overallStopLoss, candidate.portfolioAfter.overallTakeProfit,
-            candidate.portfolioAfter.liquidationPriceEstimate, candidate.portfolioAfter.liquidationDistancePct,
-            candidate.portfolioAfter.liquidationSource,
-            json(candidate.portfolioAfter), json({ events }), leg.id
+            groupId, json(groupAfter), json({ events }), leg.id
           );
         }
+      }
+      if (groupAfter) {
+        this.db.prepare("UPDATE position_groups SET metadata_json = ? WHERE group_id = ? AND status = 'OPEN'")
+          .run(json({ groupAfter, updatedAt: candidate.openedAt }), groupId);
       }
       this.db.prepare("UPDATE account_state SET cash_cny = ?, updated_at = ? WHERE id = 1").run(newBalance, candidate.openedAt);
       this.db.prepare(`
@@ -870,9 +1262,11 @@ export class PaperDatabase {
 
   updatePositionGroupManagement(positionGroupId, managementUpdate) {
     return this.transaction(() => {
+      const group = this.db.prepare("SELECT * FROM position_groups WHERE group_id = ?").get(positionGroupId);
+      if (!group || group.status !== "OPEN") throw new Error("Paper position group is not open");
       const positions = this.db.prepare(`
-        SELECT * FROM positions WHERE position_group_id = ? AND status = 'OPEN' ORDER BY id
-      `).all(positionGroupId).map(hydratePosition);
+        SELECT * FROM positions WHERE position_group_id = ? AND side = ? AND status = 'OPEN' ORDER BY id
+      `).all(positionGroupId, group.side).map(hydratePosition);
       if (!positions.length) throw new Error("Paper position group is not open");
       for (const position of positions) {
         const events = [...(position.management?.events ?? []), ...(managementUpdate.event ? [managementUpdate.event] : [])].slice(-100);
@@ -888,8 +1282,8 @@ export class PaperDatabase {
         );
       }
       return this.db.prepare(`
-        SELECT * FROM positions WHERE position_group_id = ? AND status = 'OPEN' ORDER BY id
-      `).all(positionGroupId).map(hydratePosition);
+        SELECT * FROM positions WHERE position_group_id = ? AND side = ? AND status = 'OPEN' ORDER BY id
+      `).all(positionGroupId, group.side).map(hydratePosition);
     });
   }
 
@@ -965,6 +1359,16 @@ export class PaperDatabase {
         netPnlCny: netPnl,
         managementReason: exit.managementReason ?? null
       }));
+      const remaining = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM positions
+        WHERE position_group_id = ? AND status = 'OPEN'
+      `).get(position.position_group_id).count);
+      if (remaining === 0) {
+        this.db.prepare(`
+          UPDATE position_groups SET status = 'CLOSED', closed_at = ?
+          WHERE group_id = ? AND status = 'OPEN'
+        `).run(exit.closedAt, position.position_group_id);
+      }
       return this.getPosition(positionId);
     });
   }

@@ -63,6 +63,7 @@ export const PAPER_EXCHANGE_CONSTRAINTS = Object.freeze({
 });
 
 export const RUNTIME_SETTINGS_DEFAULTS = Object.freeze({
+  positionMode: "NET",
   riskProfile: "BALANCED",
   riskMode: "AUTO",
   riskMinPct: 0.005,
@@ -105,7 +106,9 @@ export const RUNTIME_SETTINGS_DEFAULTS = Object.freeze({
   lossStreakMax: 10,
   lossStreakManual: 4,
   maxConsecutiveLosses: 7,
-  newEntriesPaused: false
+  newEntriesPaused: false,
+  indicatorProfile: "AUTO",
+  monitorIntervalMinutes: 5
 });
 
 export const RUNTIME_SETTING_LIMITS = Object.freeze({
@@ -140,7 +143,8 @@ export const RUNTIME_SETTING_LIMITS = Object.freeze({
   lossStreakMin: [1, 20],
   lossStreakMax: [1, 20],
   lossStreakManual: [1, 20],
-  maxConsecutiveLosses: [1, 20]
+  maxConsecutiveLosses: [1, 20],
+  monitorIntervalMinutes: [5, 240]
 });
 
 export const HEALTH_CONFIG = Object.freeze({

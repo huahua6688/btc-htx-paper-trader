@@ -8,10 +8,11 @@ import { analyzeChallenger, analyzeHistoricalCompatible } from "./challenger-str
 import { readJson, resolveResearchPath } from "./research-utils.mjs";
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger } from "./anti-chase-challenger.mjs";
+import { analyzeResearchChallengerV2 } from "./research-challenger-v2.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
-if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase"].includes(activeShadow.strategyType))) {
+if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2"].includes(activeShadow.strategyType))) {
   throw new Error("Active Shadow strategy is not an approved Paper-only research configuration");
 }
 const activeEdgeModel = activeShadow?.strategyType === "tradable-edge"
@@ -24,7 +25,11 @@ if (activeShadow?.strategyType === "tradable-edge"
 const shadowDatabasePath = activeShadow?.databasePath ?? SHADOW_CONFIG.databasePath;
 const shadowStrategyVersion = activeShadow?.version ?? SHADOW_CONFIG.strategyVersion;
 const shadowAnalyze = activeShadow
-  ? activeShadow.strategyType === "anti-chase"
+  ? activeShadow.strategyType === "research-v2"
+    ? (market) => analyzeResearchChallengerV2(market, activeShadow.parameters, undefined, {
+        indicatorProfile: shadowDb?.getRuntimeSettings()?.indicatorProfile ?? activeShadow.parameters?.indicatorProfile
+      })
+    : activeShadow.strategyType === "anti-chase"
     ? (market) => analyzeAntiChaseChallenger(market, activeShadow.parameters)
     : activeShadow.strategyType === "tradable-edge"
     ? (market) => analyzeTradableEdge(market, {
@@ -107,7 +112,8 @@ async function main() {
       return;
     }
     const elapsed = Date.now() - cycleStartedAt;
-    const delay = Math.max(0, PAPER_CONFIG.monitorIntervalMs - elapsed);
+    const configuredInterval = Number(db.getRuntimeSettings().monitorIntervalMinutes) * 60_000;
+    const delay = Math.max(0, configuredInterval - elapsed);
     process.stdout.write(`下一次运行：约 ${Math.ceil(delay / 60_000)} 分钟后。按 Ctrl+C 安全停止。\n`);
     timer = setTimeout(loop, delay);
   };

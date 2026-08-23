@@ -22,6 +22,7 @@ import { buildPointInTimeMarket, firstReplayableIndex } from "./replay-market.mj
 import { BAR_MS, hashObject, mean, round, standardDeviation } from "./research-utils.mjs";
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
+import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
   signalClock: "decision at completed 15m candle close",
@@ -121,8 +122,10 @@ function buildReport(strategy, market, parameters, config) {
       ? analyzeHistoricalCompatible(market, parameters, config)
       : strategy === "tradable-edge"
         ? analyzeTradableEdge(market, parameters, config)
-        : strategy === "anti-chase"
+      : strategy === "anti-chase"
           ? analyzeAntiChaseChallenger(market, parameters, config)
+        : strategy === "research-v2"
+          ? analyzeResearchChallengerV2(market, parameters, config)
       : analyzeChallenger(market, parameters, config);
   const candle = market.replay.eventCandle;
   report.latest15mBar = {
@@ -281,9 +284,10 @@ export async function runHistoricalReplay(dataset, {
   collectTrace = true,
   forceCloseAtEnd = true
 } = {}) {
-  if (!["champion", "challenger", "historical-compatible", "tradable-edge", "anti-chase"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
+  if (!["champion", "challenger", "historical-compatible", "tradable-edge", "anti-chase", "research-v2"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
   if (strategy === "historical-compatible" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = HISTORICAL_COMPATIBLE_PARAMETERS;
   if (strategy === "anti-chase" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = ANTI_CHASE_PARAMETERS;
+  if (strategy === "research-v2" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = RESEARCH_CHALLENGER_V2_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
   const warmupIndex = firstReplayableIndex(dataset.candles);
@@ -347,6 +351,9 @@ export async function runHistoricalReplay(dataset, {
         opportunityIndex: report.opportunityIndex ?? null,
         tradableEdge: report.tradableEdge ?? null,
         entryQuality: report.entryQuality ?? null,
+        entryGeometry: report.entryGeometry ?? null,
+        indicatorProfile: report.multiScaleContext?.profile?.selected ?? null,
+        directionState: report.directionState ?? null,
         regime: report.strategy.marketRegime,
         validForEntry: report.dataQuality.validForEntry,
         riskGates: report.riskGates
@@ -406,6 +413,10 @@ export async function runHistoricalReplay(dataset, {
         "Tradable Edge uses a frozen non-ML empirical model trained only on its declared pre-OOS interval.",
         "Every entry still passes the unchanged Paper risk/execution core after the net-edge gate.",
         "Unavailable historical execution and derivatives fields remain absent and are never synthesized."
+      ] : strategy === "research-v2" ? [
+        "Research V2 uses only point-in-time closed OHLCV and timestamp-visible Funding in historical replay.",
+        "Its independent-dimension scoring, price-extension gate, structure target and Tradable Edge calculation are shared with live Shadow; it does not modify the frozen V1.2 Champion.",
+        "Historical Order Book/OI/liquidations/elite positioning are absent and never synthesized; the derivatives dimension degrades to actually visible Funding only."
       ] : [
         "Challenger uses only timestamp-valid candle and Funding fields; it is a research strategy and does not replace Champion."
       ]

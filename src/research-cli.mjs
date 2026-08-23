@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { CHALLENGER_BASE_PARAMETERS, HISTORICAL_COMPATIBLE_PARAMETERS } from "./challenger-strategy.mjs";
 import { openPaperDatabase } from "./db.mjs";
 import { runCounterfactualReview } from "./counterfactual-review.mjs";
-import { auditExternalMarketFeatures } from "./external-features.mjs";
+import { auditExternalMarketFeatureCatalog } from "./external-feature-catalog.mjs";
 import { datasetView, runCurrentChallengerDiagnosis } from "./edge-diagnosis.mjs";
 import { runEdgeCandidatePipeline } from "./edge-candidate-pipeline.mjs";
 import { runHistoricalFeatureAblation } from "./feature-ablation.mjs";
@@ -146,7 +146,7 @@ async function counterfactual(args) {
 async function externalAudit(args) {
   const directory = resolveOutputPath(runId("external-features"));
   await mkdir(directory, { recursive: true });
-  const report = await auditExternalMarketFeatures({ directory });
+  const report = await auditExternalMarketFeatureCatalog({ directory });
   const db = openPaperDatabase(args.db);
   try { db.applyResearchFeatureAudit(report.features, report.generatedAt); } finally { db.close(); }
   process.stdout.write(`${JSON.stringify({ directory, report }, null, 2)}\n`);
@@ -338,7 +338,7 @@ async function full(args) {
   const dataset = await load(args);
   const directory = resolveOutputPath(runId("full-research"));
   await mkdir(directory, { recursive: true });
-  const external = await auditExternalMarketFeatures({ directory: join(directory, "external") });
+  const external = await auditExternalMarketFeatureCatalog({ directory: join(directory, "external") });
   const registryDb = openPaperDatabase(args.db);
   try { registryDb.applyResearchFeatureAudit(external.features, external.generatedAt); } finally { registryDb.close(); }
   const comparison = await runChampionChallengerComparison(dataset, { ...selected, outputDirectory: join(directory, "same-event") });

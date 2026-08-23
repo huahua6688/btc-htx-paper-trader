@@ -63,6 +63,7 @@ function scenarioSummary(report) {
 
 export async function runMonteCarloRobustness(dataset, baseReplay, {
   parameters,
+  strategy = baseReplay.strategy ?? "challenger",
   from = baseReplay.requestedRange.from,
   to = baseReplay.requestedRange.to,
   iterations = 2_000,
@@ -83,14 +84,19 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
   const losses = values.filter((value) => value < 0).sort((a, b) => a - b);
   const wins = values.filter((value) => value >= 0);
   const lossStreak = pathMetrics([...losses, ...wins], initialCapital);
-  const common = { strategy: "challenger", parameters, from, to, collectTrace: false };
+  const common = { strategy, parameters, from, to, collectTrace: false };
   const [costWorse, slippageWorse, delay2, delay3] = await Promise.all([
     runHistoricalReplay(dataset, { ...common, paperConfig: { ...PAPER_CONFIG, feeRatePerSide: PAPER_CONFIG.feeRatePerSide * 1.5 }, outputDirectory: outputDirectory ? `${outputDirectory}/cost-150pct` : undefined }),
     runHistoricalReplay(dataset, { ...common, paperConfig: { ...PAPER_CONFIG, slippageRate: PAPER_CONFIG.slippageRate * 2 }, outputDirectory: outputDirectory ? `${outputDirectory}/slippage-200pct` : undefined }),
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 2, outputDirectory: outputDirectory ? `${outputDirectory}/delay-2bars` : undefined }),
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 3, outputDirectory: outputDirectory ? `${outputDirectory}/delay-3bars` : undefined })
   ]);
-  const perturbations = [
+  const perturbations = strategy === "research-v2" ? [
+    { label: "direction-strength-minus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 0.95 } },
+    { label: "direction-strength-plus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 1.05 } },
+    { label: "net-edge-minus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 0.95 } },
+    { label: "extension-plus-5pct", patch: { maximumExtensionAtr1h: parameters.maximumExtensionAtr1h * 1.05 } }
+  ] : [
     { label: "signal-threshold-minus-5pct", patch: { signalThreshold: parameters.signalThreshold * 0.95 } },
     { label: "signal-threshold-plus-5pct", patch: { signalThreshold: parameters.signalThreshold * 1.05 } },
     { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },

@@ -68,7 +68,9 @@ export function formatStatus(db) {
     `已实现盈亏：${n(state.realizedPnlCny)} CNY`,
     `未实现盈亏：${n(state.unrealizedPnlCny)} CNY`,
     `保证金占用：${n(state.marginUsedCny)} CNY`,
-    `总名义仓位：${n(state.totalNotionalCny)} CNY`,
+    `LONG 名义仓位：${n(state.longNotionalCny)} CNY`,
+    `SHORT 名义仓位：${n(state.shortNotionalCny)} CNY`,
+    `Gross Notional：${n(state.grossNotionalCny)} CNY（多空不抵消）`,
     `当前有效杠杆：${n(state.effectiveLeverage)}x`,
     `当前总风险：${n(state.totalRiskCny)} CNY（${pct(state.totalRiskPct)}）`,
     `今日损益：${n(risk.dailyPnlCny)} CNY；连亏 ${risk.consecutiveLosses} 笔；${risk.paused ? `暂停：${risk.pauseReasons.join("；")}` : "允许评估新仓"}`,
@@ -86,28 +88,32 @@ export function formatStatus(db) {
   }
   lines.push("", "当前仓位");
   if (!state.positions.length) lines.push("无");
-  if (state.positions.length > 1) {
-    lines.push(`组合：平均入场 ${n(state.averageEntryPrice, 1)} / 整体 SL ${n(state.overallStopLoss, 1)} / 整体 TP ${n(state.overallTakeProfit, 1)}`);
-  }
-  for (const position of state.positions) {
-    const current = Number(snapshot?.price);
-    const stopDistance = position.side === "LONG"
-      ? (current - Number(position.stop_loss)) / current
-      : (Number(position.stop_loss) - current) / current;
-    const targetDistance = position.side === "LONG"
-      ? (Number(position.take_profit) - current) / current
-      : (current - Number(position.take_profit)) / current;
-    lines.push(
-      `#${position.id} ${position.side}：entry ${n(position.entry_price, 1)} / SL ${n(position.stop_loss, 1)} / TP ${n(position.take_profit, 1)}`,
-      `  距离 SL ${pct(stopDistance)} / TP ${pct(targetDistance)}；数量 ${n(position.quantity_btc, 8)} BTC`,
-      `  保证金 ${n(position.margin_cny)} CNY / ${n(position.leverage)}x / 名义 ${n(position.notional_cny)} CNY / 未实现 ${n(calculateUnrealized(position, snapshot?.price))} CNY`,
-      `  Paper 估算强平 ${n(position.liquidation_price_estimate, 1)} USDT（非 HTX 实际强平价）`
-    );
+  for (const group of state.positionGroups) {
+    lines.push(`${group.side === "LONG" ? "🟢 LONG" : "🔴 SHORT"} GROUP #${group.groupId}：${group.positionCount} 个实际仓位`);
+    for (const position of group.positions) {
+      const current = Number(snapshot?.price);
+      const stopDistance = position.side === "LONG"
+        ? (current - Number(position.stop_loss)) / current
+        : (Number(position.stop_loss) - current) / current;
+      const targetDistance = position.side === "LONG"
+        ? (Number(position.take_profit) - current) / current
+        : (current - Number(position.take_profit)) / current;
+      lines.push(
+        `#${position.id}：entry ${n(position.entry_price, 1)} / SL ${n(position.stop_loss, 1)} / TP ${n(position.take_profit, 1)}`,
+        `  距离 SL ${pct(stopDistance)} / TP ${pct(targetDistance)}；数量 ${n(position.quantity_btc, 8)} BTC`,
+        `  保证金 ${n(position.margin_cny)} CNY / ${n(position.leverage)}x / 名义 ${n(position.notional_cny)} CNY / 未实现 ${n(calculateUnrealized(position, snapshot?.price))} CNY / 风险 ${n(position.expected_loss_cny ?? position.risk_cny)} CNY`,
+        `  Paper 估算强平 ${n(position.liquidation_price_estimate, 1)} USDT（非 HTX 实际强平价）`
+      );
+      if (position.legacy_contract_math_status === "LEGACY_UNKNOWN") {
+        lines.push("  ⚠️ 旧仓合约数据缺失；风险/可用资金按保证金=名义仓位的保守 1x fallback 计算，未伪造杠杆或强平价。");
+      }
+    }
   }
   lines.push(
     "",
     "运行时设置（SQLite 持久化）",
     `配置版本 ${settings.revision} / 风险偏好 ${riskProfileChinese(settings.riskProfile)}`,
+    `持仓模式：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
     `单笔风险 ${controlModeChinese(settings.riskMode)}：${pct(settings.riskMinPct)}～${pct(settings.riskMaxPct)}；当前限制 ${pct(settings.riskPerTradePct)}`,
     `总风险 ${controlModeChinese(settings.totalRiskMode)}：${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}；当前 ${pct(settings.maxTotalRiskPct)}`,
     `保证金 ${controlModeChinese(settings.marginMode)}：${pct(settings.marginMinUsagePct)}～${pct(settings.marginMaxUsagePct)}；当前上限 ${pct(settings.maxMarginUsagePct)}`,

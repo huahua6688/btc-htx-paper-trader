@@ -20,6 +20,9 @@ function closeWith(db, position, exit, actions) {
 }
 
 function aggregatePositionGroup(positions) {
+  if (!positions.length) throw new Error("Paper position group has no open positions");
+  const sides = new Set(positions.map((position) => position.side));
+  if (sides.size !== 1) throw new Error("Position Group contains mixed LONG/SHORT legs");
   const quantity = positions.reduce((sum, item) => sum + Number(item.quantity_btc), 0);
   const weighted = (field) => quantity > 0
     ? positions.reduce((sum, item) => sum + Number(item[field]) * Number(item.quantity_btc), 0) / quantity
@@ -27,8 +30,8 @@ function aggregatePositionGroup(positions) {
   const root = positions[0];
   return {
     ...root,
-    id: root.position_group_id ?? root.id,
-    position_group_id: root.position_group_id ?? root.id,
+    id: root.position_group_id,
+    position_group_id: root.position_group_id,
     entry_price: weighted("entry_price"),
     signal_entry_price: weighted("signal_entry_price"),
     initial_stop_loss: weighted("initial_stop_loss"),
@@ -70,15 +73,12 @@ export async function runMonitorCycle(db, {
       actions.push({ type: "LEGACY_SETUP_CANCELLED", setup: cancelled });
     }
 
-    let closedThisCycle = false;
+    const blockedEntrySides = new Map();
     const coreDataFresh = coreMarketDataFreshForTrading(report, market);
-    const groups = new Map();
-    for (const position of db.getOpenPositions()) {
-      const key = position.position_group_id ?? position.id;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(position);
-    }
-    for (const [groupId, originalPositions] of groups) {
+    const groups = db.getOpenPositionGroups();
+    for (const group of groups) {
+      const groupId = group.group_id;
+      const originalPositions = group.positions.filter((position) => position.status === "OPEN");
       let positions = [];
       for (const original of originalPositions) {
         const funding = applyDueFunding(db, original, report);
@@ -97,26 +97,22 @@ export async function runMonitorCycle(db, {
         continue;
       }
 
-      const hardExits = positions.map((position) => evaluatePaperExit(position, report, config, { checkStop: true, checkTarget: false }));
-      const firstHardExit = hardExits.find(Boolean);
-      if (firstHardExit) {
-        for (let index = 0; index < positions.length; index += 1) {
-          const exit = hardExits[index] ?? evaluatePaperExit(positions[index], report, config, {
-            checkStop: false,
-            checkTarget: false,
-            forcedReason: firstHardExit.exitReason,
-            managementReason: "同一净仓位组统一执行风险退出"
-          });
-          closeWith(db, positions[index], exit, actions);
+      // Position Group 隔离生命周期；组内每个实际仓位仍保留自己的 SL/TP/PnL。
+      // 某一腿触发退出不会强制关闭同组其他腿，更不会影响另一方向 group。
+      const survivors = [];
+      for (const position of positions) {
+        const hardExit = evaluatePaperExit(position, report, config, { checkStop: true, checkTarget: false });
+        if (hardExit) {
+          closeWith(db, position, hardExit, actions);
+          blockedEntrySides.set(group.side, "本轮该方向仓位刚完成风险退出，禁止同方向立即重开");
+        } else {
+          survivors.push(position);
         }
-        closedThisCycle = true;
-        continue;
       }
 
-      const aggregate = aggregatePositionGroup(positions);
-      const management = manageOpenPosition(aggregate, report);
-      if (management.action === "EXIT") {
-        for (const position of positions) {
+      for (let position of survivors) {
+        const management = manageOpenPosition(position, report);
+        if (management.action === "EXIT") {
           const exit = evaluatePaperExit(position, report, config, {
             checkStop: false,
             checkTarget: false,
@@ -124,35 +120,29 @@ export async function runMonitorCycle(db, {
             managementReason: management.reason
           });
           closeWith(db, position, exit, actions);
+          blockedEntrySides.set(group.side, "本轮该方向仓位刚因逻辑变化退出，禁止立即重开");
+          if (report.decision !== group.side && ["LONG", "SHORT"].includes(report.decision)) {
+            blockedEntrySides.set(report.decision, "相反方向刚触发逻辑退出，等待下一轮确认，避免机械平仓后立刻反手");
+          }
+          continue;
         }
-        closedThisCycle = true;
-        continue;
-      }
-      if (management.action === "UPDATE") {
-        positions = db.updatePositionGroupManagement(groupId, management);
-        actions.push({ type: "POSITION_MANAGED", position: aggregatePositionGroup(positions), positions, management });
-      } else {
-        actions.push({ type: "POSITION_HELD", position: aggregate, positions, management });
-      }
+        if (management.action === "UPDATE") {
+          position = db.updatePositionManagement(position.id, management);
+          actions.push({ type: "POSITION_MANAGED", groupId, position, positions: [position], management });
+        } else {
+          actions.push({ type: "POSITION_HELD", groupId, position, positions: [position], management });
+        }
 
-      const targetExits = positions.map((position) => evaluatePaperExit(position, report, config, { checkStop: false, checkTarget: true }));
-      const firstTargetExit = targetExits.find(Boolean);
-      if (firstTargetExit) {
-        for (let index = 0; index < positions.length; index += 1) {
-          const exit = targetExits[index] ?? evaluatePaperExit(positions[index], report, config, {
-            checkStop: false,
-            checkTarget: false,
-            forcedReason: "TP",
-            managementReason: "同一净仓位组统一止盈"
-          });
-          closeWith(db, positions[index], exit, actions);
+        const targetExit = evaluatePaperExit(position, report, config, { checkStop: false, checkTarget: true });
+        if (targetExit) {
+          closeWith(db, position, targetExit, actions);
+          blockedEntrySides.set(group.side, "本轮该方向仓位刚止盈，禁止同方向立即重开");
         }
-        closedThisCycle = true;
       }
     }
 
-    if (closedThisCycle) {
-      noEntry(actions, ["本轮刚完成平仓，等待下一轮重新确认后再考虑新方向，避免机械反手"], null);
+    if (blockedEntrySides.has(report.decision)) {
+      noEntry(actions, [blockedEntrySides.get(report.decision)], null);
     } else if (!coreDataFresh) {
       noEntry(actions, ["核心价格/K线不够新鲜，本轮禁止新开仓，且不会用陈旧价格触发持仓动作"], null);
     } else {
@@ -185,6 +175,7 @@ export async function runMonitorCycle(db, {
       actions,
       position: db.getOpenPosition(),
       positions: db.getOpenPositions(),
+      positionGroups: db.getOpenPositionGroups(),
       runtimeSettings: db.getRuntimeSettings(),
       marketSnapshot: market,
       collectionWarnings: market.collectionWarnings ?? []

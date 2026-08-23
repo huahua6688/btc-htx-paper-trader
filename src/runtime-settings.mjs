@@ -2,6 +2,9 @@ import { RUNTIME_SETTING_LIMITS, RUNTIME_SETTINGS_DEFAULTS } from "./config.mjs"
 
 export const RISK_PROFILES = Object.freeze(["CONSERVATIVE", "BALANCED", "AGGRESSIVE"]);
 export const CONTROL_MODES = Object.freeze(["AUTO", "MANUAL"]);
+export const INDICATOR_PROFILE_KEYS = Object.freeze(["SHORT_SWING", "STANDARD_SWING", "LONG_SWING", "AUTO"]);
+export const MONITOR_INTERVAL_CHOICES = Object.freeze([5, 15, 60, 240]);
+export const POSITION_MODES = Object.freeze(["NET", "HEDGE"]);
 
 export const RANGE_DEFINITIONS = Object.freeze({
   risk: Object.freeze({ mode: "riskMode", minimum: "riskMinPct", maximum: "riskMaxPct", manual: "riskManualPct", effective: "riskPerTradePct" }),
@@ -15,12 +18,15 @@ export const RANGE_DEFINITIONS = Object.freeze({
 });
 
 export const RUNTIME_SETTING_KEYS = Object.freeze([
+  "positionMode",
   "riskProfile",
   ...Object.values(RANGE_DEFINITIONS).flatMap((definition) => [
     definition.mode, definition.minimum, definition.maximum, definition.manual, definition.effective
   ]),
   "allowPyramiding",
-  "newEntriesPaused"
+  "newEntriesPaused",
+  "indicatorProfile",
+  "monitorIntervalMinutes"
 ]);
 
 const finite = (value) => Number.isFinite(Number(value));
@@ -61,7 +67,9 @@ export function materializeRuntimeSettings(settings) {
       : autoValue(definition, output);
     output[definition.effective] = definition.integer ? Math.round(selected) : selected;
   }
-  if (!output.allowPyramiding) output.maxOpenPositions = 1;
+  // 加仓开关只控制同方向增加新腿。HEDGE 下即使关闭加仓，也可以在
+  // maxOpenPositions 允许时各持有一条 LONG 与 SHORT。
+  if (!output.allowPyramiding && output.positionMode === "NET") output.maxOpenPositions = 1;
   return output;
 }
 
@@ -82,9 +90,21 @@ export function validateRuntimePatch(patch) {
   const output = {};
   for (const [key, rawValue] of Object.entries(patch)) {
     if (!RUNTIME_SETTING_KEYS.includes(key)) throw new Error(`不支持的运行时参数：${key}`);
-    if (key === "riskProfile") {
+    if (key === "positionMode") {
+      const value = String(rawValue).toUpperCase();
+      if (!POSITION_MODES.includes(value)) throw new Error(`positionMode 必须是 ${POSITION_MODES.join("/")}`);
+      output[key] = value;
+    } else if (key === "riskProfile") {
       const value = String(rawValue).toUpperCase();
       if (!RISK_PROFILES.includes(value)) throw new Error(`风险偏好必须是 ${RISK_PROFILES.join("/")}`);
+      output[key] = value;
+    } else if (key === "indicatorProfile") {
+      const value = String(rawValue).toUpperCase();
+      if (!INDICATOR_PROFILE_KEYS.includes(value)) throw new Error(`indicatorProfile 必须是 ${INDICATOR_PROFILE_KEYS.join("/")}`);
+      output[key] = value;
+    } else if (key === "monitorIntervalMinutes") {
+      const value = Number(rawValue);
+      if (!MONITOR_INTERVAL_CHOICES.includes(value)) throw new Error(`monitorIntervalMinutes 必须是 ${MONITOR_INTERVAL_CHOICES.join("/")}`);
       output[key] = value;
     } else if (Object.values(RANGE_DEFINITIONS).some((definition) => definition.mode === key)) {
       const value = String(rawValue).toUpperCase();
