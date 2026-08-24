@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { HtxPublicResearchClient, HTX_RESEARCH_ENDPOINTS } from "./htx-public-research-client.mjs";
+import { loadHtxDownloadCenterCatalog } from "./htx-download-center.mjs";
 import {
   BAR_MS,
   ceilBar,
@@ -29,12 +30,12 @@ export const HISTORICAL_DATA_TYPES = Object.freeze([
 ]);
 
 export const HTX_HISTORICAL_CAPABILITIES = Object.freeze({
-  kline: { mode: "REQUESTED_RANGE", pagination: "from/to chunks up to 2000 rows", interval: "15m", verifiedEarliest: "2020-10-21T09:00:00.000Z" },
-  funding: { mode: "PAGINATED_HISTORY", pagination: "page_index/page_size up to 50", interval: "8h settlement", verifiedEarliest: "2020-10-21T16:00:00.000Z" },
+  kline: { mode: "REQUESTED_RANGE_PLUS_OFFICIAL_DOWNLOAD_CENTER", pagination: "REST from/to chunks up to 2000 rows; daily Download Center archives from 2026-02-01", interval: "15m", verifiedEarliest: "2020-10-21T09:00:00.000Z" },
+  funding: { mode: "PAGINATED_HISTORY_PLUS_OFFICIAL_DOWNLOAD_CENTER", pagination: "REST page_index/page_size up to 50; daily Download Center archives from 2026-02-01", interval: "8h settlement", verifiedEarliest: "2020-10-21T16:00:00.000Z" },
   openInterest: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 200 },
   eliteAccount: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 30 },
   elitePosition: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 30 },
-  markPrice: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 2000 },
+  markPrice: { mode: "OFFICIAL_DOWNLOAD_CENTER_PLUS_BOUNDED_LATEST_WINDOW", pagination: "daily 15m archives from 2026-02-01; REST latest window remains available", interval: "15m/60m", maximumRows: 2000 },
   premium: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 2000 },
   basis: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 2000 },
   liquidations: { mode: "LATEST_50_ONLY", pagination: "v3 endpoint has no historical page cursor", interval: "irregular", maximumRows: 50 },
@@ -44,7 +45,13 @@ export const HTX_HISTORICAL_CAPABILITIES = Object.freeze({
     interval: "8h settlement",
     retentionNote: "HTX returns only its currently retained recent window; requested start/end do not imply arbitrary historical coverage"
   },
-  depth: { mode: "HISTORICAL_UNAVAILABLE", pagination: "none", interval: "snapshot only" }
+  depth: {
+    mode: "OFFICIAL_DOWNLOAD_CENTER_CATALOG_ON_DEMAND",
+    pagination: "daily futures L2 150 and spot L2 400 archives",
+    interval: "exchange timestamped updates/snapshots",
+    verifiedEarliest: "2026-05-28T00:00:00.000Z",
+    note: "Large archives are checksum-cataloged and are not downloaded into replay by default; dates before verified coverage remain HISTORICAL_UNAVAILABLE"
+  }
 });
 
 function assertPublicUrl(url, expectedPath) {
@@ -363,7 +370,7 @@ function sourceManifest(type, records, {
     type,
     availability: fetchError ? "LIVE_FAILURE" : historicalUnavailable ? "HISTORICAL_UNAVAILABLE" : records.length ? "HTX_HISTORICAL" : "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE",
     capability,
-    source: type === "depth" ? `${HTX_HOST}${HTX_RESEARCH_ENDPOINTS.depth}`
+    source: type === "depth" ? "https://www.htx.com/futures/data/landing_page"
       : type === "settlement" ? `${HTX_HOST}${HTX_RESEARCH_ENDPOINTS.settlement}`
         : BOUNDED_REQUESTS[type] ? `${HTX_HOST}${BOUNDED_REQUESTS[type].path}` : null,
     provenance: records.length ? "HTX_HISTORICAL" : "HISTORICAL_UNAVAILABLE",
@@ -459,6 +466,7 @@ export async function updateHistoricalDataset({
   const sources = {};
   const series = {};
   const fetchErrors = [];
+  const downloadCenter = await readJson(join(directory, "download-center", "manifest.json"), null);
 
   const candleRecords = allCandles.filter((row) => row.timestamp >= requestedStart && row.timestamp <= requestedEnd);
   sources.kline = {
@@ -514,11 +522,23 @@ export async function updateHistoricalDataset({
     if (type === "depth") {
       if (!checkpoint.completed.depth) {
         await writeJsonAtomic(path, []);
-        checkpoint.completed.depth = { at: new Date().toISOString(), records: 0, reason: "HISTORICAL_UNAVAILABLE" };
+        checkpoint.completed.depth = {
+          at: new Date().toISOString(),
+          records: 0,
+          reason: "DOWNLOAD_CENTER_CATALOG_ON_DEMAND_NOT_INGESTED_TO_REPLAY"
+        };
         await saveCheckpoint();
       }
       records = [];
-      sources.depth = sourceManifest("depth", records, { file: relativeFile, fileSha256: sha256(`${JSON.stringify(records, null, 2)}\n`) });
+      const catalogedDepth = (downloadCenter?.archives ?? []).filter((item) =>
+        ["futuresDepth", "spotDepth"].includes(item.type) && item.availability === "CATALOGED_ON_DEMAND"
+      );
+      sources.depth = {
+        ...sourceManifest("depth", records, { file: relativeFile, fileSha256: sha256(`${JSON.stringify(records, null, 2)}\n`) }),
+        availability: catalogedDepth.length ? "CATALOGED_ON_DEMAND_NOT_INGESTED_TO_REPLAY" : "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE",
+        provenance: catalogedDepth.length ? "HTX_OFFICIAL_DOWNLOAD_CENTER_2026" : "HISTORICAL_UNAVAILABLE",
+        downloadCenterArchives: catalogedDepth.map((item) => ({ type: item.type, date: item.date, officialChecksum: item.officialChecksum }))
+      };
       series.depth = records;
       continue;
     }
@@ -567,6 +587,7 @@ export async function updateHistoricalDataset({
     source: {
       kline: `${HTX_HOST}${KLINE_PATH}`,
       funding: `${HTX_HOST}${FUNDING_PATH}`,
+      officialDownloadCenter: "https://www.htx.com/futures/data/landing_page",
       authentication: "none",
       writeOperations: false
     },
@@ -596,6 +617,19 @@ export async function updateHistoricalDataset({
       missingPolicy: "Funding settlement uses only the exact timestamped historical rate. Between settlements, the last observed rate may be labeled and used only as an entry-cost estimate; it is never represented as the future settlement rate."
     },
     sources,
+    downloadCenter: downloadCenter ? {
+      catalogId: downloadCenter.catalogId,
+      manifestHash: downloadCenter.manifestHash,
+      status: downloadCenter.status,
+      requestedCoverage: downloadCenter.requestedCoverage,
+      settlementRestUsedAsDownloadCenter: false,
+      directory: "download-center"
+    } : {
+      status: "NOT_CATALOGED_LOCALLY",
+      officialServiceVerified: true,
+      settlementRestUsedAsDownloadCenter: false,
+      directory: "download-center"
+    },
     checkpoint: {
       path: "checkpoint.json",
       status: fetchErrors.length ? "PARTIAL" : "COMPLETE",
@@ -606,9 +640,10 @@ export async function updateHistoricalDataset({
     quality: fetchErrors.length || audit.gaps.length || audit.boundaryMissing ? "DEGRADED" : "VALID",
     fetchErrors,
     historyLimitations: [
-      "Depth has no HTX historical endpoint and is never reconstructed from candles.",
-      "OI, elite ratios, mark, premium and basis are bounded latest-window endpoints without arbitrary historical pagination.",
-      "Settlement history is an HTX-retention-bounded recent window, is retained for venue-risk diagnostics, and is not treated as an independent directional alpha factor.",
+      "Official Download Center daily BTC-USDT perpetual/spot Kline, trades, mark/index price and funding archives were verified from 2026-02-01; futures L2 150 and spot L2 400 depth were verified from 2026-05-28. Earlier missing dates remain HISTORICAL_UNAVAILABLE.",
+      "Large trades/depth archives are checksum-cataloged on demand and are never reconstructed from candles or silently loaded into replay.",
+      "OI, elite ratios, premium and basis remain bounded latest-window REST endpoints without arbitrary historical pagination.",
+      "Settlement REST is an HTX-retention-bounded paginated window and is explicitly not represented as the Historical Data Download Center.",
       "The legacy 90-day liquidation endpoint is offline; v3 exposes only the latest 50 observations, so deeper history must accumulate in the self archive.",
       "A missing historical field remains null with explicit provenance; current values are never copied backwards."
     ]
@@ -644,7 +679,25 @@ export async function loadHistoricalDataset(directory = defaultCatalogDirectory(
     if (source.sha256 && sha256(text) !== source.sha256) throw new Error(`${type} cache hash does not match manifest`);
     series[type] = JSON.parse(text);
   }
-  return { directory, manifest, candles, funding, series };
+  let downloadCenter = null;
+  if (await readJson(join(directory, "download-center", "manifest.json"), null)) {
+    downloadCenter = await loadHtxDownloadCenterCatalog(join(directory, "download-center"));
+    series.markPrice = mergeTimedRecords(series.markPrice ?? [], downloadCenter.series.futuresMarkPrice ?? []);
+    series.indexPrice = downloadCenter.series.futuresIndexPrice ?? [];
+    series.spotKline = downloadCenter.series.spotKline ?? [];
+    series.downloadFuturesKline = downloadCenter.series.futuresKline ?? [];
+  }
+  const downloadFunding = (downloadCenter?.series.futuresFunding ?? []).map((item) => ({
+    timestamp: item.eventTime,
+    fundingRate: Number(item.normalized?.fundingRate),
+    source: item.source,
+    provenance: item.provenance,
+    archiveSha256: item.archiveSha256,
+    officialChecksum: item.officialChecksum
+  })).filter((item) => Number.isFinite(item.fundingRate));
+  const mergedFunding = [...new Map([...funding, ...downloadFunding].map((item) => [item.timestamp, item])).values()]
+    .sort((a, b) => a.timestamp - b.timestamp);
+  return { directory, manifest, candles, funding: mergedFunding, series, downloadCenter };
 }
 
 export const HISTORICAL_SOURCE = Object.freeze({ HTX_HOST, KLINE_PATH, FUNDING_PATH, DATASET_ID, BAR_MS, capabilities: HTX_HISTORICAL_CAPABILITIES });

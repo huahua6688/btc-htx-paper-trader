@@ -183,6 +183,7 @@ export async function runMonitorCycle(db, {
     }
 
     let entryGate = null;
+    let signalClaim = null;
     if (blockedEntrySides.has(report.decision)) {
       noEntry(actions, [blockedEntrySides.get(report.decision)], null, { reasonCodes: ["SAME_SIDE_COOLDOWN"] });
     } else if (!coreDataFresh) {
@@ -190,38 +191,59 @@ export async function runMonitorCycle(db, {
         reasonCodes: ["CORE_DATA_STALE"]
       });
     } else {
-      const gate = evaluatePaperEntry(db, report, config, market);
-      entryGate = gate;
-      if (gate.allowed) {
-        try {
-          const position = db.openPosition(gate.candidate, snapshotId, {
-            settingsRevision: gate.settings.revision,
-            settingsUpdatedAt: gate.settings.updatedAt
-          });
-          actions.push({ type: gate.candidate.isAddOn ? "ADD_POSITION" : "OPEN", position, candidate: gate.candidate });
-        } catch (error) {
-          if (/运行时设置(?:版本)?已变化|已有模拟仓位|最大同时仓位|总风险|保证金|总名义仓位|相反方向|UNIQUE/.test(error.message)) {
-            noEntry(actions, [`原子检查阻止开仓：${error.message}`], gate.dailyRisk, {
-              reasonCodes: ["ATOMIC_RECHECK_BLOCKED"]
-            });
-          } else throw error;
-        }
-      } else {
-        const marketReasons = report.entryAssessment?.missingConditions ?? [];
-        const accountRejections = gate.rejections.filter((item) => item.code !== "DECISION_NOT_DIRECTIONAL");
-        noEntry(actions, [...marketReasons, ...accountRejections.map((item) => item.message)], gate.dailyRisk, {
-          reasonCodes: accountRejections.map((item) => item.code),
-          rejections: accountRejections
+      const signalKey = report.entryAssessment?.signalKey;
+      if (["LONG", "SHORT"].includes(report.decision) && signalKey) {
+        signalClaim = db.claimStrategySignal({
+          signalKey,
+          strategyVersion: report.version ?? report.strategy?.version ?? "UNVERSIONED",
+          signalBarTimestamp: report.entryAssessment.signalBarTimestamp,
+          snapshotId,
+          claimedAt: report.generatedAt
         });
+      }
+      if (signalClaim && !signalClaim.claimed) {
+        noEntry(actions, ["同一个完整 4h signal bar 已处理，本轮幂等跳过"], null, {
+          reasonCodes: ["DUPLICATE_SIGNAL_BAR"]
+        });
+      } else {
+        const gate = evaluatePaperEntry(db, report, config, market);
+        entryGate = gate;
+        if (gate.allowed) {
+          try {
+            const position = db.openPosition(gate.candidate, snapshotId, {
+              settingsRevision: gate.settings.revision,
+              settingsUpdatedAt: gate.settings.updatedAt
+            });
+            actions.push({ type: gate.candidate.isAddOn ? "ADD_POSITION" : "OPEN", position, candidate: gate.candidate });
+          } catch (error) {
+            if (/运行时设置(?:版本)?已变化|已有模拟仓位|最大同时仓位|总风险|保证金|总名义仓位|相反方向|UNIQUE/.test(error.message)) {
+              noEntry(actions, [`原子检查阻止开仓：${error.message}`], gate.dailyRisk, {
+                reasonCodes: ["ATOMIC_RECHECK_BLOCKED"]
+              });
+            } else throw error;
+          }
+        } else {
+          const marketReasons = report.entryAssessment?.missingConditions ?? [];
+          const accountRejections = gate.rejections.filter((item) => item.code !== "DECISION_NOT_DIRECTIONAL");
+          noEntry(actions, [...marketReasons, ...accountRejections.map((item) => item.message)], gate.dailyRisk, {
+            reasonCodes: accountRejections.map((item) => item.code),
+            rejections: accountRejections
+          });
+        }
       }
     }
 
-    if (snapshotId !== null && entryGate) {
+    if (snapshotId !== null && (entryGate || signalClaim)) {
       db.updateSnapshotReport(snapshotId, {
-        dynamicLimits: entryGate.dynamicLimits,
-        exposure: entryGate.exposure,
-        entryRejectionCodes: entryGate.reasonCodes,
-        sizingRejection: entryGate.sizingRejection
+        dynamicLimits: entryGate?.dynamicLimits ?? null,
+        exposure: entryGate?.exposure ?? null,
+        entryRejectionCodes: entryGate?.reasonCodes ?? (signalClaim?.claimed === false ? ["DUPLICATE_SIGNAL_BAR"] : []),
+        sizingRejection: entryGate?.sizingRejection ?? null,
+        signalDeduplication: signalClaim ? {
+          signalKey: report.entryAssessment?.signalKey,
+          claimed: signalClaim.claimed,
+          firstSnapshotId: Number(signalClaim.claim?.first_snapshot_id)
+        } : null
       });
     }
     const finishedAt = now();
@@ -238,6 +260,7 @@ export async function runMonitorCycle(db, {
       dataQualityGate,
       dataPolicyMode: policyMode,
       entryGate,
+      signalClaim,
       dynamicLimits: entryGate?.dynamicLimits ?? null,
       exposure: entryGate?.exposure ?? null,
       marketSnapshot: market,

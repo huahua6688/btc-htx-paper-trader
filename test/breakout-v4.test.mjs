@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { analyzeBreakoutChallenger } from "../src/breakout-challenger.mjs";
+import { PaperDatabase } from "../src/db.mjs";
 import { manageOpenPosition } from "../src/position-manager.mjs";
-import { REPLAY_STRATEGIES } from "../src/replay-engine.mjs";
+import { buildPointInTimeMarket } from "../src/replay-market.mjs";
+import { REPLAY_STRATEGIES, runHistoricalReplay } from "../src/replay-engine.mjs";
+import { runMonitorCycle } from "../src/monitor-cycle.mjs";
 import { paperReport } from "./helpers.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -42,7 +45,7 @@ function breakoutMarket(side, { offsetMs = 0 } = {}) {
   };
 }
 
-test("Breakout V4 emits symmetric LONG and SHORT signals only on a completed 4h boundary", () => {
+test("Breakout V4 binds LONG and SHORT signals to the latest completed 4h signal bar", () => {
   const long = analyzeBreakoutChallenger(breakoutMarket("LONG"));
   const short = analyzeBreakoutChallenger(breakoutMarket("SHORT"));
   assert.equal(long.decision, "LONG");
@@ -55,9 +58,75 @@ test("Breakout V4 emits symmetric LONG and SHORT signals only on a completed 4h 
   assert.ok(long.plan.stopLoss < long.currentPrice);
   assert.ok(short.plan.stopLoss > short.currentPrice);
 
-  const betweenBoundaries = analyzeBreakoutChallenger(breakoutMarket("LONG", { offsetMs: 15 * 60_000 }));
-  assert.equal(betweenBoundaries.decision, "WAIT");
-  assert.equal(betweenBoundaries.breakout.isDecisionBoundary, false);
+  for (const offsetMs of [37_000, 3 * 60_000]) {
+    const liveStyle = analyzeBreakoutChallenger(breakoutMarket("LONG", { offsetMs }));
+    assert.equal(liveStyle.decision, "LONG");
+    assert.equal(liveStyle.breakout.signalBarAvailable, true);
+    assert.equal(liveStyle.breakout.isExactWallClockBoundary, false);
+    assert.equal(liveStyle.entryAssessment.signalKey, long.entryAssessment.signalKey);
+    assert.equal(liveStyle.entryAssessment.signalBarTimestamp, long.entryAssessment.signalBarTimestamp);
+  }
+});
+
+test("Replay-boundary and live Shadow timestamps have decision and signal identity parity", () => {
+  const replay = analyzeBreakoutChallenger(breakoutMarket("SHORT"));
+  const shadow = analyzeBreakoutChallenger(breakoutMarket("SHORT", { offsetMs: 3 * 60_000 }));
+  assert.deepEqual(
+    { decision: shadow.decision, signalKey: shadow.entryAssessment.signalKey, signalBarTimestamp: shadow.entryAssessment.signalBarTimestamp },
+    { decision: replay.decision, signalKey: replay.entryAssessment.signalKey, signalBarTimestamp: replay.entryAssessment.signalBarTimestamp }
+  );
+});
+
+test("real Replay orchestration and live Shadow monitor keep decision parity after a delayed 4h close observation", async () => {
+  const barMs = 15 * 60_000;
+  const start = Date.UTC(2025, 8, 1);
+  const candles = [];
+  let prior = 100;
+  for (let index = 0; index < 86 * 96; index += 1) {
+    const timestamp = start + index * barMs;
+    const close = 100 + index * 0.01;
+    candles.push({ timestamp, open: prior, high: close + 0.04, low: prior - 0.04, close, volumeBtc: 1, volumeContracts: 1, turnoverUsdt: close, trades: 1 });
+    prior = close;
+  }
+  const boundaryIndex = candles.findLastIndex((item, index) => index < candles.length - 1 && (item.timestamp + barMs) % FOUR_HOURS_MS === 0);
+  const boundaryCandle = candles[boundaryIndex];
+  const dataset = {
+    manifest: {
+      manifestHash: "breakout-shadow-parity-test",
+      datasetId: "breakout-shadow-parity-test",
+      requestedCoverage: { from: new Date(start).toISOString(), to: new Date(candles.at(-1).timestamp).toISOString() },
+      actualCoverage: { from: new Date(start).toISOString(), to: new Date(candles.at(-1).timestamp).toISOString() }
+    },
+    candles,
+    funding: [],
+    series: {}
+  };
+  const replay = await runHistoricalReplay(dataset, {
+    strategy: "breakout-v4",
+    from: new Date(boundaryCandle.timestamp).toISOString(),
+    to: new Date(boundaryCandle.timestamp + barMs).toISOString(),
+    forceCloseAtEnd: true
+  });
+  const replayDecision = replay.trace.find((item) => item.eventTimestamp === boundaryCandle.timestamp);
+  assert.ok(replayDecision?.signalKey, "synthetic 4h boundary must produce a real Replay signal");
+
+  const shadowMarket = buildPointInTimeMarket(candles, [], boundaryIndex, { historicalSeries: {} });
+  shadowMarket.ticker.ts += 3 * 60_000;
+  const db = new PaperDatabase(":memory:");
+  try {
+    const shadow = await runMonitorCycle(db, {
+      collect: async () => shadowMarket,
+      analyze: (market) => analyzeBreakoutChallenger(market),
+      now: () => new Date(shadowMarket.ticker.ts).toISOString()
+    });
+    assert.deepEqual(
+      { decision: shadow.report.decision, signalKey: shadow.report.entryAssessment.signalKey, signalBarTimestamp: shadow.report.entryAssessment.signalBarTimestamp },
+      { decision: replayDecision.decision, signalKey: replayDecision.signalKey, signalBarTimestamp: replayDecision.signalBarTimestamp }
+    );
+    assert.equal(shadow.report.breakout.isExactWallClockBoundary, false);
+  } finally {
+    db.close();
+  }
 });
 
 test("HARD_BRACKET_HOLD_V1 never recreates break-even, trailing, target extension, or signal exits", () => {

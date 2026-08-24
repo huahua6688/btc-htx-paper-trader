@@ -437,6 +437,7 @@ export async function runHistoricalReplay(dataset, {
   const decisionCounts = { LONG: 0, SHORT: 0, WAIT: 0 };
   const candidateDecisionCounts = { LONG: 0, SHORT: 0, WAIT: 0 };
   let pending = null;
+  const seenSignalKeys = new Set();
   let lastReport = null;
   try {
     for (let index = firstIndex; index <= lastIndex; index += eventStride) {
@@ -463,6 +464,10 @@ export async function runHistoricalReplay(dataset, {
       decisionCounts[report.decision] += 1;
       candidateDecisionCounts[report.candidateDecision] += 1;
       managePositions(db, report, actions, config);
+      const signalKey = report.entryAssessment?.signalKey ?? null;
+      const duplicateSignalBar = Boolean(signalKey && seenSignalKeys.has(signalKey));
+      if (signalKey && ["LONG", "SHORT"].includes(report.decision) && !duplicateSignalBar) seenSignalKeys.add(signalKey);
+      if (duplicateSignalBar) rejectionCounts.DUPLICATE_SIGNAL_BAR = (rejectionCounts.DUPLICATE_SIGNAL_BAR ?? 0) + 1;
       if (collectTrace) trace.push({
         eventTimestamp: candle.timestamp,
         eventClose: candle.close,
@@ -481,11 +486,14 @@ export async function runHistoricalReplay(dataset, {
         entryGeometry: report.entryGeometry ?? null,
         indicatorProfile: report.multiScaleContext?.profile?.selected ?? null,
         directionState: report.directionState ?? null,
+        signalKey,
+        signalBarTimestamp: report.entryAssessment?.signalBarTimestamp ?? null,
+        duplicateSignalBar,
         regime: report.strategy.marketRegime,
         validForEntry: report.dataQuality.validForEntry,
         riskGates: report.riskGates
       });
-      if (!pending && ["LONG", "SHORT"].includes(report.decision) && db.getOpenPositions().length === 0) {
+      if (!duplicateSignalBar && !pending && ["LONG", "SHORT"].includes(report.decision) && db.getOpenPositions().length === 0) {
         pending = { report: clone(report), remaining: executionDelayBars };
       }
       lastReport = report;

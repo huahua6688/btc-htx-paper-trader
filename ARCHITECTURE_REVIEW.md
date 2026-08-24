@@ -166,7 +166,7 @@ lifecycle=CANDIDATE，promotion 明确为 BLOCKED；Champion 仍为 `V1.2-FROZEN
 
 | 原 Gap | 状态 | 证据与限制 |
 |---|---|---|
-| BTC Historical Data Catalog / Dataset Manager | IMPLEMENTED | 固定 HTX 公共端点、真实分页下载、缓存、增量合并、OHLC 校验、哈希、缺口/重复/缺失率和 manifest。 |
+| BTC Historical Data Catalog / Dataset Manager | IMPLEMENTED | REST 分页与官方 Download Center 分开建模；现货/永续 Kline、trades、150/400 档 depth、mark/index/funding 有真实覆盖、`.CHECKSUM`、本地 SHA、PIT 和 provenance。大档案按需目录化，Settlement REST 不冒充下载中心。 |
 | Historical Replay Engine | IMPLEMENTED | 逐 15m 事件推进；每个时点只构建当时可见的市场对象；完整区间实际运行 61,345 个事件。 |
 | 15m/1h/4h/1d 防未来泄漏 | IMPLEMENTED | 15m 收盘后可见；1h/4h/1d 只在周期完整收盘后进入策略；prefix invariance audit 实际通过。 |
 | Replay 与实时共用策略/风险/仓位/执行核心 | IMPLEMENTED | Champion 调用原 `analyzeSnapshot`；Challenger 和实时 Shadow 调用同一分析函数；两者共用 Paper sizing、Risk Gate、Funding、退出和 position manager。回放编排器不同，但没有回测专用的成交/风险公式。 |

@@ -29,8 +29,8 @@ for (const file of files) {
   let executableText = text;
   if (file === "htx-skill-capabilities.mjs") {
     executableText = text.replace(/skill:\s*"(?:spot-account|spot-trading|futures-account|futures-trading)"/gi, "skill: \"AUDITED_PRIVATE_SKILL\"");
-    const privateRows = text.match(/\{\s*skill:\s*"(?:spot-account|spot-trading|futures-account|futures-trading)"[^\n]*\}/gi) ?? [];
-    if (privateRows.length !== 4 || privateRows.some((row) => !/integration:\s*"INTERFACE_ONLY"/.test(row))
+    const privateRows = text.match(/\{\s*skill:\s*"(?:spot-account|spot-trading|futures-account|futures-trading)"[\s\S]*?\n\s{2}\}/gi) ?? [];
+    if (privateRows.length !== 4 || privateRows.some((row) => !/status:\s*"INTERFACE_ONLY"/.test(row))
       || !/exchangeWriteEnabled:\s*false/.test(text)) {
       violations.push(`${file}: every private skill must remain interface-only with exchange writes disabled`);
     }

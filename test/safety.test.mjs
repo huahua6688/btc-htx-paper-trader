@@ -11,6 +11,13 @@ test("permits a public BTC futures kline", () => {
   }), true);
 });
 
+test("permits only the public btcusdt spot market surface", () => {
+  assert.equal(assertAllowedCommand("spot-market", "kline", { symbol: "btcusdt", period: "60min", size: 200 }), true);
+  assert.equal(assertAllowedCommand("spot-market", "depth", { symbol: "btcusdt", type: "step0", depth: 20 }), true);
+  assert.throws(() => assertAllowedCommand("spot-market", "kline", { symbol: "ethusdt", period: "60min", size: 200 }), /only permits btcusdt/);
+  assert.throws(() => assertAllowedCommand("spot-market", "depth", { symbol: "btcusdt", type: "step0", depth: 150 }), /Blocked spot depth/);
+});
+
 test("blocks every trading skill", () => {
   assert.throws(() => assertAllowedCommand("futures-trading", "order", {}), /Blocked non-public/);
   assert.throws(() => assertAllowedCommand("spot-trading", "order", {}), /Blocked non-public/);
@@ -55,6 +62,7 @@ test("V1.2 runtime has no fixed setup engine and exposes only public HTX skill f
     "futures-market",
     "liquidation-stream",
     "mark-price",
-    "oi-tracker"
+    "oi-tracker",
+    "spot-market"
   ]);
 });

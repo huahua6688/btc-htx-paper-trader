@@ -30,7 +30,7 @@ import {
 } from "./research-registry.mjs";
 import { runResearchV2Pipeline } from "./research-v2-pipeline.mjs";
 import { runResearchV3Pipeline } from "./research-v3-pipeline.mjs";
-import { runValidationEngine } from "./validation-engine.mjs";
+import { runLookaheadAudit, runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
 import { ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { buildTradeAttribution } from "./attribution-engine.mjs";
@@ -41,6 +41,15 @@ import {
 } from "./multi-venue-catalog.mjs";
 import { MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
+import {
+  defaultHtxDownloadCenterDirectory,
+  HTX_DOWNLOAD_CENTER_TYPES,
+  updateHtxDownloadCenterCatalog
+} from "./htx-download-center.mjs";
+import {
+  BREAKOUT_V4_DEVELOPMENT_SPEC,
+  runBreakoutV4DevelopmentSelection
+} from "./breakout-v4-selection.mjs";
 
 export const PREDECLARED_RESEARCH_RANGE = Object.freeze({
   from: "2024-09-01T00:00:00.000Z",
@@ -176,6 +185,55 @@ async function dataUpdate(args, defaults = null) {
   });
   process.stdout.write(`${JSON.stringify({ directory: result.directory, fetched: result.fetched, manifest: result.manifest }, null, 2)}\n`);
   return result;
+}
+
+async function downloadCenterUpdate(args) {
+  const selected = range(args);
+  const dataTypes = args.types
+    ? String(args.types).split(",").map((item) => item.trim()).filter(Boolean)
+    : HTX_DOWNLOAD_CENTER_TYPES;
+  const result = await updateHtxDownloadCenterCatalog({
+    ...selected,
+    directory: args.catalog ?? defaultHtxDownloadCenterDirectory(),
+    dataTypes,
+    onProgress: (item) => process.stderr.write(`Download Center ${item.type} ${item.date}\n`)
+  });
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, manifest: result.manifest }, null, 2)}\n`);
+  return result;
+}
+
+async function breakoutV4Select(args) {
+  const dataset = await load(args);
+  const report = runBreakoutV4DevelopmentSelection(dataset);
+  const directory = resolveOutputPath(runId("breakout-v4-development-selection"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "selection.json"), report);
+  process.stdout.write(`${JSON.stringify({ directory, reportPath, winner: report.winner, isolation: report.isolation, search: report.search, selectionHash: report.selectionHash }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
+async function breakoutV4Lookahead(args) {
+  const dataset = await load(args);
+  const cutoff = new Date(BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+  const barMs = 15 * 60 * 1000;
+  const development = {
+    ...dataset,
+    candles: dataset.candles.filter((item) => Number(item.timestamp) + barMs <= cutoff),
+    funding: dataset.funding.filter((item) => Number(item.timestamp) <= cutoff),
+    series: Object.fromEntries(Object.entries(dataset.series ?? {}).map(([key, rows]) => [key,
+      rows.filter((item) => Number(item.visibleAt ?? item.eventTime) <= cutoff)
+    ])),
+    multiVenueFunding: (dataset.multiVenueFunding ?? []).filter((item) => Number(item.visibleAt ?? item.timestamp) <= cutoff)
+  };
+  const report = runLookaheadAudit(development, { strategies: ["breakout-v4"], parameters: BREAKOUT_V4_PARAMETERS });
+  report.developmentOnly = true;
+  report.developmentCutoff = BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to;
+  report.holdoutOpened = false;
+  const directory = resolveOutputPath(runId("breakout-v4-lookahead"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "lookahead.json"), report);
+  process.stdout.write(`${JSON.stringify({ directory, reportPath, passed: report.passed, checksRun: report.checksRun, developmentCutoff: report.developmentCutoff, holdoutOpened: false }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
 }
 
 async function load(args) { return loadHistoricalDataset(args.catalog ?? defaultCatalogDirectory()); }
@@ -669,6 +727,52 @@ export function researchV2RunRecord(result) {
 const dataManifestHashOf = (result) => result?.dataset?.manifest?.manifestHash ?? null;
 
 const COMMANDS = {
+  "research:v4-lookahead": {
+    handler: (args) => breakoutV4Lookahead(args),
+    runType: "BREAKOUT_V4_DEVELOPMENT_ONLY_LOOKAHEAD_AUDIT",
+    record: (result) => ({
+      status: result?.report?.passed ? "PASSED" : "FAILED",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      strategyVersion: BREAKOUT_V4_PARAMETERS.version,
+      summary: {
+        passed: result?.report?.passed ?? false,
+        checksRun: result?.report?.checksRun ?? 0,
+        developmentCutoff: result?.report?.developmentCutoff ?? null,
+        holdoutOpened: false
+      }
+    })
+  },
+  "research:v4-select": {
+    handler: (args) => breakoutV4Select(args),
+    runType: "BREAKOUT_V4_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+    record: (result) => ({
+      status: result?.report?.winner?.matchesCommittedBreakoutV4 ? "PASSED" : "PARTIAL",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.report?.datasetManifestHash ?? null,
+      strategyVersion: result?.report?.winner?.parameters?.version ?? null,
+      summary: {
+        candidateCount: result?.report?.search?.candidateCount ?? null,
+        winner: result?.report?.winner ?? null,
+        isolation: result?.report?.isolation ?? null,
+        championChanged: false
+      }
+    })
+  },
+  "data:download-center": {
+    handler: (args) => downloadCenterUpdate(args),
+    runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_CATALOG_UPDATE",
+    record: (result) => ({
+      status: result?.manifest?.status === "COMPLETE" ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: {
+        directory: result?.directory ?? null,
+        requestedCoverage: result?.manifest?.requestedCoverage ?? null,
+        errors: result?.manifest?.errors ?? [],
+        settlementRestUsedAsDownloadCenter: false
+      }
+    })
+  },
   "multi-venue:update": {
     handler: (args) => multiVenueUpdate(args),
     runType: "MULTI_VENUE_FUNDING_CATALOG_UPDATE",

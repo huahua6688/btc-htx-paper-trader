@@ -31,8 +31,14 @@ test("all official HTX skill families are accounted for without enabling private
   assert.deepEqual([...HTX_SKILL_NAMES].sort(), expected.sort());
   const privateCapabilities = HTX_SKILL_CAPABILITIES.filter((item) => item.access.startsWith("PRIVATE"));
   assert.ok(privateCapabilities.length >= 4);
-  assert.ok(privateCapabilities.every((item) => item.integration === "INTERFACE_ONLY"));
-  assert.equal(htxSkillCapabilityReport().exchangeWriteEnabled, false);
+  assert.ok(privateCapabilities.every((item) => item.status === "INTERFACE_ONLY"));
+  const report = htxSkillCapabilityReport();
+  assert.equal(report.exchangeWriteEnabled, false);
+  assert.equal(report.auditedSkillCount, 17);
+  assert.ok(report.actuallyInvokedCount < report.auditedSkillCount);
+  assert.equal(report.claim, "17_SKILLS_AUDITED_NOT_17_ACTUALLY_INVOKED");
+  assert.equal(HTX_SKILL_CAPABILITIES.find((item) => item.skill === "spot-market").status, "ACTUALLY_INVOKED");
+  assert.equal(HTX_SKILL_CAPABILITIES.find((item) => item.skill === "technical-analysis").status, "LOCAL_EQUIVALENT");
   assert.ok(HISTORICAL_DATA_TYPES.includes("settlement"));
 });
 

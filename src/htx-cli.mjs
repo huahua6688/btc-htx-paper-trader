@@ -13,6 +13,12 @@ export function resolveCliPath({ platform = process.platform, arch = process.arc
 }
 
 const RULES = Object.freeze({
+  "spot-market": Object.freeze({
+    "market-detail-merged": ["symbol"],
+    "kline": ["symbol", "period", "size"],
+    "depth": ["symbol", "type", "depth"],
+    "history-trade": ["symbol", "size"]
+  }),
   "futures-market": Object.freeze({
     "detail-merged": ["contract_code"],
     "kline": ["contract_code", "period", "size"],
@@ -76,6 +82,7 @@ export function assertAllowedCommand(skill, subcommand, params = {}) {
     if ((key === "contract_code" || key === "contract") && value !== "BTC-USDT") {
       throw new Error(`V0 only permits BTC-USDT, received: ${value}`);
     }
+    if (key === "symbol" && value !== "btcusdt") throw new Error(`V0 only permits btcusdt, received: ${value}`);
     if (key === "period" && !VALID_PERIODS.has(value)) {
       throw new Error(`Blocked unsupported period: ${value}`);
     }
@@ -87,6 +94,7 @@ export function assertAllowedCommand(skill, subcommand, params = {}) {
     }
     if (key === "page_index" && Number(value) !== 1) throw new Error("V0 only reads the first public page");
     if (key === "type" && value !== "step0") throw new Error(`Blocked depth aggregation: ${value}`);
+    if (key === "depth" && ![5, 10, 20].includes(Number(value))) throw new Error(`Blocked spot depth: ${value}`);
     if (key === "basis_price_type" && value !== "close") throw new Error(`Blocked basis type: ${value}`);
   }
   return true;

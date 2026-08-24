@@ -13,6 +13,7 @@ export const BREAKOUT_V4_PARAMETERS = Object.freeze({
   breakoutLookback4h: 40,
   trendEma4h: 50,
   trendSlopeBars4h: 6,
+  trendFilter: "EMA50_DIRECTION_SLOPE",
   atrPeriod4h: 14,
   stopAtrMultiple: 2.5,
   targetRiskMultiple: 4,
@@ -71,13 +72,22 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const priorLow = Math.min(...prior.map((item) => item.low));
   const atr4h = atr(h4, parameters.atrPeriod4h);
   const atr1h = atr(h1, 14);
-  const isDecisionBoundary = now % FOUR_HOURS_MS === 0 && latest.timestamp + FOUR_HOURS_MS === now;
+  // `closedMarketView` has already removed every still-open candle.  The live
+  // monitor normally observes a 4h close a few seconds/minutes after the wall
+  // clock boundary, so the signal identity must be the completed candle rather
+  // than an exact ticker timestamp modulo check.
+  const signalBarTimestamp = latest.timestamp;
+  const signalBarClosedAt = signalBarTimestamp + FOUR_HOURS_MS;
+  const signalBarAvailable = signalBarClosedAt <= now;
+  const isExactWallClockBoundary = now % FOUR_HOURS_MS === 0 && signalBarClosedAt === now;
+  const signalKey = `${base.strategyHash}:BTC-USDT:4h:${signalBarTimestamp}`;
   const longBreakoutDistanceAtr = atr4h > 0 ? (latest.close - priorHigh) / atr4h : 0;
   const shortBreakoutDistanceAtr = atr4h > 0 ? (priorLow - latest.close) / atr4h : 0;
-  const longTrend = latest.close > trendNow && trendNow > trendPrior;
-  const shortTrend = latest.close < trendNow && trendNow < trendPrior;
-  const longSignal = isDecisionBoundary && latest.close > priorHigh && longTrend && longBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
-  const shortSignal = isDecisionBoundary && latest.close < priorLow && shortTrend && shortBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
+  const requireSlope = parameters.trendFilter !== "EMA50_PRICE_ALIGNMENT";
+  const longTrend = latest.close > trendNow && (!requireSlope || trendNow > trendPrior);
+  const shortTrend = latest.close < trendNow && (!requireSlope || trendNow < trendPrior);
+  const longSignal = signalBarAvailable && latest.close > priorHigh && longTrend && longBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
+  const shortSignal = signalBarAvailable && latest.close < priorLow && shortTrend && shortBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
   const candidateDecision = longSignal ? "LONG" : shortSignal ? "SHORT" : "WAIT";
   const direction = candidateDecision === "LONG" ? 1 : candidateDecision === "SHORT" ? -1 : 0;
   const riskDistance = atr4h * parameters.stopAtrMultiple;
@@ -89,7 +99,7 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const shortScore = clamp(20 + shortSupport - (longTrend ? 20 : 0), 0, 100);
   const riskPct = direction ? config.reducedRiskPerTradePct : 0;
   const reason = candidateDecision === "WAIT"
-    ? isDecisionBoundary ? "4h 收盘尚未突破前高/前低并满足 EMA50 斜率" : "只在完整 4h 收盘边界评估新突破"
+    ? "最近完整 4h signal bar 尚未突破前高/前低并满足 EMA50 斜率"
     : `${parameters.breakoutLookback4h} 根4h区间突破，EMA${parameters.trendEma4h}方向一致`;
   return {
     ...base,
@@ -101,12 +111,15 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       entryPrice: round(currentPrice, 2), stopLoss: round(stopLoss, 2), takeProfit: [round(takeProfit, 2)],
       riskReward: [parameters.targetRiskMultiple], netRiskReward: null,
       initialRiskDistance: round(riskDistance, 8),
-      targetSource: "FIXED_4R_FROM_4H_ATR_BRACKET",
+      targetSource: `FIXED_${parameters.targetRiskMultiple}R_FROM_4H_ATR_BRACKET`,
       managementContract: { profile: parameters.positionManagementProfile, hardStopAlwaysActive: true, hardTargetAlwaysActive: true, dynamicExitEnabled: false }
     } : { entryPrice: null, stopLoss: null, takeProfit: null, riskReward: null, netRiskReward: null, targetSource: null },
     entryAssessment: {
       enterNow: Boolean(direction), method: direction ? "4H_DONCHIAN_BREAKOUT" : "WAIT_4H_BREAKOUT",
-      methodLabel: reason, reasons: [reason], missingConditions: direction ? [] : [reason], riskPct
+      methodLabel: reason, reasons: [reason], missingConditions: direction ? [] : [reason], riskPct,
+      signalKey: direction ? signalKey : null,
+      signalBarTimestamp,
+      signalBarClosedAt
     },
     opportunities: {
       LONG: { side: "LONG", score: round(longScore, 2), opportunityScore: round(longScore, 2), directionalScore: round(longScore, 2), timingScore: longSignal ? 85 : 20, supportingReasons: longTrend ? ["4h EMA50 向上且价格在其上"] : [], opposingReasons: shortTrend ? ["4h 趋势向下"] : [] },
@@ -132,7 +145,14 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       frozenChampionModified: false
     },
     breakout: {
-      isDecisionBoundary, lookback4h: parameters.breakoutLookback4h, priorHigh: round(priorHigh, 2), priorLow: round(priorLow, 2),
+      signalKey,
+      signalBarTimestamp,
+      signalBarClosedAt,
+      signalBarAvailable,
+      signalAgeMs: now - signalBarClosedAt,
+      isDecisionBoundary: signalBarAvailable,
+      isExactWallClockBoundary,
+      lookback4h: parameters.breakoutLookback4h, priorHigh: round(priorHigh, 2), priorLow: round(priorLow, 2),
       atr4h: round(atr4h, 6), longBreakoutDistanceAtr: round(longBreakoutDistanceAtr, 6), shortBreakoutDistanceAtr: round(shortBreakoutDistanceAtr, 6),
       longTrend, shortTrend
     },

@@ -37,6 +37,53 @@ test("monitor cycle stores decisions, opens a paper position, then closes it at 
   }
 });
 
+test("monitor persistently claims a completed strategy signal bar only once", async () => {
+  const db = new PaperDatabase(":memory:");
+  try {
+    const signalKey = "breakout-v4-test:BTC-USDT:4h:1787263200000";
+    const signalBarTimestamp = Date.UTC(2026, 7, 21, 0, 0, 0);
+    const firstReport = paperReport({
+      version: "breakout-challenger-v4.0.0",
+      entryAssessment: { ...paperReport().entryAssessment, signalKey, signalBarTimestamp, signalBarClosedAt: signalBarTimestamp + 4 * 60 * 60_000 }
+    });
+    const first = await runMonitorCycle(db, {
+      collect: async () => firstReport,
+      analyze: (value) => value,
+      now: () => firstReport.generatedAt
+    });
+    assert.equal(first.signalClaim.claimed, true);
+    assert.ok(first.actions.some((item) => item.type === "OPEN"));
+
+    const position = db.getOpenPosition();
+    db.closePosition(position.id, {
+      exitPrice: position.entry_price,
+      exitTriggerPrice: position.entry_price,
+      exitReason: "TEST_RESET",
+      grossPnlCny: 0,
+      netPnlCny: -position.entry_fee_cny,
+      exitFeeCny: 0,
+      exitSlippageCny: 0,
+      closedAt: new Date(new Date(firstReport.generatedAt).getTime() + 3 * 60_000).toISOString()
+    });
+    const secondReport = paperReport({
+      generatedAt: new Date(new Date(firstReport.generatedAt).getTime() + 3 * 60_000).toISOString(),
+      version: "breakout-challenger-v4.0.0",
+      entryAssessment: { ...paperReport().entryAssessment, signalKey, signalBarTimestamp, signalBarClosedAt: signalBarTimestamp + 4 * 60 * 60_000 }
+    });
+    const second = await runMonitorCycle(db, {
+      collect: async () => secondReport,
+      analyze: (value) => value,
+      now: () => secondReport.generatedAt
+    });
+    assert.equal(second.signalClaim.claimed, false);
+    assert.equal(db.getOpenPosition(), null);
+    assert.ok(second.actions.some((item) => item.type === "NO_ENTRY" && item.reasonCodes.includes("DUPLICATE_SIGNAL_BAR")));
+    assert.equal(db.getStrategySignalClaim(signalKey).first_snapshot_id, first.snapshotId);
+  } finally {
+    db.close();
+  }
+});
+
 test("monitor cancels a legacy fixed-price setup and evaluates the current round independently", async () => {
   const db = new PaperDatabase(":memory:");
   try {

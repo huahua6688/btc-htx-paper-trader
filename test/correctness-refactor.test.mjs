@@ -586,8 +586,10 @@ test("secondary sources are not retried and degrade to a warning", async () => {
       return { status: "ok" };
     }
   });
-  assert.equal(depthCalls, 1, "次要任务不重试");
+  assert.equal(depthCalls, 2, "spot/futures 两个次要 depth 各调用一次且都不重试");
+  assert.equal(snapshot.spotDepth, null);
   assert.equal(snapshot.depth, null);
+  assert.ok(snapshot.collectionWarnings.some((item) => item.startsWith("spotDepth:")));
   assert.ok(snapshot.collectionWarnings.some((item) => item.startsWith("depth:")));
 });
 

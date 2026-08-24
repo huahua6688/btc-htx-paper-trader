@@ -206,14 +206,21 @@ Feature Registry 记录每项特征的数据源、时间层、当前权重、适
 
 研究模块现在是可运行实现，不是验证字段或 README 占位。冻结的 V1.2 Champion 源码哈希保持为 `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`。研究运行不会修改 Champion，也不会改变实时 Risk Gate。
 
-Historical Catalog V2 从 HTX 固定公开端点下载 BTC-USDT 永续 Kline、Funding，以及官方端点在请求时仍能提供的 OI、精英账户/仓位比、Mark Price、Premium、Basis 和最近清算。Kline 与 Funding 可分页；其余端点只有有限的最新窗口，Depth 只有实时快照。`manifest.json` 对每类数据记录来源、抓取时间、事件时间、实际端点覆盖、缺口、重复、原始 payload SHA-256、schema 和 provenance。超出官方真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md)。
+Historical Catalog V2 同时区分两类官方来源：REST 的 Kline/Funding 分页与有限最新窗口；以及独立的 HTX Historical Data Download Center。Download Center 已实测 BTC-USDT 现货和 `BTC-USDT-PERP` 永续的 Kline、逐笔成交、期货 150 档/现货 400 档深度、Mark/Index Kline 和 Funding。普通类型从 `2026-02-01` 起有真实档案，Depth 首个实测日期为 `2026-05-28`。小档案必须通过官方 `.CHECKSUM` 后才转成带 `eventTime/visibleAt` 的 PIT 记录；大体量 trades/depth 默认只登记 checksum、ETag 和大小，按需下载。Settlement REST 仍是有限保留窗口，绝不冒充 Download Center。超出真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md) 与 [HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json](./HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json)。
+
+HTX Skills Hub 的 17 个包只声明为“已审计”，不再声称 17/17 实际调用。`src/htx-skill-capabilities.mjs` 逐项标记 `AUDITED_ONLY / ACTUALLY_INVOKED / LOCAL_EQUIVALENT / RESEARCH_ONLY / INTERFACE_ONLY` 并给出代码证据。公开 `spot-market` 的 ticker、1h Kline、depth 和历史成交已进入每轮采集；现货/永续 premium 只作为研究展示，未改变 Champion。Private Account/Trading 仍为禁用接口，CLI 子进程不接收交易所凭据。
 
 实时 monitor 每轮把已成功取得的 HTX 原始响应和 normalized 研究字段 best-effort 写入独立 `market-archive.sqlite`。归档失败只产生警告，不影响 Paper 仓位管理；原始 payload 不会因 parser 升级被重写，normalized 字段可从原始数据重新生成。Replay V2 只读取 `eventTime <= visibleAt`，Archive 还必须满足 `observedAt <= visibleAt`，并逐字段标记 `HTX_HISTORICAL / SELF_ARCHIVED / HISTORICAL_UNAVAILABLE / STALE / REPLAY_ARCHIVE_ERROR`。
 
 ```bash
 # 必须显式给出连续区间；不会自动挑选收益最好看的时期
 npm run data:update -- --from=2024-09-01T00:00:00.000Z --to=2026-07-31T23:45:00.000Z
+npm run data:download-center -- --from=2026-08-23 --to=2026-08-23
 npm run data:inspect
+
+# V4 参数选择和前视审计只使用固定 development cutoff，不读取未成熟 holdout
+npm run research:v4-select
+npm run research:v4-lookahead
 
 # 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
 npm run htx:status

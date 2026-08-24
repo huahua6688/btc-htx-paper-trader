@@ -1,6 +1,10 @@
 import { runPublicCommand } from "./htx-cli.mjs";
 
 export const MARKET_TASKS = Object.freeze([
+  ["spotTicker", "spot-market", "market-detail-merged", { symbol: "btcusdt" }],
+  ["spotKline1h", "spot-market", "kline", { symbol: "btcusdt", period: "60min", size: 200 }],
+  ["spotDepth", "spot-market", "depth", { symbol: "btcusdt", type: "step0", depth: 20 }],
+  ["spotTrades", "spot-market", "history-trade", { symbol: "btcusdt", size: 100 }],
   ["ticker", "futures-market", "detail-merged", { contract_code: "BTC-USDT" }],
   ["kline15m", "futures-market", "kline", { contract_code: "BTC-USDT", period: "15min", size: 200 }],
   ["kline1h", "futures-market", "kline", { contract_code: "BTC-USDT", period: "60min", size: 200 }],

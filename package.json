@@ -18,6 +18,7 @@
     "positions:repair": "node src/repair-position-groups.mjs",
     "gate:report": "node src/gate-report.mjs",
     "data:update": "node src/research-cli.mjs data:update",
+    "data:download-center": "node src/research-cli.mjs data:download-center",
     "data:inspect": "node src/research-cli.mjs data:inspect",
     "multi-venue:update": "node src/research-cli.mjs multi-venue:update",
     "multi-venue:inspect": "node src/research-cli.mjs multi-venue:inspect",
@@ -39,6 +40,8 @@
     "check:safety": "node scripts/check-safety.mjs",
     "research:v2": "node src/research-cli.mjs research:v2",
     "research:v3": "node src/research-cli.mjs research:v3",
+    "research:v4-select": "node src/research-cli.mjs research:v4-select",
+    "research:v4-lookahead": "node src/research-cli.mjs research:v4-lookahead",
     "research:runs": "node src/research-cli.mjs research:runs",
     "research:register-candidate": "node src/research-cli.mjs research:register-candidate",
     "replay": "node src/research-cli.mjs replay"
