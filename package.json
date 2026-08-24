@@ -30,7 +30,10 @@
     "research:run": "node src/research-cli.mjs full",
     "telegram:test": "node src/telegram-test.mjs",
     "test": "node --test \"test/*.test.mjs\"",
-    "check:safety": "node scripts/check-safety.mjs"
+    "check:safety": "node scripts/check-safety.mjs",
+    "research:v2": "node src/research-cli.mjs research:v2",
+    "research:runs": "node src/research-cli.mjs research:runs",
+    "research:register-candidate": "node src/research-cli.mjs research:register-candidate"
   },
   "engines": {
     "node": ">=24"

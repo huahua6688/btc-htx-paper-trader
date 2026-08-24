@@ -2,6 +2,65 @@
 
 更新时间：2026-08-23
 
+## 2026-08-24 更新：既有研究结论降级为 BEFORE BASELINE
+
+本轮在执行层发现并修复了一个会系统性改变仓位规模的缺陷（杠杆按 0.01 步进被四舍五入，
+向下取整时 `notional / leverage` 超过可用保证金）。`replay-engine.mjs` 与实时 monitor 共用
+同一个 `evaluatePaperEntry` / `buildPaperCandidate`，因此**下方所有历史数字都是在这个缺陷
+存在的情况下产生的**：589 笔 Challenger、四窗口 Purged OOS、500 次 trade-order resampling、
+500 次 block bootstrap、成本/滑点/延迟压力重放、Final OOS 与 Tradable Edge 分解全部受影响。
+
+固定网格实测（权益 3000～60000 × 5 档止损 × 4 档评分，5,496 个场景）：拒绝率 37.0% → 0.9%，
+合计可建仓数量 148.657 → 257.616 BTC。缺陷有两种表现：在没有重新量化兜底时直接静默拒绝，
+在有兜底时把仓位缩小（权益 5000 CNY、止损 1% 只拿到 0.005 BTC，实际允许 0.009 BTC）。
+
+因此：
+
+- 下方的 `NO_CHALLENGER_GENERATED`、`Promotion Gate = BLOCKED` 等结论**保留为 BEFORE BASELINE**，
+  不再作为当前有效证据。
+- 重跑之前，**不得声称策略已经盈利，也不得声称 NO_EDGE 结论仍然成立**。修复只改变了执行层，
+  没有增加任何 edge；成本吞掉 494.53% 毛收益这类结构性问题不会因为仓位变大而消失，
+  但现有样本已不足以支撑任何方向的结论。
+- 冻结的 V1.2 Champion 源码未改动，SHA-256 仍为
+  `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`，仍是可复现 baseline。
+- 已使用过的 Final OOS 不得重新用于调参。重跑必须按原有 Candidate → Replay → Walk-forward →
+  Purged OOS → 未触碰 Final OOS → Monte Carlo → Shadow → Promotion Gate 的顺序重新走。
+
+### AFTER 重跑状态：BLOCKED
+
+本次实现环境无法执行重跑，原因是真实的、可复现的外部限制，不是选择性跳过：
+
+| 前置条件 | 状态 | 实证 |
+|---|---|---|
+| 本地 15m/Funding 数据目录 | 缺失 | `npm run backtest` → `ENOENT ... candles-15m.json`；`data/research/` 在 `.gitignore` 中，从未提交 |
+| HTX 公开历史端点 | 不可达 | `npm run data:update` → `HTTP 403`（本环境网络策略不允许出站到 `api.hbdm.com`） |
+| `vendor/htx-cli-linux-x64` | 缺失 | 二进制在 `.gitignore` 中，实时 monitor 因此也无法运行 |
+| 新 Final OOS 成熟度 | 未成熟 | 需要至少 30 个自然日与 2,880 根 15m K 线 |
+
+这两次失败已经如实登记为 `BLOCKED` 研究运行（见下）。**没有伪造任何替代结果。**
+
+### 研究闭环的真实状态
+
+| 步骤 | IMPLEMENTED | CONNECTED | EXECUTED | PERSISTED |
+|---|---|---|---|---|
+| Candidate 生成 | 是 | 是 | 否（无数据） | — |
+| Replay | 是 | 是 | 否（无数据） | — |
+| Walk-forward | 是 | 是 | 否（无数据） | — |
+| Purged OOS | 是 | 是 | 否（无数据） | — |
+| Final untouched OOS | 是 | 是 | 否（未成熟） | — |
+| Monte Carlo / block bootstrap | 是 | 是 | 否（无数据） | — |
+| Shadow | 是 | 是 | 否（无 CLI 二进制） | — |
+| Promotion Gate | 是 | 是 | 否 | — |
+
+「已持久化研究运行 = 0」的根因已经查清并修复：`recordResearchRun` 与 `registerStrategyVersion`
+只在 `research-v2-pipeline.mjs` 中被调用，而该模块**没有任何 CLI 入口**，属于不可达代码；
+其余所有研究命令只写 `research-output/` 下的 JSON，从不落库。现在所有研究命令都会登记，
+失败也会以 `BLOCKED` 加真实原因入库，并新增 `npm run research:runs` 直接查询。
+
+本环境实测：`persistedResearchRuns` 0 → 2（两条均为 `BLOCKED`），
+`registeredStrategyVersions` 1 → 2（新增 `V1.3-DATA-TIERED-CANDIDATE`，role=CHALLENGER，
+lifecycle=CANDIDATE，promotion 明确为 BLOCKED；Champion 仍为 `V1.2-FROZEN` / `FROZEN`）。
+
 ## 结论
 
 项目仍是 BTC-USDT 单品种、公开数据、Paper-only 系统。冻结的 V1.2 Champion 分析核心未修改，SHA-256 为：

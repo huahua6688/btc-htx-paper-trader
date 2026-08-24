@@ -108,7 +108,10 @@ export const RUNTIME_SETTINGS_DEFAULTS = Object.freeze({
   maxConsecutiveLosses: 7,
   newEntriesPaused: false,
   indicatorProfile: "AUTO",
-  monitorIntervalMinutes: 5
+  monitorIntervalMinutes: 5,
+  // 默认保持冻结 V1.2 的严格数据门禁，升级不会静默改写 Champion 行为。
+  // 管理员显式切到 TIERED_DEGRADED 后，实时 monitor 才使用分级降级候选策略。
+  dataPolicyMode: "FROZEN_V12_STRICT"
 });
 
 export const RUNTIME_SETTING_LIMITS = Object.freeze({
@@ -156,6 +159,9 @@ export const HEALTH_CONFIG = Object.freeze({
 export const TELEGRAM_CONFIG = Object.freeze({
   botToken: process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "",
   chatId: process.env.TELEGRAM_CHAT_ID?.trim() ?? "",
+  // 群组里 chat.id 对所有成员都一样，只比对 chat.id 等于把控制权交给整个群。
+  // 配置 TELEGRAM_ADMIN_USER_ID 后，只有该发送者本人可以修改任何 Paper 设置。
+  adminUserId: process.env.TELEGRAM_ADMIN_USER_ID?.trim() ?? "",
   apiBaseUrl: "https://api.telegram.org",
   timeoutMs: 10_000,
   controlPollIntervalMs: 5_000,

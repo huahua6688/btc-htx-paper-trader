@@ -8,7 +8,7 @@ import {
   minimumMarginForStopBeforeLiquidation,
   resolveExchangeConstraints
 } from "./exchange-constraints.mjs";
-import { selectRiskPct } from "./runtime-settings.mjs";
+import { applyDynamicLimits, selectRiskPct } from "./runtime-settings.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
@@ -16,6 +16,44 @@ const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const round = (value, digits = 8) => Number(Number(value).toFixed(digits));
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+
+// 杠杆按 0.01 步进存储和展示。计算保证金时必须使用“满足约束的最小可表示杠杆”，
+// 也就是向上取整；向下四舍五入会让 notional/leverage 略高于可用保证金，
+// 从而把本来完全合法的仓位误判成违规并静默丢弃。
+const LEVERAGE_STEP = 0.01;
+const LEVERAGE_EPSILON = 1e-9;
+const ceilToLeverageStep = (value) => Math.ceil(value / LEVERAGE_STEP - LEVERAGE_EPSILON) * LEVERAGE_STEP;
+const floorToLeverageStep = (value) => Math.floor(value / LEVERAGE_STEP + LEVERAGE_EPSILON) * LEVERAGE_STEP;
+const normalizeLeverage = (value) => Number(value.toFixed(2));
+
+/**
+ * 仓位计算的拒绝原因码。每一种拒绝都必须能被 monitor、Telegram 和研究回放分别统计，
+ * 不允许再把「合约步进不够」「保证金上限」「净 RR 不足」混成同一句话。
+ */
+export const SIZING_REJECTION_CODES = Object.freeze({
+  DECISION_NOT_DIRECTIONAL: "当前决策不是 LONG/SHORT",
+  PLAN_INCOMPLETE: "缺少可用的价格或止损计划",
+  STOP_ON_WRONG_SIDE: "止损方向与开仓方向不一致",
+  EQUITY_NOT_POSITIVE: "账户权益不为正",
+  PORTFOLIO_RISK_BUDGET_EXHAUSTED: "组合总风险预算已用尽",
+  PORTFOLIO_MARGIN_BUDGET_EXHAUSTED: "组合保证金预算已用尽",
+  PORTFOLIO_NOTIONAL_BUDGET_EXHAUSTED: "组合名义仓位预算已用尽",
+  RISK_BUDGET_ZERO: "本轮单笔风险预算为 0",
+  NO_TARGET_MEETS_NET_RR: "没有止盈目标能达到成本后净 RR 门槛",
+  BELOW_MIN_CONTRACT_STEP: "按风险/保证金算出的数量不足一个最小合约步进",
+  LEVERAGE_CAP_BINDING: "达到杠杆上限后仍无法构造合法仓位",
+  MARGIN_CAP_BINDING: "达到保证金上限后仍无法构造合法仓位",
+  NET_RR_BELOW_MINIMUM: "合约步进取整后净 RR 低于门槛",
+  RISK_BUDGET_EXCEEDED: "合约步进取整后预计亏损超过风险预算",
+  LIQUIDATION_ESTIMATE_UNAVAILABLE: "无法估算 Paper 强平价",
+  STOP_BEYOND_LIQUIDATION_BUFFER: "止损没有先于 Paper 强平缓冲触发",
+  PORTFOLIO_LIQUIDATION_ESTIMATE_UNAVAILABLE: "无法估算加仓后的组合 Paper 强平价",
+  PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER: "加仓后整体止损没有先于 Paper 强平缓冲触发"
+});
+
+function rejection(code, metrics = {}) {
+  return { code, message: SIZING_REJECTION_CODES[code] ?? code, metrics };
+}
 
 export function shanghaiDayStartIso(timestamp = new Date().toISOString()) {
   const utcMs = new Date(timestamp).getTime();
@@ -130,7 +168,10 @@ export function calculateAccountState(db, currentPrice = db.getLatestSnapshot()?
     const direction = position.side === "LONG" ? 1 : -1;
     const priceRisk = Math.max(0, direction * (Number(currentPrice) - Number(position.stop_loss)))
       * Number(position.quantity_btc) * config.usdtCnyRate;
-    const exitCost = Number(position.take_profit) * Number(position.quantity_btc)
+    // 剩余风险是「被止损出场」的情形，退出成本必须按止损成交价估算，
+    // 而不是按永远不会在这条路径上成交的止盈价。
+    const stopExitFill = adverseFill(position.side, Number(position.stop_loss), "EXIT", config.slippageRate);
+    const exitCost = stopExitFill * Number(position.quantity_btc)
       * config.usdtCnyRate * (config.feeRatePerSide + config.slippageRate);
     return sum + priceRisk + exitCost;
   }, 0);
@@ -159,7 +200,11 @@ export function calculateAccountState(db, currentPrice = db.getLatestSnapshot()?
   };
 }
 
-export function buildPaperCandidate(
+export function buildPaperCandidate(...args) {
+  return buildPaperCandidateResult(...args).candidate;
+}
+
+export function buildPaperCandidateResult(
   report,
   accountOrState,
   runtimeSettings = RUNTIME_SETTINGS_DEFAULTS,
@@ -168,16 +213,22 @@ export function buildPaperCandidate(
   config = PAPER_CONFIG,
   portfolioPositions = openPositions
 ) {
+  const reject = (code, metrics) => ({ candidate: null, rejection: rejection(code, metrics) });
   const side = report.decision;
-  if (!["LONG", "SHORT"].includes(side)) return null;
-  if (!report.plan || !finite(report.currentPrice) || !finite(report.plan.stopLoss)) return null;
+  if (!["LONG", "SHORT"].includes(side)) return reject("DECISION_NOT_DIRECTIONAL", { decision: report.decision ?? null });
+  if (!report.plan || !finite(report.currentPrice) || !finite(report.plan.stopLoss)) {
+    return reject("PLAN_INCOMPLETE", {
+      currentPrice: report.currentPrice ?? null,
+      stopLoss: report.plan?.stopLoss ?? null
+    });
+  }
   const signalEntry = Number(report.currentPrice);
   const stopLoss = Number(report.plan.stopLoss);
   const stopIsValid = side === "LONG" ? stopLoss < signalEntry : stopLoss > signalEntry;
-  if (!stopIsValid) return null;
+  if (!stopIsValid) return reject("STOP_ON_WRONG_SIDE", { side, signalEntry, stopLoss });
 
   const accountEquityCny = Number(accountOrState.equityCny ?? accountOrState.cash_cny);
-  if (!(accountEquityCny > 0)) return null;
+  if (!(accountEquityCny > 0)) return reject("EQUITY_NOT_POSITIVE", { accountEquityCny });
   const portfolioMargin = portfolioPositions.reduce((sum, item) => sum + Number(item.margin_cny ?? item.notional_cny), 0);
   const portfolioNotional = portfolioPositions.reduce((sum, item) => sum + Number(item.notional_cny), 0);
   const portfolioRisk = portfolioPositions.reduce((sum, item) => sum + Number(item.expected_loss_cny ?? item.risk_cny), 0);
@@ -187,7 +238,9 @@ export function buildPaperCandidate(
   const availableRisk = Math.max(0, accountEquityCny * runtimeSettings.maxTotalRiskPct - portfolioRisk);
   const availableMargin = Math.max(0, accountEquityCny * runtimeSettings.maxMarginUsagePct - portfolioMargin);
   const availableNotional = Math.max(0, accountEquityCny * runtimeSettings.maxTotalNotionalMultiple - portfolioNotional);
-  if (!(availableRisk > 0) || !(availableMargin > 0) || !(availableNotional > 0)) return null;
+  if (!(availableRisk > 0)) return reject("PORTFOLIO_RISK_BUDGET_EXHAUSTED", { availableRisk, portfolioRisk, accountEquityCny });
+  if (!(availableMargin > 0)) return reject("PORTFOLIO_MARGIN_BUDGET_EXHAUSTED", { availableMargin, portfolioMargin, accountEquityCny });
+  if (!(availableNotional > 0)) return reject("PORTFOLIO_NOTIONAL_BUDGET_EXHAUSTED", { availableNotional, portfolioNotional, accountEquityCny });
 
   const opportunityScore = Number(report.opportunities?.[side]?.score ?? 0);
   const volatilityPct = finite(report.timeframes?.["1h"]?.atr14)
@@ -204,7 +257,7 @@ export function buildPaperCandidate(
   }) * opportunityRiskFactor(report, side);
   const riskPct = clamp(requestedRiskPct, runtimeSettings.riskMinPct, config.absoluteMaxRiskPerTradePct);
   const riskBudgetCny = Math.min(accountEquityCny * riskPct, availableRisk);
-  if (!(riskBudgetCny > 0)) return null;
+  if (!(riskBudgetCny > 0)) return reject("RISK_BUDGET_ZERO", { riskPct, availableRisk, accountEquityCny });
 
   const fundingRate = finite(report.derivatives?.fundingRatePct) ? Number(report.derivatives.fundingRatePct) / 100 : 0;
   const viableTargets = candidateTargets(report).map((takeProfit) => ({
@@ -214,7 +267,17 @@ export function buildPaperCandidate(
     const validDirection = side === "LONG" ? takeProfit > signalEntry : takeProfit < signalEntry;
     return validDirection && finite(economics.netRr) && economics.netRr >= config.minimumRiskReward;
   });
-  if (!viableTargets.length) return null;
+  if (!viableTargets.length) {
+    const attempted = candidateTargets(report).map((takeProfit) => {
+      const economics = unitEconomics(side, signalEntry, stopLoss, takeProfit, fundingRate, config);
+      return { takeProfit, netRr: finite(economics.netRr) ? round(economics.netRr, 4) : null };
+    });
+    return reject("NO_TARGET_MEETS_NET_RR", {
+      minimumRiskReward: config.minimumRiskReward,
+      attemptedTargets: attempted,
+      bestNetRr: attempted.reduce((best, item) => item.netRr !== null && item.netRr > best ? item.netRr : best, 0)
+    });
+  }
   const selected = opportunityScore >= 80 ? viableTargets.at(-1) : viableTargets[0];
   const perBtc = selected.economics;
   const quantityByRisk = riskBudgetCny / perBtc.expectedLoss;
@@ -236,24 +299,84 @@ export function buildPaperCandidate(
   const unitNotional = perBtc.entryFill * config.usdtCnyRate;
   const liquidationSafeMaxLeverage = unitSafeMargin > 0 ? unitNotional / unitSafeMargin : hardMaxLeverage;
   const leverageCap = Math.max(1, Math.min(hardMaxLeverage, liquidationSafeMaxLeverage));
-  const quantityByNotional = Math.min(availableNotional, availableMargin * leverageCap) / unitNotional;
+  // 名义仓位只能用「可以被 0.01 步进精确表示」的杠杆去撬动，否则向上取整后的杠杆
+  // 会越过上限。先把上限向下对齐到步进，requiredLeverage 就一定落在可表示范围内。
+  const usableLeverageCap = Math.max(LEVERAGE_STEP, floorToLeverageStep(leverageCap));
+  const marginBoundNotional = availableMargin * usableLeverageCap;
+  const quantityByNotional = Math.min(availableNotional, marginBoundNotional) / unitNotional;
   const contractSize = Number(exchangeConstraints.contractSizeBtc);
-  const quantityBtc = floorToContract(Math.min(quantityByRisk, quantityByNotional), contractSize);
-  if (!(quantityBtc >= contractSize)) return null;
+  const targetQuantity = Math.min(quantityByRisk, quantityByNotional);
+  let quantityBtc = floorToContract(targetQuantity, contractSize);
+  if (!(quantityBtc >= contractSize)) {
+    return reject("BELOW_MIN_CONTRACT_STEP", {
+      contractSizeBtc: contractSize,
+      quantityByRisk: round(quantityByRisk, 10),
+      quantityByNotional: round(quantityByNotional, 10),
+      bindingConstraint: quantityByRisk <= quantityByNotional ? "RISK_BUDGET" : "MARGIN_OR_NOTIONAL",
+      riskBudgetCny: round(riskBudgetCny, 6),
+      expectedLossPerBtcCny: round(perBtc.expectedLoss, 6),
+      accountEquityCny: round(accountEquityCny, 4),
+      minimumContractNotionalCny: round(contractSize * unitNotional, 4)
+    });
+  }
 
-  const notionalCny = quantityBtc * perBtc.entryFill * config.usdtCnyRate;
-  const requiredLeverage = notionalCny / availableMargin;
-  const desiredLeverage = runtimeSettings.leverageMode === "MANUAL"
-    ? Number(runtimeSettings.leverageManual)
-    : Math.max(hardMinLeverage, requiredLeverage);
-  const leverage = round(clamp(desiredLeverage, hardMinLeverage, leverageCap), 2);
-  const marginCny = notionalCny / leverage;
-  if (marginCny > availableMargin + 0.01) return null;
+  // 杠杆必须是「满足可用保证金约束的最小可表示杠杆」。向上取整保证
+  // marginCny = notional / leverage <= availableMargin；如果向上取整后越过上限，
+  // 就按合约步进缩小数量重算，绝不放行一个越界的仓位。
+  let notionalCny = quantityBtc * perBtc.entryFill * config.usdtCnyRate;
+  let leverage = null;
+  let marginCny = null;
+  let leverageBlocked = null;
+  for (let attempt = 0; quantityBtc >= contractSize; attempt += 1) {
+    notionalCny = quantityBtc * perBtc.entryFill * config.usdtCnyRate;
+    const requiredLeverage = notionalCny / availableMargin;
+    const desiredLeverage = runtimeSettings.leverageMode === "MANUAL"
+      ? Math.max(Number(runtimeSettings.leverageManual), requiredLeverage)
+      : Math.max(hardMinLeverage, requiredLeverage);
+    const candidateLeverage = ceilToLeverageStep(clamp(desiredLeverage, hardMinLeverage, Math.max(hardMinLeverage, leverageCap)));
+    if (candidateLeverage > leverageCap + LEVERAGE_EPSILON) {
+      leverageBlocked = { requiredLeverage, candidateLeverage, leverageCap };
+      quantityBtc = round(quantityBtc - contractSize, 8);
+      continue;
+    }
+    const candidateMargin = notionalCny / candidateLeverage;
+    if (candidateMargin > availableMargin + LEVERAGE_EPSILON) {
+      leverageBlocked = { requiredLeverage, candidateLeverage, candidateMargin, availableMargin };
+      quantityBtc = round(quantityBtc - contractSize, 8);
+      continue;
+    }
+    leverage = normalizeLeverage(candidateLeverage);
+    marginCny = notionalCny / leverage;
+    if (marginCny > availableMargin + 0.01) {
+      // normalizeLeverage 只做两位小数展示化，理论上不会放大保证金；保留防御分支。
+      leverageBlocked = { requiredLeverage, candidateLeverage, marginCny, availableMargin };
+      leverage = null;
+      marginCny = null;
+      quantityBtc = round(quantityBtc - contractSize, 8);
+      continue;
+    }
+    break;
+  }
+  if (leverage === null || marginCny === null || !(quantityBtc >= contractSize)) {
+    const code = leverageBlocked?.candidateLeverage > leverageCap ? "LEVERAGE_CAP_BINDING" : "MARGIN_CAP_BINDING";
+    return reject(code, {
+      contractSizeBtc: contractSize,
+      leverageCap: round(leverageCap, 4),
+      usableLeverageCap: round(usableLeverageCap, 4),
+      availableMarginCny: round(availableMargin, 4),
+      ...leverageBlocked
+    });
+  }
 
   const expectedLossCny = perBtc.expectedLoss * quantityBtc;
   const expectedProfitCny = perBtc.expectedProfit * quantityBtc;
   const netRr = expectedLossCny > 0 ? expectedProfitCny / expectedLossCny : null;
-  if (!(netRr >= config.minimumRiskReward) || expectedLossCny > riskBudgetCny + 0.01) return null;
+  if (!(netRr >= config.minimumRiskReward)) {
+    return reject("NET_RR_BELOW_MINIMUM", { netRr: finite(netRr) ? round(netRr, 4) : null, minimumRiskReward: config.minimumRiskReward });
+  }
+  if (expectedLossCny > riskBudgetCny + 0.01) {
+    return reject("RISK_BUDGET_EXCEEDED", { expectedLossCny: round(expectedLossCny, 4), riskBudgetCny: round(riskBudgetCny, 4) });
+  }
   const liquidation = estimatePaperLiquidation({
     side,
     entry: perBtc.entryFill,
@@ -262,11 +385,17 @@ export function buildPaperCandidate(
     usdtCnyRate: config.usdtCnyRate,
     maintenanceMarginRate: exchangeConstraints.maintenanceMarginRate
   });
-  if (!liquidation) return null;
+  if (!liquidation) return reject("LIQUIDATION_ESTIMATE_UNAVAILABLE", { quantityBtc, marginCny: round(marginCny, 4) });
   const stopBeforeLiquidation = side === "LONG"
     ? stopLoss > liquidation.price + signalEntry * PAPER_EXCHANGE_CONSTRAINTS.liquidationSafetyBufferPct
     : stopLoss < liquidation.price - signalEntry * PAPER_EXCHANGE_CONSTRAINTS.liquidationSafetyBufferPct;
-  if (!stopBeforeLiquidation) return null;
+  if (!stopBeforeLiquidation) {
+    return reject("STOP_BEYOND_LIQUIDATION_BUFFER", {
+      stopLoss,
+      liquidationPrice: liquidation.price,
+      bufferPct: PAPER_EXCHANGE_CONSTRAINTS.liquidationSafetyBufferPct
+    });
+  }
 
   const existingQuantity = openPositions.reduce((sum, item) => sum + Number(item.quantity_btc), 0);
   const totalQuantity = existingQuantity + quantityBtc;
@@ -293,11 +422,18 @@ export function buildPaperCandidate(
     usdtCnyRate: config.usdtCnyRate,
     maintenanceMarginRate: exchangeConstraints.maintenanceMarginRate
   });
-  if (!portfolioLiquidation) return null;
+  if (!portfolioLiquidation) {
+    return reject("PORTFOLIO_LIQUIDATION_ESTIMATE_UNAVAILABLE", { totalQuantity, totalMarginCny: round(totalMarginCny, 4) });
+  }
   const portfolioStopBeforeLiquidation = side === "LONG"
     ? weightedStop > portfolioLiquidation.price + averageEntry * PAPER_EXCHANGE_CONSTRAINTS.liquidationSafetyBufferPct
     : weightedStop < portfolioLiquidation.price - averageEntry * PAPER_EXCHANGE_CONSTRAINTS.liquidationSafetyBufferPct;
-  if (!portfolioStopBeforeLiquidation) return null;
+  if (!portfolioStopBeforeLiquidation) {
+    return reject("PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER", {
+      weightedStop: round(weightedStop, 2),
+      portfolioLiquidationPrice: portfolioLiquidation.price
+    });
+  }
   const portfolioAfter = {
     positionCount: openPositions.length + 1,
     totalQuantityBtc: round(totalQuantity, 8),
@@ -332,7 +468,7 @@ export function buildPaperCandidate(
     )
   };
   const directionReasons = (side === "LONG" ? report.bullishReasons : report.bearishReasons) ?? [];
-  return {
+  const candidate = {
     symbol: report.symbol,
     side,
     openedAt: report.generatedAt,
@@ -370,6 +506,22 @@ export function buildPaperCandidate(
     groupAfter: portfolioAfter,
     portfolioAfter,
     isAddOn: openPositions.length > 0,
+    // 仓位计算的中间量。测试用它断言「这是约束允许的最大合法仓位」，
+    // 研究报告用它区分是被风险预算、名义仓位还是保证金/杠杆卡住。
+    sizing: {
+      contractSizeBtc: contractSize,
+      quantityByRisk: round(quantityByRisk, 10),
+      quantityByNotional: round(quantityByNotional, 10),
+      unitNotionalCny: round(unitNotional, 8),
+      expectedLossPerBtcCny: round(perBtc.expectedLoss, 8),
+      availableRiskCny: round(availableRisk, 6),
+      availableMarginCny: round(availableMargin, 6),
+      availableNotionalCny: round(availableNotional, 6),
+      leverageCap: round(leverageCap, 6),
+      usableLeverageCap: round(usableLeverageCap, 6),
+      hardMinLeverage: round(hardMinLeverage, 6),
+      bindingConstraint: quantityByRisk <= quantityByNotional ? "RISK_BUDGET" : "MARGIN_OR_NOTIONAL"
+    },
     openingReasons: [
       ...(report.entryAssessment?.methodLabel ? [`动态入场：${report.entryAssessment.methodLabel}`] : []),
       ...directionReasons.slice(0, 4),
@@ -377,6 +529,7 @@ export function buildPaperCandidate(
       `实际 ${leverage}x 仅用于分配 ${round(marginCny, 2)} CNY 保证金，不增加允许亏损`
     ].slice(0, 6)
   };
+  return { candidate, rejection: null };
 }
 
 export function getDailyRiskState(db, at = new Date().toISOString(), runtimeSettings = db.getRuntimeSettings?.() ?? RUNTIME_SETTINGS_DEFAULTS) {
@@ -425,44 +578,109 @@ function aggregateOpenPosition(openPositions) {
   };
 }
 
+/**
+ * 从数据库与当轮报告拼出 AUTO 限额需要的账户/市场上下文。
+ * 全部来自已经发生的事实，不使用任何未来数据。
+ */
+export function buildExposureContext(db, report, accountState, dailyRisk, config = PAPER_CONFIG) {
+  const side = report.decision;
+  const equityCny = Number(accountState.equityCny);
+  const signalEntry = Number(report.currentPrice);
+  const stopLoss = Number(report.plan?.stopLoss);
+  const stopDistancePct = finite(signalEntry) && finite(stopLoss) && signalEntry > 0
+    ? Math.abs(signalEntry - stopLoss) / signalEntry
+    : null;
+  const volatilityPct = finite(report.timeframes?.["1h"]?.atr14) && signalEntry > 0
+    ? Number(report.timeframes["1h"].atr14) / signalEntry
+    : stopDistancePct;
+  const peakBalanceCny = typeof db.getPeakBalanceCny === "function"
+    ? Number(db.getPeakBalanceCny())
+    : Number(accountState.initialCapitalCny);
+  const peak = Math.max(peakBalanceCny, Number(accountState.initialCapitalCny), equityCny);
+  const sameSideNotionalCny = side === "LONG" ? Number(accountState.longNotionalCny)
+    : side === "SHORT" ? Number(accountState.shortNotionalCny) : 0;
+  return {
+    equityCny,
+    initialCapitalCny: Number(accountState.initialCapitalCny),
+    opportunityScore: Number(report.opportunities?.[side]?.score ?? 0),
+    volatilityPct: finite(volatilityPct) ? Number(volatilityPct) : 0.02,
+    stopDistancePct: finite(stopDistancePct) ? Number(stopDistancePct) : 0.02,
+    marginUsedCny: Number(accountState.marginUsedCny),
+    totalRiskCny: Number(accountState.totalRiskCny),
+    grossNotionalCny: Number(accountState.grossNotionalCny),
+    sameSideNotionalCny,
+    drawdownPct: peak > 0 ? Math.max(0, (peak - equityCny) / peak) : 0,
+    dailyLossPct: Number(dailyRisk.dayStartBalanceCny) > 0
+      ? Math.max(0, Number(dailyRisk.dailyLossCny) / Number(dailyRisk.dayStartBalanceCny))
+      : 0,
+    lossStreak: Number(dailyRisk.consecutiveLosses ?? 0),
+    positionCount: accountState.positions.length
+  };
+}
+
 export function evaluatePaperEntry(db, report, config = PAPER_CONFIG, marketData = {}) {
-  const reasons = [];
-  const settings = db.getRuntimeSettings();
+  const blocks = [];
+  const block = (code, message) => blocks.push({ code, message });
+  const storedSettings = db.getRuntimeSettings();
   const openPositions = db.getOpenPositions();
   const sameSidePositions = openPositions.filter((position) => position.side === report.decision);
   const oppositeSidePositions = openPositions.filter((position) => position.side !== report.decision);
-  if (!["LONG", "SHORT"].includes(report.decision)) reasons.push("当前决策不是 LONG/SHORT");
-  if (report.riskGates?.length) reasons.push(...report.riskGates);
-  const dailyRisk = getDailyRiskState(db, report.generatedAt, settings);
-  if (dailyRisk.paused) reasons.push(...dailyRisk.pauseReasons);
-  if (openPositions.length >= settings.maxOpenPositions) reasons.push("已达到最大同时仓位数");
-  if (settings.positionMode === "NET" && oppositeSidePositions.length) {
-    reasons.push("NET 模式已有相反方向仓位，本轮禁止开仓");
+  if (!["LONG", "SHORT"].includes(report.decision)) block("DECISION_NOT_DIRECTIONAL", "当前决策不是 LONG/SHORT");
+  for (const gate of report.riskGates ?? []) block("MARKET_RISK_GATE", gate);
+  const dailyRisk = getDailyRiskState(db, report.generatedAt, storedSettings);
+  if (dailyRisk.paused) {
+    for (const reason of dailyRisk.pauseReasons) block("ACCOUNT_PAUSED", reason);
+  }
+  if (openPositions.length >= storedSettings.maxOpenPositions) block("MAX_OPEN_POSITIONS", "已达到最大同时仓位数");
+  if (storedSettings.positionMode === "NET" && oppositeSidePositions.length) {
+    block("NET_MODE_OPPOSITE_POSITION", "NET 模式已有相反方向仓位，本轮禁止开仓");
   }
   if (sameSidePositions.length) {
-    if (!settings.allowPyramiding) reasons.push("已有同方向 BTC 模拟仓位，加仓已关闭");
+    if (!storedSettings.allowPyramiding) block("PYRAMIDING_DISABLED", "已有同方向 BTC 模拟仓位，加仓已关闭");
     const aggregate = aggregateOpenPosition(sameSidePositions);
     const favorable = report.decision === "LONG"
       ? report.currentPrice > aggregate.averageEntry + aggregate.averageInitialRiskDistance * 0.5
       : report.currentPrice < aggregate.averageEntry - aggregate.averageInitialRiskDistance * 0.5;
     const score = Number(report.opportunities?.[report.decision]?.score ?? 0);
-    if (!favorable) reasons.push("已有仓位尚未获得足够有利进展，禁止加仓");
-    if (score < config.minimumImmediateEntryScore + 5) reasons.push("新机会质量不足以支持受控加仓");
+    if (!favorable) block("ADD_ON_NOT_FAVORABLE", "已有仓位尚未获得足够有利进展，禁止加仓");
+    if (score < config.minimumImmediateEntryScore + 5) block("ADD_ON_QUALITY_TOO_LOW", "新机会质量不足以支持受控加仓");
     const newestBar = Math.max(...sameSidePositions.map((item) => Number(item.entry_bar_ts)));
-    if (Number(report.latest15mBar?.timestamp) <= newestBar) reasons.push("同一行情周期禁止重复加仓");
+    if (Number(report.latest15mBar?.timestamp) <= newestBar) block("ADD_ON_SAME_BAR", "同一行情周期禁止重复加仓");
   }
   let candidate = null;
-  if (!reasons.length) {
+  let sizing = null;
+  let dynamic = null;
+  let settings = storedSettings;
+  if (!blocks.length) {
     const accountState = calculateAccountState(db, report.currentPrice, config);
+    const exposureContext = buildExposureContext(db, report, accountState, dailyRisk, config);
+    dynamic = applyDynamicLimits(storedSettings, exposureContext);
+    settings = dynamic.settings;
     const constraints = resolveExchangeConstraints(marketData);
-    candidate = buildPaperCandidate(report, accountState, settings, constraints, sameSidePositions, config, openPositions);
-    if (!candidate) reasons.push("没有满足净 RR、合约步进、总风险、保证金、名义仓位与强平缓冲的有效仓位");
+    sizing = buildPaperCandidateResult(report, accountState, settings, constraints, sameSidePositions, config, openPositions);
+    candidate = sizing.candidate;
+    if (!candidate) block(sizing.rejection.code, sizing.rejection.message);
   }
+  const seen = new Set();
+  const rejections = blocks.filter((item) => {
+    const key = `${item.code}:${item.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   return {
-    allowed: reasons.length === 0,
-    reasons: [...new Set(reasons)],
+    allowed: rejections.length === 0,
+    reasons: rejections.map((item) => item.message),
+    reasonCodes: rejections.map((item) => item.code),
+    rejections,
+    sizingRejection: sizing?.rejection ?? null,
+    dynamicLimits: dynamic?.limits ?? null,
+    exposure: dynamic?.exposure ?? null,
     dailyRisk,
-    settings,
+    // openPosition 的原子复核使用已写入 SQLite 的天花板，因此这里必须回传 storedSettings
+    // 的 revision/updatedAt；动态限额只会更严，永远不会突破天花板。
+    settings: { ...settings, revision: storedSettings.revision, updatedAt: storedSettings.updatedAt },
+    storedSettings,
     candidate
   };
 }
@@ -476,12 +694,18 @@ export function evaluatePaperExit(position, report, config = PAPER_CONFIG, {
   if (!finite(report.currentPrice)) return null;
   const bar = report.latest15mBar;
   const canUseBar = finite(bar?.timestamp) && Number(bar.timestamp) > Number(position.entry_bar_ts);
+  // 移动止损之后，同一根 K 线在止损生效之前已经走出的 high/low 属于过去，
+  // 不能用来触发新的止损。只有开始时间晚于止损生效时刻的 K 线才可回溯。
+  const stopEffectiveBarTs = finite(position.stop_effective_bar_ts)
+    ? Number(position.stop_effective_bar_ts)
+    : Number(position.entry_bar_ts);
+  const canUseBarForStop = canUseBar && Number(bar.timestamp) > stopEffectiveBarTs;
   const currentPrice = Number(report.currentPrice);
   const liquidation = Number(position.liquidation_price_estimate);
   const hasLiquidation = finite(position.liquidation_price_estimate);
   let exitReason = forcedReason;
   let triggerPrice = currentPrice;
-  const barHitStop = canUseBar && (position.side === "LONG"
+  const barHitStop = canUseBarForStop && (position.side === "LONG"
     ? Number(bar.low) <= Number(position.stop_loss)
     : Number(bar.high) >= Number(position.stop_loss));
   const barHitTarget = canUseBar && (position.side === "LONG"
@@ -499,8 +723,8 @@ export function evaluatePaperExit(position, report, config = PAPER_CONFIG, {
   }
   if (!exitReason && checkStop) {
     const hitStop = position.side === "LONG"
-      ? (canUseBar ? Number(bar.low) <= Number(position.stop_loss) : currentPrice <= Number(position.stop_loss))
-      : (canUseBar ? Number(bar.high) >= Number(position.stop_loss) : currentPrice >= Number(position.stop_loss));
+      ? (canUseBarForStop ? Number(bar.low) <= Number(position.stop_loss) : currentPrice <= Number(position.stop_loss))
+      : (canUseBarForStop ? Number(bar.high) >= Number(position.stop_loss) : currentPrice >= Number(position.stop_loss));
     if (hitStop) {
       exitReason = "SL";
       triggerPrice = Number(position.stop_loss);

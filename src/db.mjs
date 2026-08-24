@@ -69,7 +69,8 @@ const RUNTIME_FIELDS = Object.freeze([
   ["lossStreakMode", "loss_streak_mode", "text"], ["lossStreakMin", "loss_streak_min"], ["lossStreakMax", "loss_streak_max"], ["lossStreakManual", "loss_streak_manual"], ["maxConsecutiveLosses", "max_consecutive_losses"],
   ["newEntriesPaused", "new_entries_paused", "boolean"],
   ["indicatorProfile", "indicator_profile", "text"],
-  ["monitorIntervalMinutes", "monitor_interval_minutes"]
+  ["monitorIntervalMinutes", "monitor_interval_minutes"],
+  ["dataPolicyMode", "data_policy_mode", "text"]
 ]);
 
 function runtimeFromRow(row) {
@@ -95,6 +96,8 @@ export class PaperDatabase {
     this.pathSource = config.databasePathSource ?? (path === ":memory:" ? "MEMORY" : "EXPLICIT");
     this.config = config;
     this.readOnly = readOnly;
+    this.transactionDepth = 0;
+    this.savepointCounter = 0;
     if (path !== ":memory:" && !readOnly) mkdirSync(dirname(path), { recursive: true });
     this.positionGroupMigrationBackup = readOnly ? null : backupDatabaseBeforePositionGroupMigration(path);
     this.db = new DatabaseSync(path, { readOnly });
@@ -315,6 +318,7 @@ export class PaperDatabase {
         new_entries_paused INTEGER NOT NULL CHECK (new_entries_paused IN (0, 1)),
         indicator_profile TEXT NOT NULL DEFAULT 'AUTO',
         monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
+        data_policy_mode TEXT NOT NULL DEFAULT 'FROZEN_V12_STRICT',
         revision INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         updated_by TEXT NOT NULL
@@ -455,9 +459,12 @@ export class PaperDatabase {
       ["exchange_constraints_json", "TEXT"], ["portfolio_after_json", "TEXT"],
       ["exit_trigger_price", "REAL"], ["last_management_bar_ts", "INTEGER"],
       ["opposite_signal_count", "INTEGER NOT NULL DEFAULT 0"], ["management_json", "TEXT NOT NULL DEFAULT '{}'"],
-      ["position_group_id", "INTEGER"], ["legacy_contract_math_status", "TEXT NOT NULL DEFAULT 'CURRENT'"]
+      ["position_group_id", "INTEGER"], ["legacy_contract_math_status", "TEXT NOT NULL DEFAULT 'CURRENT'"],
+      ["stop_effective_bar_ts", "INTEGER"]
     ];
     for (const [name, definition] of migrations) this.ensureColumn("positions", name, definition);
+    // 老仓位没有这个字段时，止损自入场起生效，与升级前的行为一致。
+    this.db.exec("UPDATE positions SET stop_effective_bar_ts = entry_bar_ts WHERE stop_effective_bar_ts IS NULL");
     this.ensureColumn("feature_validation_runs", "validation_stage", "TEXT NOT NULL DEFAULT 'HISTORICAL_OOS'");
     this.ensureColumn("feature_validation_runs", "candidate_version", "TEXT NOT NULL DEFAULT 'unversioned'");
     if (this.ensureColumn("feature_registry", "availability_status", "TEXT NOT NULL DEFAULT 'research-only'")) {
@@ -467,6 +474,8 @@ export class PaperDatabase {
     this.ensureColumn("runtime_settings", "position_mode", "TEXT NOT NULL DEFAULT 'NET'");
     this.ensureColumn("runtime_settings", "indicator_profile", "TEXT NOT NULL DEFAULT 'AUTO'");
     this.ensureColumn("runtime_settings", "monitor_interval_minutes", "INTEGER NOT NULL DEFAULT 5");
+    // 已部署的库升级后保持冻结 V1.2 严格门禁，不会因为部署新版而改变交易行为。
+    this.ensureColumn("runtime_settings", "data_policy_mode", "TEXT NOT NULL DEFAULT 'FROZEN_V12_STRICT'");
     const rangeMigrations = [
       ["risk_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["risk_min_pct", "REAL NOT NULL DEFAULT 0.005"], ["risk_max_pct", "REAL NOT NULL DEFAULT 0.05"], ["risk_manual_pct", "REAL NOT NULL DEFAULT 0.01"],
       ["margin_mode", "TEXT NOT NULL DEFAULT 'MANUAL'"], ["margin_min_usage_pct", "REAL NOT NULL DEFAULT 0.10"], ["margin_max_usage_pct", "REAL NOT NULL DEFAULT 0.80"], ["margin_manual_usage_pct", "REAL NOT NULL DEFAULT 0.25"],
@@ -722,8 +731,30 @@ export class PaperDatabase {
     });
   }
 
+  /**
+   * 可安全嵌套的事务。最外层使用 BEGIN IMMEDIATE，内层使用命名 SAVEPOINT：
+   * 内层失败只回滚到自己的 savepoint 并把异常继续抛出，绝不会把外层事务一起废掉；
+   * 只有最外层才真正 COMMIT 或 ROLLBACK。
+   */
   transaction(work) {
+    if (this.transactionDepth > 0) {
+      const name = `paper_sp_${this.savepointCounter++}`;
+      this.db.exec(`SAVEPOINT ${name}`);
+      this.transactionDepth += 1;
+      try {
+        const result = work();
+        this.db.exec(`RELEASE SAVEPOINT ${name}`);
+        return result;
+      } catch (error) {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
+        this.db.exec(`RELEASE SAVEPOINT ${name}`);
+        throw error;
+      } finally {
+        this.transactionDepth -= 1;
+      }
+    }
     this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth = 1;
     try {
       const result = work();
       this.db.exec("COMMIT");
@@ -731,8 +762,12 @@ export class PaperDatabase {
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.transactionDepth = 0;
     }
   }
+
+  get inTransaction() { return this.transactionDepth > 0; }
 
   close() { this.db.close(); }
 
@@ -1043,10 +1078,24 @@ export class PaperDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       report.generatedAt, report.symbol, report.currentPrice, report.decision, report.candidateDecision,
-      report.confidencePct, report.finalScore, report.derivatives?.fundingRatePct,
+      report.signalQualityScore ?? report.confidencePct, report.finalScore, report.derivatives?.fundingRatePct,
       report.derivatives?.oiUsd, report.derivatives?.pressureScore, json(report.riskGates), json(report)
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * 把入场门禁产生的信息（动态限额、拒绝原因码）合并回当轮快照，
+   * 这样 status / Telegram / gate:report 看到的是同一份事实，而不是各算各的。
+   */
+  updateSnapshotReport(snapshotId, patch) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT report_json FROM snapshots WHERE id = ?").get(snapshotId);
+      if (!row) return null;
+      const merged = { ...parseJson(row.report_json, {}), ...patch };
+      this.db.prepare("UPDATE snapshots SET report_json = ? WHERE id = ?").run(json(merged), snapshotId);
+      return merged;
+    });
   }
 
   getLatestSnapshot() {
@@ -1178,8 +1227,8 @@ export class PaperDatabase {
           take_profit_distance_pct, opportunity_score, fee_estimate_cny, funding_estimate_cny,
           slippage_estimate_cny, entry_fee_cny, entry_slippage_cny, liquidation_price_estimate,
           liquidation_distance_pct, liquidation_source, exchange_constraints_json, portfolio_after_json,
-          opening_reasons_json, last_funding_at, last_management_bar_ts, management_json
-        ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          opening_reasons_json, last_funding_at, last_management_bar_ts, management_json, stop_effective_bar_ts
+        ) VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         groupId, snapshotId, candidate.symbol, candidate.side, candidate.openedAt, candidate.entryBarTs,
         candidate.signalEntryPrice ?? candidate.entry, candidate.entry,
@@ -1195,7 +1244,7 @@ export class PaperDatabase {
         candidate.liquidationPriceEstimate ?? null, candidate.liquidationDistancePct ?? null,
         candidate.liquidationSource ?? "UNAVAILABLE", json(candidate.exchangeConstraints ?? {}),
         json(groupAfter ?? {}), json(candidate.openingReasons), candidate.openedAt,
-        candidate.entryBarTs, json({ events: [] })
+        candidate.entryBarTs, json({ events: [] }), candidate.entryBarTs
       );
       const positionId = Number(result.lastInsertRowid);
       if (sameSide.length && groupAfter) {
@@ -1238,6 +1287,7 @@ export class PaperDatabase {
     takeProfit,
     lastManagementBarTs,
     oppositeSignalCount,
+    stopEffectiveBarTs,
     event
   }) {
     return this.transaction(() => {
@@ -1247,17 +1297,27 @@ export class PaperDatabase {
       const events = [...(management.events ?? []), ...(event ? [event] : [])].slice(-100);
       this.db.prepare(`
         UPDATE positions SET stop_loss = ?, take_profit = ?, last_management_bar_ts = ?,
-          opposite_signal_count = ?, management_json = ? WHERE id = ? AND status = 'OPEN'
+          opposite_signal_count = ?, management_json = ?, stop_effective_bar_ts = ?
+        WHERE id = ? AND status = 'OPEN'
       `).run(
         stopLoss ?? position.stop_loss,
         takeProfit ?? position.take_profit,
         lastManagementBarTs ?? position.last_management_bar_ts,
         oppositeSignalCount ?? position.opposite_signal_count,
         json({ events }),
+        stopEffectiveBarTs ?? position.stop_effective_bar_ts ?? position.entry_bar_ts,
         positionId
       );
       return this.getPosition(positionId);
     });
+  }
+
+  getPeakBalanceCny() {
+    const row = this.db.prepare("SELECT MAX(balance_after_cny) AS peak FROM account_events").get();
+    const account = this.getAccount();
+    const initial = Number(account?.initial_capital_cny ?? 0);
+    const peak = Number(row?.peak);
+    return Number.isFinite(peak) ? Math.max(peak, initial) : initial;
   }
 
   updatePositionGroupManagement(positionGroupId, managementUpdate) {
@@ -1272,13 +1332,16 @@ export class PaperDatabase {
         const events = [...(position.management?.events ?? []), ...(managementUpdate.event ? [managementUpdate.event] : [])].slice(-100);
         this.db.prepare(`
           UPDATE positions SET stop_loss = ?, take_profit = ?, last_management_bar_ts = ?,
-            opposite_signal_count = ?, management_json = ? WHERE id = ? AND status = 'OPEN'
+            opposite_signal_count = ?, management_json = ?, stop_effective_bar_ts = ?
+          WHERE id = ? AND status = 'OPEN'
         `).run(
           managementUpdate.stopLoss ?? position.stop_loss,
           managementUpdate.takeProfit ?? position.take_profit,
           managementUpdate.lastManagementBarTs ?? position.last_management_bar_ts,
           managementUpdate.oppositeSignalCount ?? position.opposite_signal_count,
-          json({ events }), position.id
+          json({ events }),
+          managementUpdate.stopEffectiveBarTs ?? position.stop_effective_bar_ts ?? position.entry_bar_ts,
+          position.id
         );
       }
       return this.db.prepare(`

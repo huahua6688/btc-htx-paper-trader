@@ -10,9 +10,16 @@ import { runHistoricalFeatureAblation } from "./feature-ablation.mjs";
 import { defaultCatalogDirectory, loadHistoricalDataset, updateHistoricalDataset } from "./historical-data.mjs";
 import { runMonteCarloRobustness } from "./monte-carlo.mjs";
 import { runStrategyOptimization } from "./optimization-engine.mjs";
-import { runChampionChallengerComparison, runHistoricalReplay } from "./replay-engine.mjs";
+import {
+  CAPITAL_PROFILES,
+  DEFAULT_REFERENCE_CAPITAL_CNY,
+  runChampionChallengerComparison,
+  runHistoricalReplay
+} from "./replay-engine.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
 import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
+import { PAPER_CONFIG } from "./config.mjs";
+import { runResearchV2Pipeline } from "./research-v2-pipeline.mjs";
 import { runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
 import { ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
@@ -45,6 +52,70 @@ function range(args, defaults = null) {
 }
 
 function runId(prefix) { return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`; }
+
+/**
+ * 研究运行登记簿。
+ *
+ * 修复前：只有 research-v2-pipeline.mjs 会调用 recordResearchRun / registerStrategyVersion，
+ * 而那个模块没有任何 CLI 入口，等于永远不会被执行。所有研究命令都只把 JSON 写进
+ * research-output/，SQLite 里的 research_runs 因此恒为 0 ——「代码存在」但「从未执行」。
+ *
+ * 修复后：每个研究命令结束时都把运行结果登记进一个独立的研究 SQLite。
+ * 它绝不是生产 Paper 库：路径固定在 research-output/ 下，PAPER_DB_PATH 不会被读取，
+ * 也不会写入任何仓位或账户。
+ */
+export function researchRegistryPath() { return resolveOutputPath("research-registry.sqlite"); }
+
+export function openResearchRegistry(path = researchRegistryPath()) {
+  return openPaperDatabase(path, {
+    ...PAPER_CONFIG,
+    databasePath: path,
+    databasePathSource: "RESEARCH_REGISTRY_NOT_PRODUCTION"
+  });
+}
+
+async function withResearchRegistry(work) {
+  await mkdir(resolveOutputPath("."), { recursive: true });
+  const db = openResearchRegistry();
+  try {
+    return work(db);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * 登记一次研究运行。status 必须如实反映真实结果：
+ * PASSED / FAILED / PARTIAL / BLOCKED，绝不允许为了让计数变成 1 而伪造 PASSED。
+ */
+export async function persistResearchRun(record) {
+  return withResearchRegistry((db) => ({
+    id: db.recordResearchRun(record),
+    registryPath: researchRegistryPath(),
+    totalRuns: db.getResearchRuns({ limit: 1_000_000 }).length
+  }));
+}
+
+async function recordRun(runType, startedAt, status, { artifactPath = null, dataManifestHash = null, strategyVersion = null, summary = {} } = {}) {
+  try {
+    const persisted = await persistResearchRun({
+      runType,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      status,
+      artifactPath,
+      dataManifestHash,
+      strategyVersion,
+      summary
+    });
+    process.stdout.write(`${JSON.stringify({ researchRunPersisted: { runType, status, ...persisted } })}\n`);
+    return persisted;
+  } catch (error) {
+    // 登记失败不能把已经完成的研究结果吞掉，但必须明确说出来。
+    process.stderr.write(`Research run registry write failed: ${error.message}\n`);
+    return null;
+  }
+}
 
 async function save(path, value) {
   await writeJsonAtomic(path, value);
@@ -81,12 +152,31 @@ async function dataUpdate(args, defaults = null) {
 
 async function load(args) { return loadHistoricalDataset(args.catalog ?? defaultCatalogDirectory()); }
 
+/**
+ * 解析研究资金视角。默认 PRODUCTION_FAITHFUL（真实 Paper 资金规模）。
+ * --capital=reference 或 --capital=EDGE_REFERENCE_CAPITAL 切到研究参考资金，
+ * 可用 --reference-capital=50000 指定金额。参考资金只用于判断 edge 是否存在，
+ * 永远不会改变生产 Paper 账户。
+ */
+export function capitalOptions(args) {
+  const raw = String(args.capital ?? "").toUpperCase();
+  const capitalProfile = ["REFERENCE", "EDGE", "EDGE_REFERENCE_CAPITAL"].includes(raw)
+    ? CAPITAL_PROFILES.EDGE_REFERENCE_CAPITAL
+    : CAPITAL_PROFILES.PRODUCTION_FAITHFUL;
+  const referenceCapitalCny = args["reference-capital"] !== undefined
+    ? Number(args["reference-capital"])
+    : DEFAULT_REFERENCE_CAPITAL_CNY;
+  return { capitalProfile, referenceCapitalCny };
+}
+
 async function backtest(args) {
+  const startedAt = new Date().toISOString();
   const dataset = await load(args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId("backtest"));
   await mkdir(directory, { recursive: true });
-  const comparison = await runChampionChallengerComparison(dataset, { ...selected, outputDirectory: directory });
+  const capital = capitalOptions(args);
+  const comparison = await runChampionChallengerComparison(dataset, { ...selected, ...capital, outputDirectory: directory });
   const championPath = await save(join(directory, "champion-backtest.json"), comparison.champion);
   const challengerPath = await save(join(directory, "challenger-backtest.json"), comparison.challenger);
   const comparisonPath = await save(join(directory, "comparison.json"), {
@@ -94,7 +184,47 @@ async function backtest(args) {
     champion: compactReplay(comparison.champion), challenger: compactReplay(comparison.challenger)
   });
   process.stdout.write(`${JSON.stringify({ directory, championPath, challengerPath, comparisonPath, sameEvents: comparison.sameEvents, champion: compactReplay(comparison.champion), challenger: compactReplay(comparison.challenger) }, null, 2)}\n`);
+  await recordRun("HISTORICAL_REPLAY_BACKTEST", startedAt, "PASSED", {
+    artifactPath: comparisonPath,
+    dataManifestHash: dataset.manifest.manifestHash,
+    strategyVersion: comparison.challenger.strategyVersion,
+    summary: {
+      capital: comparison.challenger.capital,
+      sameEvents: comparison.sameEvents,
+      championTrades: comparison.champion.tradeCount,
+      challengerTrades: comparison.challenger.tradeCount,
+      championEntryRejections: comparison.champion.entryRejections,
+      challengerEntryRejections: comparison.challenger.entryRejections,
+      challengerPerformance: {
+        netPnlCny: comparison.challenger.performance.cumulativePnlCny,
+        profitFactor: comparison.challenger.performance.profitFactor,
+        expectancyCny: comparison.challenger.performance.expectancyCny,
+        winRatePct: comparison.challenger.performance.winRatePct,
+        maxDrawdownPct: comparison.challenger.performance.maxDrawdownPct
+      }
+    }
+  });
   return { dataset, comparison, directory };
+}
+
+async function researchV2(args) {
+  const startedAt = new Date().toISOString();
+  const dataset = await load(args);
+  const directory = resolveOutputPath(runId("research-v2"));
+  await mkdir(directory, { recursive: true });
+  await mkdir(resolveOutputPath("."), { recursive: true });
+  const result = await runResearchV2Pipeline(dataset, {
+    outputDirectory: directory,
+    // 研究登记簿，不是生产 Paper 库。
+    databasePath: researchRegistryPath()
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  await recordRun("RESEARCH_V2_PIPELINE_CLI", startedAt, result?.promotionGate?.status === "PASSED" ? "PASSED" : "BLOCKED", {
+    artifactPath: join(directory, "research-v2-pipeline.json"),
+    dataManifestHash: dataset.manifest.manifestHash,
+    summary: { promotionGate: result?.promotionGate ?? null, finalOos: result?.finalOos ?? null }
+  });
+  return result;
 }
 
 async function validation(args) {
@@ -378,6 +508,9 @@ async function full(args) {
 
 const command = process.argv[2] ?? "data:inspect";
 const args = argumentsMap();
+const commandStartedAt = new Date().toISOString();
+// 只读命令没有「研究结果」可言，失败时不需要登记。
+const REGISTRY_EXEMPT_COMMANDS = new Set(["data:inspect", "research:runs", "research:register-candidate"]);
 try {
   if (command === "data:update") await dataUpdate(args);
   else if (command === "data:inspect") {
@@ -395,9 +528,66 @@ try {
   else if (command === "edge:pipeline") await edgePipeline(args);
   else if (command === "tradable-edge") await tradableEdge(args);
   else if (command === "anti-chase") await antiChase(args);
+  else if (command === "research:v2") await researchV2(args);
+  else if (command === "research:register-candidate") {
+    // 把 V1.3-DATA-TIERED 登记为 CANDIDATE。这只是登记一份真实存在的源码及其哈希，
+    // 不是研究结果：没有跑过 OOS，因此 lifecycle 为 REGISTERED、promotion 为 BLOCKED。
+    const { readFile } = await import("node:fs/promises");
+    const { sha256 } = await import("./research-utils.mjs");
+    const { DATA_TIERED_PARAMETERS } = await import("./data-tiered-strategy.mjs");
+    const source = await readFile(new URL("./data-tiered-strategy.mjs", import.meta.url), "utf8");
+    const codeSha256 = sha256(source);
+    const registered = await withResearchRegistry((db) => db.registerStrategyVersion({
+      version: DATA_TIERED_PARAMETERS.version,
+      role: "CHALLENGER",
+      lifecycleStatus: "CANDIDATE",
+      strategyHash: codeSha256,
+      codeSha256,
+      parameters: DATA_TIERED_PARAMETERS,
+      featureSet: ["FROZEN_V12_DIRECTION", "TIERED_DATA_QUALITY_GATE"],
+      promotionReason: "BLOCKED: no OOS/Shadow evidence has been produced for this candidate yet",
+      rollbackVersion: "V1.2-FROZEN"
+    }));
+    process.stdout.write(`${JSON.stringify({
+      registered: registered.version, role: registered.role,
+      lifecycleStatus: registered.lifecycle_status, codeSha256,
+      championUnchanged: "V1.2-FROZEN"
+    }, null, 2)}\n`);
+  }
+  else if (command === "research:runs") {
+    // 直接回答「SQLite 里到底登记了多少次研究运行 / 多少个策略版本」。
+    await withResearchRegistry((db) => {
+      const runs = db.getResearchRuns({ limit: 1_000_000 });
+      process.stdout.write(`${JSON.stringify({
+        registryPath: researchRegistryPath(),
+        persistedResearchRuns: runs.length,
+        registeredStrategyVersions: db.getStrategyVersions({ limit: 1_000_000 }).length,
+        runs: runs.slice(0, 20).map((item) => ({
+          id: item.id, runType: item.run_type, status: item.status,
+          finishedAt: item.finished_at, strategyVersion: item.strategy_version
+        }))
+      }, null, 2)}\n`);
+    });
+  }
   else if (command === "full") await full(args);
   else throw new Error(`Unknown research command: ${command}`);
 } catch (error) {
   process.stderr.write(`Research command failed safely: ${error.stack ?? error.message}\n`);
+  // 失败也必须留痕。一次因为没有数据目录、或者公网不可达而跑不起来的研究，
+  // 应该在登记簿里以 BLOCKED 出现，而不是悄悄消失、让 run count 看起来像“从没试过”。
+  if (!REGISTRY_EXEMPT_COMMANDS.has(command)) {
+    await recordRun(`RESEARCH_CLI_${command.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`, commandStartedAt, "BLOCKED", {
+      summary: {
+        command,
+        arguments: args,
+        blockedReason: error.message,
+        interpretation: /ENOENT/.test(error.message)
+          ? "本地历史数据目录不存在（data/research 未提交 Git），需要先运行 data:update"
+          : /HTTP 40[357]|fetch failed|ENOTFOUND|EAI_AGAIN/.test(error.message)
+            ? "无法访问 HTX 公开历史端点，本环境网络策略不允许出站到 api.hbdm.com"
+            : "见 blockedReason"
+      }
+    });
+  }
   process.exitCode = 1;
 }

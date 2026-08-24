@@ -18,6 +18,107 @@
 - 开仓后按新的完整 15m K 线动态选择持有、保本、移动止损、延长止盈或在原逻辑连续失效后提前退出；不会被普通 5 分钟噪音反复洗出。
 - 风险设置保存在 SQLite，Telegram 管理员修改后下一轮生效，无需重启或改 `.env`。
 
+## 2026-08-24 执行层与研究正确性重构
+
+本轮只修 execution / sizing / infrastructure 与研究管线，**冻结的 V1.2 Champion 源码未改动**，
+`src/analysis-engine.mjs` 的 SHA-256 仍为 `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`。
+
+### 杠杆取整导致的仓位缺陷（严重）
+
+`requiredLeverage = notional / availableMargin` 曾经被 `round(..., 2)` **四舍五入**。
+一旦向下取整，`notional / leverage` 就会略高于可用保证金，于是：
+
+- 修复前没有重新量化时：完全合法的候选被静默 `return null`；
+- 有兜底重新量化时：仓位被一步步缩小，权益 5000 CNY、止损 1% 只能拿到 0.005 BTC，
+  而约束其实允许 0.009 BTC。
+
+现在使用「满足约束的最小可表示杠杆」（按 0.01 步进向上取整），并把名义仓位上限对齐到
+可表示的杠杆步进，因此 `margin = notional / leverage ≤ availableMargin` 恒成立；
+若向上取整后越过杠杆上限，则按合约步进缩小数量重算，绝不放行越界仓位。
+
+固定网格（权益 3000～60000 × 5 档止损 × 4 档评分，共 5,496 个场景）的实测：
+
+| | 可开仓候选 | 被拒 | 拒绝率 | 合计可建仓数量 |
+|---|---|---|---|---|
+| 修复前 | 3,460 | 2,036 | 37.0% | 148.657 BTC |
+| 修复后 | 5,446 | 50 | 0.9% | 257.616 BTC |
+
+### 拒绝原因码
+
+仓位计算不再把所有失败混成一句「没有满足净 RR、合约步进……的有效仓位」。
+每种拒绝都有机器可读的原因码（`BELOW_MIN_CONTRACT_STEP`、`NO_TARGET_MEETS_NET_RR`、
+`LEVERAGE_CAP_BINDING`、`MARGIN_CAP_BINDING`、`RISK_BUDGET_EXCEEDED`、
+`STOP_BEYOND_LIQUIDATION_BUFFER` 等），monitor、Telegram 与研究回放分别统计。
+回放报告的 `entryRejections` 会把「因最小合约步进被拒」与「因风险/保证金被拒」分开计数。
+
+### 分级数据质量门禁
+
+数据源分为 `CRITICAL / IMPORTANT / AUXILIARY`，每轮输出 `DATA_OK / DATA_DEGRADED / DATA_BLOCKED`
+以及具体缺失项，并区分「历史天然无档案」与「实时接口失败」，两者都绝不伪造或回填。
+
+- 核心价格/K 线缺失：HARD BLOCK。
+- 次要衍生品缺失：标记 missing、收缩风险预算、提高入场质量门槛；只有累计降级权重达到预算
+  才升级为 HARD BLOCK。
+
+`dataPolicyMode` 运行时设置控制是否据此改变交易行为：
+
+- `FROZEN_V12_STRICT`（默认）：完全复现冻结 V1.2 的一票否决行为，作为可复现 baseline。
+- `TIERED_DEGRADED`：启用 `V1.3-DATA-TIERED-CANDIDATE` 候选策略的降级放行。
+  该候选**没有**通过任何 OOS/Shadow/Promotion Gate，Champion 保持不变。
+
+### 真正动态的 AUTO 风险参数
+
+AUTO 曾经对 risk / margin / leverage / notional 直接取区间上限。现在这些值在下单时按
+权益、机会质量、波动、止损距离、已有敞口、保证金占用、总风险、回撤、日内亏损、连亏
+和仓位数动态计算，并始终夹在用户区间内、且不超过写入 SQLite 的天花板（原子复核因此仍然成立）。
+Telegram 风险面板与「🤖 本轮自动限额」页会显示自动范围、本轮实际值和选择理由。
+
+### 研究：两种资金视角
+
+小账户下 0.001 BTC 最小合约就占权益 72%，仓位规模被合约步进主导。研究因此拆成两个视角，
+必须分开报告，且**生产 Paper 初始资金仍然是 1000 CNY，没有被改动**：
+
+- `PRODUCTION_FAITHFUL`（默认）：真实 Paper 资金与真实合约步进，回答「这个账户实际能执行出什么」。
+- `EDGE_REFERENCE_CAPITAL`：`--capital=reference --reference-capital=50000`，仅供研究，
+  回答「策略本身有没有 edge」，永不影响生产账户。
+
+### 研究运行登记
+
+修复前只有 `research-v2-pipeline.mjs` 会写 `research_runs`，而该模块没有任何 CLI 入口，
+等于永远不会执行——这就是「已登记策略版本 1 / 已持久化研究运行 0」的原因。
+现在所有研究命令都会把运行结果登记进独立的研究 SQLite（`research-output/research-registry.sqlite`，
+不是生产 Paper 库），失败也会如实记为 `BLOCKED` 并写明原因。
+
+```bash
+npm run research:runs                 # 查看真实的持久化运行数与策略版本数
+npm run research:v2                   # 之前无法从 CLI 触发的 V2 管线
+npm run research:register-candidate   # 登记 V1.3-DATA-TIERED 候选（不等于晋级）
+```
+
+### 其它修复
+
+- 剩余风险的退出成本改用止损成交价估算（原先误用止盈价）。
+- 移动止损后，同一根 K 线中「止损生效之前」的 high/low 不再能立即触发新止损。
+- `db.transaction` 支持 SAVEPOINT 嵌套，内层回滚不会破坏外层事务。
+- 核心公开行情增加有限次退避重试（3 次），次要数据源仍然只降级不重试。
+- 数据源时间戳改为 schema 感知，不再把任何名为 `id` 的数字当成时间戳。
+- `confidencePct` 对外更名为 `signalQualityScore`（SQLite 列与旧字段保留为兼容别名），
+  UI 不再称其为置信度或胜率。
+- 生产运行目标统一为 Node 24：`package.json` engines、`.nvmrc` 与 GitHub Actions CI 一致。
+
+### Telegram 鉴权
+
+管理员判定不再只看 `chat.id`。新增可选环境变量：
+
+```text
+TELEGRAM_ADMIN_USER_ID=
+```
+
+- 私聊：未配置该变量时保持兼容（私聊 chat.id 等于用户 id）。
+- 群组/超级群：**必须**配置 `TELEGRAM_ADMIN_USER_ID`，且只有该发送者本人可以修改风险、
+  杠杆、保证金、NET/HEDGE、暂停/恢复、最大仓位数以及执行任何管理型 callback；
+  群内其他成员即使看到按钮也无法操作。
+
 ## 严格保留的风控
 
 - 初始模拟资金 `1000 CNY`，当前 Paper 换算假设为 `1 USDT = 7.20 CNY`。
@@ -32,7 +133,10 @@
 - 先确定止损和允许亏损，再确定名义仓位，最后反推合理杠杆与保证金；提高杠杆不能提高允许亏损。
 - 强平价使用明确标记的 Paper 隔离保证金估算，正常止损必须先于强平缓冲；它不是 HTX 真实强平公式。
 - 同一根可观察 K 线同时触及 SL/TP 时保守按 SL；开仓所在 K 线不用于高低点回溯触发。
-- 核心价格/K 线不足时禁止开仓和所有价格触发动作；次要衍生品缺失会安全降级且绝不伪造数据。
+- 核心价格/K 线不足时禁止开仓和所有价格触发动作。
+- 次要衍生品缺失绝不伪造数据：默认的 `FROZEN_V12_STRICT` 政策下仍然一票否决（冻结 V1.2 原行为），
+  切到 `TIERED_DEGRADED` 后才会降级放行并同时收缩风险、提高入场门槛。两种政策每轮都会显式输出
+  `DATA_OK / DATA_DEGRADED / DATA_BLOCKED` 与具体缺失项。
 
 ## Multi-Layer Market Context 与研究门禁
 

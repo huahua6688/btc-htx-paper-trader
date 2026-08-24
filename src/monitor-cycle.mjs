@@ -8,9 +8,17 @@ import {
 } from "./paper-engine.mjs";
 import { manageOpenPosition } from "./position-manager.mjs";
 import { attachMultiLayerMarketContext, coreMarketDataFreshForTrading } from "./market-context.mjs";
+import { classifyDataQuality, DATA_POLICIES } from "./data-quality.mjs";
+import { applyTieredDataPolicy, DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 
-function noEntry(actions, reasons, dailyRisk) {
-  actions.push({ type: "NO_ENTRY", reasons: [...new Set(reasons)], dailyRisk });
+function noEntry(actions, reasons, dailyRisk, { reasonCodes = [], rejections = [] } = {}) {
+  actions.push({
+    type: "NO_ENTRY",
+    reasons: [...new Set(reasons)],
+    reasonCodes: [...new Set(reasonCodes)],
+    rejections,
+    dailyRisk
+  });
 }
 
 function closeWith(db, position, exit, actions) {
@@ -57,8 +65,20 @@ export async function runMonitorCycle(db, {
   try {
     const market = await collect();
     const coreReport = analyze(market);
-    const context = attachMultiLayerMarketContext(db, coreReport, market);
+    // 分级数据质量始终计算并展示（DATA_OK / DATA_DEGRADED / DATA_BLOCKED）。
+    // 是否据此改变交易行为由 dataPolicyMode 决定：默认 FROZEN_V12_STRICT 只做展示，
+    // 冻结 V1.2 的判断保持逐字节可复现；只有管理员显式切到 TIERED_DEGRADED，
+    // 才会启用 V1.3-DATA-TIERED 候选的降级放行逻辑。
+    const policyMode = db.getRuntimeSettings().dataPolicyMode === "TIERED_DEGRADED"
+      ? DATA_POLICIES.TIERED_DEGRADED
+      : DATA_POLICIES.FROZEN_V12_STRICT;
+    const dataQualityGate = classifyDataQuality(coreReport, market, { policy: policyMode });
+    const policedReport = policyMode === DATA_POLICIES.TIERED_DEGRADED
+      ? applyTieredDataPolicy(coreReport, market, dataQualityGate, DATA_TIERED_PARAMETERS, config)
+      : coreReport;
+    const context = attachMultiLayerMarketContext(db, policedReport, market);
     const report = context.report;
+    report.dataQualityGate = dataQualityGate;
     snapshotId = db.insertSnapshot(report);
     db.recordDataSourceObservations(snapshotId, context.observations);
     const actions = [];
@@ -111,7 +131,7 @@ export async function runMonitorCycle(db, {
       }
 
       for (let position of survivors) {
-        const management = manageOpenPosition(position, report);
+        const management = manageOpenPosition(position, report, config);
         if (management.action === "EXIT") {
           const exit = evaluatePaperExit(position, report, config, {
             checkStop: false,
@@ -141,12 +161,16 @@ export async function runMonitorCycle(db, {
       }
     }
 
+    let entryGate = null;
     if (blockedEntrySides.has(report.decision)) {
-      noEntry(actions, [blockedEntrySides.get(report.decision)], null);
+      noEntry(actions, [blockedEntrySides.get(report.decision)], null, { reasonCodes: ["SAME_SIDE_COOLDOWN"] });
     } else if (!coreDataFresh) {
-      noEntry(actions, ["核心价格/K线不够新鲜，本轮禁止新开仓，且不会用陈旧价格触发持仓动作"], null);
+      noEntry(actions, ["核心价格/K线不够新鲜，本轮禁止新开仓，且不会用陈旧价格触发持仓动作"], null, {
+        reasonCodes: ["CORE_DATA_STALE"]
+      });
     } else {
       const gate = evaluatePaperEntry(db, report, config, market);
+      entryGate = gate;
       if (gate.allowed) {
         try {
           const position = db.openPosition(gate.candidate, snapshotId, {
@@ -156,16 +180,29 @@ export async function runMonitorCycle(db, {
           actions.push({ type: gate.candidate.isAddOn ? "ADD_POSITION" : "OPEN", position, candidate: gate.candidate });
         } catch (error) {
           if (/运行时设置(?:版本)?已变化|已有模拟仓位|最大同时仓位|总风险|保证金|总名义仓位|相反方向|UNIQUE/.test(error.message)) {
-            noEntry(actions, [`原子检查阻止开仓：${error.message}`], gate.dailyRisk);
+            noEntry(actions, [`原子检查阻止开仓：${error.message}`], gate.dailyRisk, {
+              reasonCodes: ["ATOMIC_RECHECK_BLOCKED"]
+            });
           } else throw error;
         }
       } else {
         const marketReasons = report.entryAssessment?.missingConditions ?? [];
-        const accountReasons = gate.reasons.filter((item) => item !== "当前决策不是 LONG/SHORT");
-        noEntry(actions, [...marketReasons, ...accountReasons], gate.dailyRisk);
+        const accountRejections = gate.rejections.filter((item) => item.code !== "DECISION_NOT_DIRECTIONAL");
+        noEntry(actions, [...marketReasons, ...accountRejections.map((item) => item.message)], gate.dailyRisk, {
+          reasonCodes: accountRejections.map((item) => item.code),
+          rejections: accountRejections
+        });
       }
     }
 
+    if (snapshotId !== null && entryGate) {
+      db.updateSnapshotReport(snapshotId, {
+        dynamicLimits: entryGate.dynamicLimits,
+        exposure: entryGate.exposure,
+        entryRejectionCodes: entryGate.reasonCodes,
+        sizingRejection: entryGate.sizingRejection
+      });
+    }
     const finishedAt = now();
     const message = actions.map((action) => action.type).join(", ") || "NO_ACTION";
     db.recordMonitorRun({ startedAt, finishedAt, status: "OK", message, snapshotId });
@@ -177,6 +214,11 @@ export async function runMonitorCycle(db, {
       positions: db.getOpenPositions(),
       positionGroups: db.getOpenPositionGroups(),
       runtimeSettings: db.getRuntimeSettings(),
+      dataQualityGate,
+      dataPolicyMode: policyMode,
+      entryGate,
+      dynamicLimits: entryGate?.dynamicLimits ?? null,
+      exposure: entryGate?.exposure ?? null,
       marketSnapshot: market,
       collectionWarnings: market.collectionWarnings ?? []
     };

@@ -18,7 +18,7 @@ export function formatCycle(result) {
   const lines = [
     `V1.2 monitor 完成：${report.generatedAt}`,
     `当前 BTC：${n(report.currentPrice, 1)} USDT`,
-    `系统判断：${report.decision}（方向强度 ${report.confidencePct}/100，非概率）`,
+    `系统判断：${report.decision}（信号质量分 ${report.signalQualityScore ?? report.confidencePct}/100，排序指标，不是胜率或概率）`,
     `双向机会：做多 ${report.opportunities?.LONG?.score ?? "—"} / 做空 ${report.opportunities?.SHORT?.score ?? "—"}`,
     `是否现在入场：${report.entryAssessment?.enterNow ? "是" : "否"}；${report.entryAssessment?.methodLabel ?? "继续等待"}`,
     ...((report.entryAssessment?.reasons ?? []).slice(0, 5).map((item) => `- ${item}`))

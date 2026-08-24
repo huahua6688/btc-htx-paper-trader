@@ -35,10 +35,35 @@ function mainButtons(settings = { newEntriesPaused: false }) {
 
 const MAIN_BUTTONS = Object.freeze(mainButtons());
 
+/**
+ * AUTO 现在是真的按当时状态算出来的，因此必须能回答三件事：
+ * 自动范围是多少、本轮实际采用了多少、为什么是这个值。
+ */
+export function dynamicLimitLines(db) {
+  const snapshot = db.getLatestSnapshot();
+  const limits = snapshot?.report?.dynamicLimits;
+  if (!limits) return ["自动限额：本轮尚未计算（没有可入场的方向判断时不会计算）"];
+  const format = (name, item, render) => {
+    if (item.mode === "MANUAL") return `${name}：手动 ${render(item.value)}`;
+    const why = (item.reasons ?? []).slice(0, 3).join("；");
+    return `${name}：自动范围 ${render(item.minimum)}～${render(item.maximum)}；本轮 ${render(item.value)}（系数 ${item.factor}）\n  └ ${why}`;
+  };
+  const asPct = (value) => `${(Number(value) * 100).toFixed(2)}%`;
+  const asX = (value) => `${Number(value).toFixed(2)}x`;
+  return [
+    format("单笔风险", limits.risk, asPct),
+    format("保证金占用上限", limits.margin, asPct),
+    format("杠杆上限", limits.leverage, asX),
+    format("名义仓位上限", limits.notional, (value) => `${Number(value).toFixed(2)}倍权益`),
+    format("组合总风险上限", limits.totalRisk, asPct)
+  ];
+}
+
 function settingsText(settings) {
   return [
     "⚙️ Paper Trading 控制面板",
     `配置版本：${settings.revision}`,
+    `数据门禁政策：${settings.dataPolicyMode === "TIERED_DEGRADED" ? "分级降级（V1.3 候选）" : "冻结 V1.2 严格门禁"}`,
     `手动新开仓开关：${settings.newEntriesPaused ? "已暂停" : "允许评估（仍须通过自动风控）"}`,
     `持仓模式：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
     `风险偏好：${riskProfileChinese(settings.riskProfile)}`,
@@ -103,6 +128,27 @@ function positionModePanel(settings) {
   };
 }
 
+/**
+ * 数据质量必须能被一眼看到：DATA_OK / DATA_DEGRADED / DATA_BLOCKED 加上到底缺了什么。
+ * 以前一个次要接口挂掉只会表现为一串安静的 WAIT，根本看不出系统已经不可能开仓。
+ */
+export function dataQualityLines(report) {
+  const gate = report?.dataQualityGate;
+  if (!gate) return ["数据质量：未记录"];
+  const tierName = (tier) => tier === "CRITICAL" ? "核心" : tier === "IMPORTANT" ? "重要" : "辅助";
+  const missing = gate.missing?.length
+    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${item.provenance === "HISTORICAL_UNAVAILABLE" ? "历史无档案" : "实时失败"}]`).join("、")
+    : "无";
+  return [
+    `数据质量：${gate.status}（政策 ${gate.policy}）`,
+    `missing：${missing}`,
+    ...(gate.status === "DATA_DEGRADED"
+      ? [`降级：权重 ${gate.degradationScore}，风险系数 ×${gate.riskMultiplier}，入场分门槛 +${gate.entryScoreBonus}`]
+      : []),
+    ...(gate.status === "DATA_BLOCKED" ? gate.hardBlockReasons.slice(0, 3).map((item) => `阻断：${item}`) : [])
+  ];
+}
+
 function decisionText(db) {
   const snapshot = db.getLatestSnapshot();
   if (!snapshot) return "🧠 当前判断\n尚无行情快照。";
@@ -113,6 +159,8 @@ function decisionText(db) {
     `做多评分：${report.opportunities?.LONG?.score ?? "—"}`,
     `做空评分：${report.opportunities?.SHORT?.score ?? "—"}`,
     `最终判断：${snapshot.decision}`,
+    `信号质量分：${report.signalQualityScore ?? report.confidencePct ?? "—"}/100（排序指标，不是胜率）`,
+    ...dataQualityLines(report),
     `是否值得现在入场：${report.entryAssessment?.enterNow ? "是" : "否"}`,
     "主要原因：",
     ...((report.entryAssessment?.reasons ?? []).slice(0, 5).map((item) => `- ${item}`))
@@ -278,7 +326,7 @@ function todayText(db) {
   ].join("\n");
 }
 
-function riskPanel(settings) {
+function riskPanel(settings, db = null) {
   return {
     text: [
       "⚙️ 风险设置",
@@ -287,12 +335,17 @@ function riskPanel(settings) {
       `账户总风险：${controlModeChinese(settings.totalRiskMode)} ${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}`,
       `每日损失：${controlModeChinese(settings.dailyLossMode)} ${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}`,
       `连亏暂停：${controlModeChinese(settings.lossStreakMode)} ${settings.lossStreakMin}～${settings.lossStreakMax} 笔`,
+      "",
+      "本轮实际采用的自动值：",
+      ...(db ? dynamicLimitLines(db) : []),
+      "",
       "选择一项后再调最低、最高和手动值；每次点击只刷新当前消息。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "保守", callback_data: "paper:set:riskProfile:CONSERVATIVE" }, { text: "均衡", callback_data: "paper:set:riskProfile:BALANCED" }, { text: "积极", callback_data: "paper:set:riskProfile:AGGRESSIVE" }],
       [{ text: "单笔风险", callback_data: "paper:view:range-risk" }, { text: "总风险", callback_data: "paper:view:range-totalRisk" }],
       [{ text: "每日损失", callback_data: "paper:view:range-dailyLoss" }, { text: "连亏暂停", callback_data: "paper:view:range-lossStreak" }],
+      [{ text: "🤖 本轮自动限额", callback_data: "paper:view:auto" }],
       [{ text: "返回", callback_data: "paper:view:main" }]
     ] }
   };
@@ -434,7 +487,46 @@ export class TelegramControlPanel {
   }
 
   get enabled() { return telegramEnabled(this.config); }
-  isAdmin(chatId) { return String(chatId) === String(this.config.chatId); }
+
+  /**
+   * 授权判定必须同时区分 CHAT ID 与 SENDER(USER) ID。
+   *
+   *   - chat 必须精确等于 TELEGRAM_CHAT_ID，否则一律拒绝。
+   *   - 配置了 TELEGRAM_ADMIN_USER_ID 时，发送者必须精确等于它。
+   *     这是群组场景下唯一安全的模式：群里其他人即使看到按钮也无法操作。
+   *   - 未配置 TELEGRAM_ADMIN_USER_ID 时，只兼容私聊：私聊的 chat.id 等于用户自己的
+   *     user id，因此要求 sender === chat 才放行。群组/超级群/频道在没有显式管理员
+   *     user id 的情况下一律拒绝，绝不因为“在群里”就把风控开关交出去。
+   */
+  authorize({ chatId, senderId, chatType } = {}) {
+    if (chatId === null || chatId === undefined || String(chatId) === "") {
+      return { allowed: false, reason: "无法识别来源会话" };
+    }
+    if (String(chatId) !== String(this.config.chatId)) {
+      return { allowed: false, reason: "无权限" };
+    }
+    const adminUserId = String(this.config.adminUserId ?? "").trim();
+    if (adminUserId) {
+      if (senderId === null || senderId === undefined || String(senderId) === "") {
+        return { allowed: false, reason: "无法识别发送者" };
+      }
+      return String(senderId) === adminUserId
+        ? { allowed: true, mode: "ADMIN_USER_ID" }
+        : { allowed: false, reason: "只有管理员本人可以操作 Paper 设置" };
+    }
+    const isPrivate = chatType === undefined || chatType === null || chatType === "private";
+    if (!isPrivate) {
+      return { allowed: false, reason: "群组模式必须配置 TELEGRAM_ADMIN_USER_ID 才能操作" };
+    }
+    if (senderId !== null && senderId !== undefined && String(senderId) !== String(chatId)) {
+      return { allowed: false, reason: "发送者与私聊会话不一致" };
+    }
+    return { allowed: true, mode: "PRIVATE_CHAT" };
+  }
+
+  isAdmin(chatId, senderId, chatType) {
+    return this.authorize({ chatId, senderId, chatType }).allowed;
+  }
 
   async sendView(text, replyMarkup = MAIN_BUTTONS) {
     return this.send(text, { config: this.config, fetchImpl: this.fetchImpl, replyMarkup });
@@ -459,7 +551,8 @@ export class TelegramControlPanel {
     if (name === "research") return { text: researchText(this.db), markup: main };
     if (name === "account") return { text: accountText(this.db), markup: main };
     if (name === "today") return { text: todayText(this.db), markup: main };
-    if (name === "risk") return riskPanel(settings);
+    if (name === "risk") return riskPanel(settings, this.db);
+    if (name === "auto") return { text: ["🤖 本轮自动限额", ...dynamicLimitLines(this.db)].join("\n"), markup: main };
     if (name === "leverage") return leveragePanel(settings);
     if (name === "margin") return marginPanel(settings);
     if (name === "pyramiding") return pyramidingPanel(settings);
@@ -521,9 +614,13 @@ export class TelegramControlPanel {
   async handleAdminUpdate(update) {
     const callback = update.callback_query;
     const message = update.message;
-    const chatId = callback?.message?.chat?.id ?? message?.chat?.id;
-    if (!this.isAdmin(chatId)) {
-      if (callback?.id) await this.answer(callback.id, "无权限", { config: this.config, fetchImpl: this.fetchImpl });
+    const chat = callback?.message?.chat ?? message?.chat;
+    const chatId = chat?.id;
+    const senderId = callback?.from?.id ?? message?.from?.id;
+    const decision = this.authorize({ chatId, senderId, chatType: chat?.type });
+    if (!decision.allowed) {
+      this.logger(`Telegram control rejected an unauthorized update: chat=${chatId ?? "?"} sender=${senderId ?? "?"} reason=${decision.reason}`);
+      if (callback?.id) await this.answer(callback.id, decision.reason, { config: this.config, fetchImpl: this.fetchImpl });
       this.db.markTelegramUpdateProcessed(update.update_id);
       return;
     }
