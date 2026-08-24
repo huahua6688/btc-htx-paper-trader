@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { gzipSync } from "node:zlib";
 import { openPaperDatabase } from "../src/db.mjs";
+import { analyzeSnapshot } from "../src/analysis-engine.mjs";
 import { runPublicCommandWithBinary } from "../src/htx-cli.mjs";
 import {
   checkHtxUpstream,
@@ -17,10 +18,10 @@ import {
 } from "../src/htx-upstream.mjs";
 import { MarketArchive } from "../src/market-archive.mjs";
 import { HtxPublicResearchClient, HTX_RESEARCH_ENDPOINTS } from "../src/htx-public-research-client.mjs";
-import { readDataInfrastructureStatusSync } from "../src/data-infrastructure-status.mjs";
+import { buildDataInfrastructureStatus, readDataInfrastructureStatusSync } from "../src/data-infrastructure-status.mjs";
 import { runMonitorCycle } from "../src/monitor-cycle.mjs";
-import { updateHistoricalDataset } from "../src/historical-data.mjs";
-import { buildPointInTimeMarket } from "../src/replay-market.mjs";
+import { mergeTimedRecords, updateHistoricalDataset } from "../src/historical-data.mjs";
+import { buildPointInTimeMarket, REPLAY_PROVENANCE } from "../src/replay-market.mjs";
 import { runHistoricalReplay } from "../src/replay-engine.mjs";
 import { paperReport } from "./helpers.mjs";
 
@@ -124,6 +125,60 @@ test("HTX updater records a local digest without claiming an official checksum w
     assert.equal(result.metadata.asset.officialChecksumProvided, false);
     assert.equal(result.metadata.asset.officialChecksumVerified, false);
     assert.equal(result.metadata.installedSha256, sha256(candidate));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("HTX updater removes a stale PID lock, writes owner metadata, and continues safely", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-stale-lock-"));
+  const target = join(directory, "cli.exe");
+  const stateDirectory = join(directory, "state");
+  const environment = { HTX_CLI_STATE_DIR: stateDirectory };
+  const paths = htxRuntimePaths(environment);
+  const candidate = Buffer.from("candidate-after-stale-lock");
+  await mkdir(stateDirectory, { recursive: true });
+  await writeFile(paths.lock, JSON.stringify({
+    pid: 999_999,
+    createdAt: "2020-01-01T00:00:00.000Z",
+    hostname: "test-host"
+  }));
+  let observedLock;
+  try {
+    const result = await updateHtxCli({
+      cliPath: target,
+      environment,
+      hostnameValue: "test-host",
+      pid: 4242,
+      processExists: () => false,
+      releaseProvider: async () => fakeRelease(candidate),
+      downloadAsset: async (_asset, path) => {
+        observedLock = JSON.parse(await readFile(paths.lock, "utf8"));
+        await writeFile(path, candidate);
+      },
+      smokeTest: async () => ({ compatible: true, checkedAt: new Date().toISOString(), commands: [] }),
+      verifyProject: async () => {}
+    });
+    assert.equal(result.changed, true);
+    assert.equal(observedLock.pid, 4242);
+    assert.equal(observedLock.hostname, "test-host");
+    assert.ok(Number.isFinite(new Date(observedLock.createdAt).getTime()));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("HTX updater rejects an active owner lock without deleting it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-active-lock-"));
+  const environment = { HTX_CLI_STATE_DIR: join(directory, "state") };
+  const paths = htxRuntimePaths(environment);
+  await mkdir(paths.directory, { recursive: true });
+  await writeFile(paths.lock, JSON.stringify({ pid: 4242, createdAt: new Date().toISOString(), hostname: "test-host" }));
+  try {
+    await assert.rejects(() => updateHtxCli({
+      cliPath: join(directory, "cli.exe"),
+      environment,
+      hostnameValue: "test-host",
+      processExists: () => true,
+      releaseProvider: async () => { throw new Error("must not query upstream"); }
+    }), /Another HTX CLI update is already running/);
+    assert.equal(JSON.parse(await readFile(paths.lock, "utf8")).pid, 4242);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -419,8 +474,9 @@ test("archive preserves exact upstream object shape while replay receives the co
     assert.equal(Array.isArray(event.raw.data), false);
     assert.deepEqual(event.raw, upstream);
     const visible = archive.getVisiblePayload("oiHistory", "2026-08-24T12:01:00.000Z", { ttlMs: 2 * 60 * 60 * 1000 });
-    assert.equal(Array.isArray(visible.payload.data), true);
-    assert.equal(visible.payload.data[0].tick[0].value, "123");
+    assert.equal(Array.isArray(visible.payload.data), false);
+    assert.equal(visible.payload.data.tick[0].value, "123");
+    assert.equal(event.normalized[0].value, 123);
   } finally { archive.close(); }
 });
 
@@ -437,6 +493,47 @@ test("data status degrades safely when the archive file is corrupt", async () =>
     assert.equal(status.archive.available, false);
     assert.match(status.archive.error, /database|file/i);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("health/status infrastructure reads recorded CLI SHA without hashing by default", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-no-default-rehash-"));
+  let verifyHash;
+  try {
+    const status = await buildDataInfrastructureStatus(null, {
+      catalogDirectory: join(directory, "catalog"),
+      archivePath: join(directory, "archive.sqlite"),
+      installedStatusProvider: async (options) => {
+        verifyHash = options.verifyHash;
+        return {
+          installed: true,
+          cliPath: "recorded-cli",
+          installedSha256: "a".repeat(64),
+          installedMetadata: { release: { tag: "v2.0.0" }, compatibility: null },
+          sourceManifest: null,
+          upstreamUpdateAvailable: false,
+          sourceRepo: "https://github.com/htx-exchange/htx-skills-hub"
+        };
+      }
+    });
+    assert.equal(verifyHash, false);
+    assert.equal(status.htx.sha256, "a".repeat(64));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("catalog revision merge is idempotent for a raw hash already recorded", () => {
+  const base = {
+    eventTime: 1000, visibleAt: 2000, observedAt: "2026-08-24T00:00:00.000Z",
+    rawPayloadHash: "base", normalized: { value: 1 }
+  };
+  const revision = {
+    eventTime: 1000, visibleAt: 2000, observedAt: "2026-08-24T01:00:00.000Z",
+    rawPayloadHash: "revision", normalized: { value: 2 }
+  };
+  const once = mergeTimedRecords([base], [revision]);
+  const twice = mergeTimedRecords(once, [revision]);
+  assert.equal(once[0].revisions.length, 1);
+  assert.equal(twice[0].revisions.length, 1);
+  assert.equal(twice[0].revisions[0].rawPayloadHash, "revision");
 });
 
 test("historical backfill checkpoint resumes without downloading completed Kline again", async () => {
@@ -494,6 +591,79 @@ test("point-in-time replay never reads a future historical record", () => {
   assert.equal(market.replay.fieldStatus.openInterest.provenance, "HISTORICAL_UNAVAILABLE");
 });
 
+test("catalog PIT evidence carries selected event/visible times and passes a real no-lookahead check", () => {
+  const candles = replayCandles();
+  const index = 60 * 96;
+  const replayVisibleAt = candles[index].timestamp + 15 * 60 * 1000;
+  const selectedEventTime = replayVisibleAt - 60 * 60 * 1000;
+  const selectedVisibleAt = selectedEventTime + 30 * 60 * 1000;
+  const market = buildPointInTimeMarket(candles, [], index, { historicalSeries: {
+    basis: [
+      { eventTime: selectedEventTime, visibleAt: selectedVisibleAt, normalized: { id: selectedEventTime / 1000, basis_rate: "0.0004" } },
+      { eventTime: replayVisibleAt + 60_000, visibleAt: replayVisibleAt + 120_000, normalized: { id: replayVisibleAt / 1000 + 60, basis_rate: "9" } }
+    ]
+  } });
+  assert.equal(market.basis.data[0].basis_rate, "0.0004");
+  assert.equal(market.replay.fieldStatus.basis.eventTime, selectedEventTime);
+  assert.equal(market.replay.fieldStatus.basis.visibleAt, selectedVisibleAt);
+  assert.equal(market.replay.fieldStatus.basis.observedAt, null);
+  assert.equal(market.replay.eventTimeNotAfterVisibleAt, true);
+  assert.equal(market.replay.observedAtNotAfterVisibleAt, true);
+});
+
+test("archive PIT evidence includes observedAt and never selects a future observation", () => {
+  const candles = replayCandles();
+  const index = 60 * 96;
+  const replayVisibleAt = candles[index].timestamp + 15 * 60 * 1000;
+  const eventTime = replayVisibleAt - 60 * 60 * 1000;
+  const firstObservedAt = new Date(replayVisibleAt - 30_000).toISOString();
+  const futureObservedAt = new Date(replayVisibleAt + 60_000).toISOString();
+  const archive = new MarketArchive(":memory:");
+  try {
+    archive.archiveSnapshot({ basis: { status: "ok", data: [{ id: eventTime / 1000, basis_rate: "0.0004" }] } }, { observedAt: firstObservedAt });
+    archive.archiveSnapshot({ basis: { status: "ok", data: [{ id: eventTime / 1000, basis_rate: "0.0099" }] } }, { observedAt: futureObservedAt });
+    const market = buildPointInTimeMarket(candles, [], index, { archive });
+    assert.equal(market.basis.data[0].basis_rate, "0.0004");
+    assert.equal(market.replay.fieldStatus.basis.eventTime, eventTime);
+    assert.equal(market.replay.fieldStatus.basis.observedAt, firstObservedAt);
+    assert.equal(market.replay.fieldStatus.basis.archiveSource, true);
+    assert.equal(market.replay.eventTimeNotAfterVisibleAt, true);
+    assert.equal(market.replay.observedAtNotAfterVisibleAt, true);
+  } finally { archive.close(); }
+});
+
+test("replay archive read errors are not mislabeled as live feed failures", () => {
+  const candles = replayCandles();
+  const market = buildPointInTimeMarket(candles, [], 60 * 96, {
+    archive: { getVisiblePayload: () => { throw new Error("archive unreadable"); } }
+  });
+  assert.equal(market.replay.fieldStatus.openInterest.provenance, REPLAY_PROVENANCE.REPLAY_ARCHIVE_ERROR);
+  assert.equal(market.dataProvenance.oiHistory, REPLAY_PROVENANCE.REPLAY_ARCHIVE_ERROR);
+  assert.notEqual(market.dataProvenance.oiHistory, REPLAY_PROVENANCE.LIVE_FAILURE);
+});
+
+test("Replay does not mark an archived field available until frozen V1.2 can consume its shape", () => {
+  const candles = replayCandles();
+  const visibleAt = candles[60 * 96].timestamp + 15 * 60 * 1000;
+  const market = buildPointInTimeMarket(candles, [], 60 * 96, {
+    archive: {
+      getVisiblePayload: (type) => type === "oiHistory"
+        ? {
+            payload: { status: "ok", data: [{ tick: [{ ts: visibleAt - 1, value: 1 }] }] },
+            provenance: REPLAY_PROVENANCE.SELF_ARCHIVED,
+            eventTime: visibleAt - 1,
+            observedAt: new Date(visibleAt - 1).toISOString(),
+            ageMs: 1
+          }
+        : { payload: null, provenance: REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE }
+    }
+  });
+  assert.equal(market.oiHistory, null);
+  assert.equal(market.replay.fieldStatus.openInterest.available, false);
+  assert.equal(market.replay.fieldStatus.openInterest.provenance, REPLAY_PROVENANCE.REPLAY_ARCHIVE_ERROR);
+  assert.equal(market.replay.availableSources.includes("openInterest"), false);
+});
+
 test("stale historical records cannot masquerade as current replay evidence", () => {
   const candles = replayCandles(1);
   const index = 20;
@@ -540,6 +710,33 @@ test("Replay passes real timestamp-visible OI and Basis into the strategy core",
   assert.ok(replay.replayDataCoverage.fields.openInterest.availableEvents > 0);
   assert.ok(replay.replayDataCoverage.fields.basis.availableEvents > 0);
   assert.equal(replay.trace.some((item) => item.replayFields.openInterest.available && item.replayFields.basis.available), true);
+});
+
+test("frozen V1.2 actually consumes replay OI and Elite object payloads", () => {
+  const candles = replayCandles();
+  const index = 60 * 96;
+  const visibleAt = candles[index].timestamp + 15 * 60 * 1000;
+  const series = {
+    openInterest: [
+      { eventTime: visibleAt - 90 * 60 * 1000, visibleAt: visibleAt - 60 * 60 * 1000, normalized: { ts: visibleAt - 90 * 60 * 1000, value: 1_000_000_000 } },
+      { eventTime: visibleAt - 30 * 60 * 1000, visibleAt: visibleAt - 15 * 60 * 1000, normalized: { ts: visibleAt - 30 * 60 * 1000, value: 1_100_000_000 } }
+    ],
+    eliteAccount: [{ eventTime: visibleAt - 30 * 60 * 1000, visibleAt: visibleAt - 15 * 60 * 1000, normalized: { ts: visibleAt - 30 * 60 * 1000, buy_ratio: 0.6, sell_ratio: 0.4 } }],
+    elitePosition: [{ eventTime: visibleAt - 30 * 60 * 1000, visibleAt: visibleAt - 15 * 60 * 1000, normalized: { ts: visibleAt - 30 * 60 * 1000, buy_ratio: 0.55, sell_ratio: 0.45 } }]
+  };
+  const market = buildPointInTimeMarket(candles, [], index, { historicalSeries: series });
+  assert.equal(Array.isArray(market.oiHistory.data), false);
+  assert.equal(Array.isArray(market.oiHistory.data.tick), true);
+  assert.equal(Array.isArray(market.eliteAccount.data.list), true);
+  assert.equal(Array.isArray(market.elitePosition.data.list), true);
+  const report = analyzeSnapshot(market);
+  assert.equal(report.derivatives.oiUsd, 1_100_000_000);
+  assert.equal(report.derivatives.oiDelta24Pct, 10);
+  assert.equal(report.derivatives.eliteAccountRatio, 1.5);
+  assert.equal(report.derivatives.elitePositionRatio, 1.222);
+  assert.ok(market.replay.availableSources.includes("openInterest"));
+  assert.ok(market.replay.availableSources.includes("eliteAccount"));
+  assert.ok(market.replay.availableSources.includes("elitePosition"));
 });
 
 test("real replay exposes an explicit coverage warning when all historical derivatives are absent", async () => {

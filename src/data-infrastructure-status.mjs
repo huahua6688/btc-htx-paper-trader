@@ -66,7 +66,15 @@ function replayAvailability(catalog, archive) {
     const archived = archiveTypes.get(archiveType);
     return {
       field,
-      provenance: archived?.records ? "SELF_ARCHIVED" : historical?.records ? "HTX_HISTORICAL" : historical?.availability === "LIVE_FAILURE" ? "LIVE_FAILURE" : "HISTORICAL_UNAVAILABLE",
+      provenance: archived?.records
+        ? "SELF_ARCHIVED"
+        : historical?.records
+          ? "HTX_HISTORICAL"
+          : historical?.availability === "STALE"
+            ? "STALE"
+            : historical?.availability === "LIVE_FAILURE"
+              ? "LIVE_FAILURE"
+              : "HISTORICAL_UNAVAILABLE",
       historicalRecords: historical?.records ?? 0,
       archiveRecords: archived?.records ?? 0,
       latest: archived?.latest ?? historical?.latest ?? null
@@ -87,10 +95,11 @@ function sourceHealth(db) {
 export async function buildDataInfrastructureStatus(db, {
   catalogDirectory = defaultCatalogDirectory(),
   archivePath = MARKET_ARCHIVE_CONFIG.path,
-  verifyCliHash = true
+  verifyCliHash = false,
+  installedStatusProvider = getHtxInstalledStatus
 } = {}) {
   const [htx, manifest] = await Promise.all([
-    getHtxInstalledStatus({ verifyHash: verifyCliHash }),
+    installedStatusProvider({ verifyHash: verifyCliHash }),
     readJson(join(catalogDirectory, "manifest.json"), null)
   ]);
   const catalog = catalogSummary(manifest, catalogDirectory);

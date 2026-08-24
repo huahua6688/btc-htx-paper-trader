@@ -196,7 +196,7 @@ Feature Registry 记录每项特征的数据源、时间层、当前权重、适
 
 Historical Catalog V2 从 HTX 固定公开端点下载 BTC-USDT 永续 Kline、Funding，以及官方端点在请求时仍能提供的 OI、精英账户/仓位比、Mark Price、Premium、Basis 和最近清算。Kline 与 Funding 可分页；其余端点只有有限的最新窗口，Depth 只有实时快照。`manifest.json` 对每类数据记录来源、抓取时间、事件时间、实际端点覆盖、缺口、重复、原始 payload SHA-256、schema 和 provenance。超出官方真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md)。
 
-实时 monitor 每轮把已成功取得的 HTX 原始响应和 normalized 研究字段 best-effort 写入独立 `market-archive.sqlite`。归档失败只产生警告，不影响 Paper 仓位管理；原始 payload 不会因 parser 升级被重写，normalized 字段可从原始数据重新生成。Replay V2 只读取 `eventTime <= visibleAt` 且没有超过字段 TTL 的 Catalog/Archive 记录，并逐字段标记 `HTX_HISTORICAL / SELF_ARCHIVED / HISTORICAL_UNAVAILABLE / STALE / LIVE_FAILURE`。
+实时 monitor 每轮把已成功取得的 HTX 原始响应和 normalized 研究字段 best-effort 写入独立 `market-archive.sqlite`。归档失败只产生警告，不影响 Paper 仓位管理；原始 payload 不会因 parser 升级被重写，normalized 字段可从原始数据重新生成。Replay V2 只读取 `eventTime <= visibleAt`，Archive 还必须满足 `observedAt <= visibleAt`，并逐字段标记 `HTX_HISTORICAL / SELF_ARCHIVED / HISTORICAL_UNAVAILABLE / STALE / REPLAY_ARCHIVE_ERROR`。
 
 ```bash
 # 必须显式给出连续区间；不会自动挑选收益最好看的时期
@@ -205,6 +205,7 @@ npm run data:inspect
 
 # 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
 npm run htx:status
+npm run htx:status -- --verify  # 显式重新计算当前 binary SHA-256
 npm run htx:check
 npm run htx:update
 npm run archive:status
@@ -320,8 +321,8 @@ npm run check:safety
 - `analyze`：只读公开行情并输出当轮判断，不写交易所。
 - `monitor`：立即运行一次，之后每 5 分钟分析、写 SQLite 并管理模拟仓位。
 - `status`：第一部分显示实际数据库路径，并显示权益、可用资金、已/未实现盈亏、保证金、名义仓位、有效杠杆、净仓位、当前风险、最近判断和数据源质量。
-- `health`：只读 SQLite；超过 15 分钟没有成功 monitor、最近运行失败或数据库不可用时返回非零退出码。
-- `htx:status`：显示已安装 release、SHA-256、最后一次上游检查和兼容性报告，不访问交易账户。
+- `health`：Paper DB、monitor 或快照异常时返回非零退出码；Research/Archive 状态失败仅显示 infrastructure warning，不会误报 Paper core 故障。
+- `htx:status`：默认显示 installed metadata 中记录的 SHA-256，不重复读取约 100MB binary；只有显式增加 `--verify` 才重新计算并核对当前文件。
 - `htx:check`：只查询官方 GitHub Release 并比较身份，不修改生产 binary。
 - `htx:update`：下载到 staging，验证官方 release 身份/可用 checksum、跑全部已采用 public command 的兼容测试、项目测试和安全扫描，全部通过才原子替换并保留 rollback。它不会自动扩大白名单。
 - `archive:status`：只读显示独立 Market Archive 的覆盖、缺口和存储统计。

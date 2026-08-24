@@ -21,6 +21,7 @@ function iso(value) {
 }
 
 export function normalizeArchivedPayload(type, payload, { observedAt = null } = {}) {
+  const dataObject = () => Array.isArray(payload.data) ? payload.data[0] ?? {} : payload.data ?? {};
   const normalizers = {
     ticker: () => ({ ts: Number(payload.ts ?? payload.tick?.ts), close: Number(payload.tick?.close), open: Number(payload.tick?.open), high: Number(payload.tick?.high), low: Number(payload.tick?.low), bid: payload.tick?.bid ?? null, ask: payload.tick?.ask ?? null }),
     kline15m: () => (payload.data ?? []).map((row) => ({ eventTime: Number(row.id) * 1000, open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), amount: Number(row.amount), volume: Number(row.vol), turnover: Number(row.trade_turnover), trades: Number(row.count) })),
@@ -35,10 +36,10 @@ export function normalizeArchivedPayload(type, payload, { observedAt = null } = 
       nextFundingTime: Number(payload.data?.next_funding_time)
     }),
     fundingHistory: () => (payload.data?.data ?? []).map((row) => ({ eventTime: Number(row.funding_time), fundingRate: Number(row.realized_rate ?? row.funding_rate), averagePremiumIndex: Number(row.avg_premium_index) })),
-    oiCurrent: () => (payload.data ?? []).map((row) => ({ eventTime: Number(row.ts ?? payload.ts), value: Number(row.value), volume: Number(row.volume), amountType: Number(row.amount_type) })),
-    oiHistory: () => (payload.data ?? []).flatMap((item) => item.tick ?? []).map((row) => ({ eventTime: Number(row.ts), value: Number(row.value), volume: Number(row.volume), amountType: Number(row.amount_type) })),
-    eliteAccount: () => (payload.data ?? []).flatMap((item) => item.list ?? []).map((row) => ({ eventTime: Number(row.ts), buyRatio: Number(row.buy_ratio), sellRatio: Number(row.sell_ratio), lockedRatio: Number(row.locked_ratio) })),
-    elitePosition: () => (payload.data ?? []).flatMap((item) => item.list ?? []).map((row) => ({ eventTime: Number(row.ts), buyRatio: Number(row.buy_ratio), sellRatio: Number(row.sell_ratio) })),
+    oiCurrent: () => (Array.isArray(payload.data) ? payload.data : payload.data ? [payload.data] : []).map((row) => ({ eventTime: Number(row.ts ?? payload.ts), value: Number(row.value), volume: Number(row.volume), amountType: Number(row.amount_type) })),
+    oiHistory: () => (dataObject().tick ?? []).map((row) => ({ eventTime: Number(row.ts), value: Number(row.value), volume: Number(row.volume), amountType: Number(row.amount_type) })),
+    eliteAccount: () => (dataObject().list ?? []).map((row) => ({ eventTime: Number(row.ts), buyRatio: Number(row.buy_ratio), sellRatio: Number(row.sell_ratio), lockedRatio: Number(row.locked_ratio) })),
+    elitePosition: () => (dataObject().list ?? []).map((row) => ({ eventTime: Number(row.ts), buyRatio: Number(row.buy_ratio), sellRatio: Number(row.sell_ratio) })),
     liquidations: () => (payload.data ?? []).map((row) => ({ eventTime: Number(row.created_at), direction: row.direction, offset: row.offset, volume: Number(row.volume), amount: Number(row.amount), price: Number(row.price), turnover: Number(row.trade_turnover) })),
     markPrice: () => (payload.data ?? []).map((row) => ({ eventTime: Number(row.id) * 1000, open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close) })),
     premium: () => normalizers.markPrice(),

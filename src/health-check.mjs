@@ -47,7 +47,31 @@ export function evaluateHealth(db, {
       initialCapitalCny: Number(account.initial_capital_cny),
       openPosition: Boolean(db.getOpenPosition())
     } : null,
-    infrastructure
+    infrastructure,
+    degradedInfrastructure: false,
+    infrastructureWarnings: []
+  };
+}
+
+export async function evaluateHealthWithInfrastructure(db, {
+  infrastructureBuilder = null,
+  infrastructureOptions = undefined,
+  ...healthOptions
+} = {}) {
+  let infrastructure = null;
+  const infrastructureWarnings = [];
+  if (infrastructureBuilder) {
+    try {
+      infrastructure = await infrastructureBuilder(db, infrastructureOptions);
+    } catch (error) {
+      infrastructureWarnings.push(`Research infrastructure 状态不可用：${error.message}`);
+    }
+  }
+  const result = evaluateHealth(db, { ...healthOptions, infrastructure });
+  return {
+    ...result,
+    degradedInfrastructure: infrastructureWarnings.length > 0,
+    infrastructureWarnings
   };
 }
 
@@ -67,6 +91,9 @@ export function formatHealth(result) {
       `Archive：${infra.archive.available ? `${infra.archive.storage.records} 条 / latest ${infra.archive.coverage.map((item) => item.latest).sort().at(-1) ?? "—"}` : "尚未建立"}`,
       `Catalog：${infra.catalog.available ? `v${infra.catalog.schemaVersion} / ${infra.catalog.quality}` : "尚未建立"}`
     );
+  }
+  if (result.infrastructureWarnings?.length) {
+    lines.push("Research infrastructure 警告（不影响 Paper health）：", ...result.infrastructureWarnings.map((item) => `- ${item}`));
   }
   if (result.failures.length) lines.push("失败原因：", ...result.failures.map((item) => `- ${item}`));
   lines.push("安全：health 只读取本地 SQLite，不调用交易所接口。");

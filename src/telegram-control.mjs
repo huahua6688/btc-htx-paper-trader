@@ -148,8 +148,14 @@ export function dataQualityLines(report) {
   const gate = report?.dataQualityGate;
   if (!gate) return ["数据质量：未记录"];
   const tierName = (tier) => tier === "CRITICAL" ? "核心" : tier === "IMPORTANT" ? "重要" : "辅助";
+  const provenanceName = (provenance) => ({
+    HISTORICAL_UNAVAILABLE: "历史无档案",
+    LIVE_FAILURE: "实时失败",
+    STALE: "数据过期",
+    REPLAY_ARCHIVE_ERROR: "回放档案错误"
+  })[provenance] ?? provenance;
   const missing = gate.missing?.length
-    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${item.provenance === "HISTORICAL_UNAVAILABLE" ? "历史无档案" : "实时失败"}]`).join("、")
+    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${provenanceName(item.provenance)}]`).join("、")
     : "无";
   return [
     `数据质量：${gate.status}（政策 ${gate.policy}）`,

@@ -15,7 +15,8 @@ export const REPLAY_PROVENANCE = Object.freeze({
   LIVE_OBSERVED: "LIVE_OBSERVED",
   HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE",
   STALE: "STALE",
-  LIVE_FAILURE: "LIVE_FAILURE"
+  LIVE_FAILURE: "LIVE_FAILURE",
+  REPLAY_ARCHIVE_ERROR: "REPLAY_ARCHIVE_ERROR"
 });
 
 export const REPLAY_FIELD_TTL_MS = Object.freeze({
@@ -92,44 +93,112 @@ function htxRows(rows) {
 
 function payload(rows) { return { status: "ok", data: htxRows(rows) }; }
 
+function timestampMs(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function replayPayloadConsumable(type, value) {
+  if (!value) return false;
+  const finite = (input) => input !== null && input !== undefined && Number.isFinite(Number(input));
+  if (type === "openInterest") return Array.isArray(value.data?.tick) && value.data.tick.some((row) => finite(row?.ts) && finite(row?.value));
+  if (type === "eliteAccount" || type === "elitePosition") {
+    return Array.isArray(value.data?.list) && value.data.list.some((row) => finite(row?.ts) && finite(row?.buy_ratio) && finite(row?.sell_ratio));
+  }
+  if (type === "depth") return Array.isArray(value.tick?.bids) && value.tick.bids.length > 0
+    && Array.isArray(value.tick?.asks) && value.tick.asks.length > 0;
+  if (type === "markPrice" || type === "premium") return Array.isArray(value.data) && value.data.some((row) => finite(row?.close));
+  if (type === "basis") return Array.isArray(value.data) && value.data.some((row) => finite(row?.basis_rate));
+  if (type === "liquidations") return Array.isArray(value.data) && value.data.some((row) => finite(row?.created_at));
+  if (type === "contractElements") return Array.isArray(value.data) && value.data.some((row) => row?.contract_code === "BTC-USDT");
+  return false;
+}
+
 function visibleHistoricalRecords(records = [], visibleAt, ttlMs) {
-  const visible = records.filter((item) => Number(item.eventTime) <= visibleAt && Number(item.visibleAt ?? item.eventTime) <= visibleAt);
+  const visible = records
+    .filter((item) => {
+      const eventTime = timestampMs(item.eventTime);
+      const recordVisibleAt = timestampMs(item.visibleAt ?? item.eventTime);
+      return eventTime !== null && recordVisibleAt !== null && eventTime <= visibleAt && recordVisibleAt <= visibleAt;
+    })
+    .sort((a, b) => timestampMs(a.eventTime) - timestampMs(b.eventTime)
+      || timestampMs(a.visibleAt ?? a.eventTime) - timestampMs(b.visibleAt ?? b.eventTime));
   const latest = visible.at(-1) ?? null;
-  if (!latest) return { records: [], provenance: REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE, ageMs: null };
-  const ageMs = visibleAt - Number(latest.eventTime);
-  if (Number.isFinite(ttlMs) && ageMs > ttlMs) return { records: [], provenance: REPLAY_PROVENANCE.STALE, ageMs };
-  return { records: visible, provenance: REPLAY_PROVENANCE.HTX_HISTORICAL, ageMs };
+  if (!latest) return { records: [], provenance: REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE, ageMs: null, eventTime: null, visibleAt: null };
+  const eventTime = timestampMs(latest.eventTime);
+  const selectedVisibleAt = timestampMs(latest.visibleAt ?? latest.eventTime);
+  const ageMs = visibleAt - eventTime;
+  if (Number.isFinite(ttlMs) && ageMs > ttlMs) {
+    return { records: [], provenance: REPLAY_PROVENANCE.STALE, ageMs, eventTime, visibleAt: selectedVisibleAt };
+  }
+  return { records: visible, provenance: REPLAY_PROVENANCE.HTX_HISTORICAL, ageMs, eventTime, visibleAt: selectedVisibleAt };
 }
 
 function historicalPayload(type, historicalSeries, visibleAt) {
   const ttlMs = REPLAY_FIELD_TTL_MS[type];
   const result = visibleHistoricalRecords(historicalSeries?.[type] ?? [], visibleAt, ttlMs);
-  if (!result.records.length) return { payload: null, provenance: result.provenance, ageMs: result.ageMs };
+  if (!result.records.length) return { payload: null, provenance: result.provenance, ageMs: result.ageMs, eventTime: result.eventTime, visibleAt: result.visibleAt };
   const rows = result.records.map((item) => item.normalized);
   let value;
-  if (type === "openInterest") value = { status: "ok", data: [{ symbol: "BTC", contract_code: "BTC-USDT", tick: rows.slice(-200) }] };
-  else if (type === "eliteAccount" || type === "elitePosition") value = { status: "ok", data: [{ symbol: "BTC", contract_code: "BTC-USDT", list: rows.slice(-30) }] };
+  if (type === "openInterest") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", tick: rows.slice(-200) } };
+  else if (type === "eliteAccount" || type === "elitePosition") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", list: rows.slice(-30) } };
   else if (["markPrice", "premium", "basis"].includes(type)) value = { status: "ok", data: rows.slice(-2000) };
   else if (type === "liquidations") value = { code: 200, msg: "success", data: rows.filter((row) => Number(row.created_at) >= visibleAt - 24 * 60 * 60 * 1000).slice(-50), ts: visibleAt };
   else value = null;
-  return { payload: value, provenance: result.provenance, ageMs: result.ageMs };
+  if (!replayPayloadConsumable(type, value)) {
+    return {
+      payload: null,
+      provenance: REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE,
+      ageMs: result.ageMs,
+      eventTime: result.eventTime,
+      visibleAt: result.visibleAt,
+      error: `${type} historical payload is not consumable by frozen V1.2`
+    };
+  }
+  return { payload: value, provenance: result.provenance, ageMs: result.ageMs, eventTime: result.eventTime, visibleAt: result.visibleAt };
 }
 
 function replayField(type, historicalSeries, archive, visibleAt) {
+  const historical = () => historicalPayload(type, historicalSeries, visibleAt);
   if (archive?.getVisiblePayload) {
     try {
       const archiveType = type === "openInterest" ? "oiHistory" : type;
       const archived = archive.getVisiblePayload(archiveType, new Date(visibleAt).toISOString(), { ttlMs: REPLAY_FIELD_TTL_MS[type] });
-      if (archived?.payload) return archived;
+      if (archived?.payload && replayPayloadConsumable(type, archived.payload)) {
+        return { ...archived, visibleAt: timestampMs(archived.observedAt), archiveSource: true };
+      }
+      if (archived?.payload) {
+        const fallback = historical();
+        return fallback.payload ? { ...fallback, archiveError: `${type} archived payload is incompatible with frozen V1.2` } : {
+          payload: null,
+          provenance: REPLAY_PROVENANCE.REPLAY_ARCHIVE_ERROR,
+          eventTime: archived.eventTime ?? null,
+          visibleAt: timestampMs(archived.observedAt),
+          observedAt: archived.observedAt ?? null,
+          ageMs: archived.ageMs ?? null,
+          error: `${type} archived payload is incompatible with frozen V1.2`
+        };
+      }
       if (archived?.provenance === REPLAY_PROVENANCE.STALE) {
-        const historical = historicalPayload(type, historicalSeries, visibleAt);
-        return historical.payload ? historical : archived;
+        const fallback = historical();
+        return fallback.payload ? fallback : { ...archived, visibleAt: timestampMs(archived.observedAt), archiveSource: true };
       }
     } catch (error) {
-      return { payload: null, provenance: REPLAY_PROVENANCE.LIVE_FAILURE, error: error.message };
+      const fallback = historical();
+      return fallback.payload ? { ...fallback, archiveError: error.message } : {
+        payload: null,
+        provenance: REPLAY_PROVENANCE.REPLAY_ARCHIVE_ERROR,
+        eventTime: null,
+        visibleAt: null,
+        observedAt: null,
+        ageMs: null,
+        error: error.message
+      };
     }
   }
-  return historicalPayload(type, historicalSeries, visibleAt);
+  return historical();
 }
 
 export function buildPointInTimeMarket(candles, funding, index, {
@@ -189,7 +258,7 @@ export function buildPointInTimeMarket(candles, funding, index, {
       age_ms: visibleAt - currentFunding.timestamp
     } } : null,
     fundingHistory: { status: "ok", data: { data: fundingVisible.slice(-30).map((item) => ({ funding_rate: String(item.fundingRate), funding_time: String(item.timestamp) })) } },
-    oiCurrent: oiPayload?.data?.[0]?.tick?.length ? { status: "ok", data: [oiPayload.data[0].tick.at(-1)] } : null,
+    oiCurrent: oiPayload?.data?.tick?.length ? { status: "ok", data: [oiPayload.data.tick.at(-1)] } : null,
     oiHistory: oiPayload,
     eliteAccount: replayFields.eliteAccount.payload,
     elitePosition: replayFields.elitePosition.payload,
@@ -227,10 +296,19 @@ export function buildPointInTimeMarket(candles, funding, index, {
         provenance: value.provenance,
         ageMs: value.ageMs ?? null,
         available: Boolean(value.payload),
-        error: value.error ?? null
+        eventTime: value.eventTime ?? null,
+        visibleAt: value.visibleAt ?? null,
+        observedAt: value.observedAt ?? null,
+        archiveSource: Boolean(value.archiveSource),
+        error: value.error ?? value.archiveError ?? null
       }])),
       availableSources: Object.entries(replayFields).filter(([, item]) => item.payload).map(([key]) => key),
-      eventTimeNotAfterVisibleAt: Object.values(replayFields).every((item) => !item.eventTime || Number(item.eventTime) <= visibleAt)
+      eventTimeNotAfterVisibleAt: Object.values(replayFields)
+        .filter((item) => item.payload)
+        .every((item) => timestampMs(item.eventTime) !== null && timestampMs(item.eventTime) <= visibleAt),
+      observedAtNotAfterVisibleAt: Object.values(replayFields)
+        .filter((item) => item.payload && item.observedAt !== null && item.observedAt !== undefined)
+        .every((item) => timestampMs(item.observedAt) !== null && timestampMs(item.observedAt) <= visibleAt)
     }
   };
 }

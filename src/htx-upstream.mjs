@@ -20,6 +20,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { hostname } from "node:os";
 import { MARKET_TASKS } from "./market-data.mjs";
 import { resolveCliPath, runPublicCommandWithBinary } from "./htx-cli.mjs";
 
@@ -29,6 +30,7 @@ const sourceManifestPath = fileURLToPath(new URL("../vendor/htx-cli-source.json"
 const GITHUB_API = "https://api.github.com/repos/htx-exchange/htx-skills-hub";
 const SOURCE_REPO = "https://github.com/htx-exchange/htx-skills-hub";
 const RELEASE_ASSET_TIMEOUT_MS = 10 * 60_000;
+export const HTX_UPDATE_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 export const HTX_UPSTREAM = Object.freeze({
   sourceRepo: SOURCE_REPO,
@@ -78,6 +80,61 @@ async function writeJsonAtomic(path, value) {
   const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(temporary, path);
+}
+
+function defaultProcessExists(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+async function acquireUpdateLock(paths, {
+  now,
+  pid,
+  hostnameValue,
+  lockTimeoutMs,
+  processExists
+}) {
+  const createLock = async () => {
+    const handle = await open(paths.lock, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify({ pid, createdAt: now(), hostname: hostnameValue }, null, 2)}\n`, "utf8");
+      return handle;
+    } catch (error) {
+      await handle.close();
+      await rm(paths.lock, { force: true });
+      throw error;
+    }
+  };
+
+  try {
+    return await createLock();
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+
+  const [metadata, fileStat] = await Promise.all([
+    readJson(paths.lock),
+    stat(paths.lock).catch(() => null)
+  ]);
+  const createdMs = new Date(metadata?.createdAt ?? fileStat?.mtimeMs ?? null).getTime();
+  const ageMs = Number.isFinite(createdMs) ? Date.now() - createdMs : null;
+  const expired = ageMs === null || ageMs > lockTimeoutMs;
+  const sameHost = !metadata?.hostname || metadata.hostname === hostnameValue;
+  const ownerGone = sameHost && Number.isInteger(Number(metadata?.pid)) && !processExists(Number(metadata.pid));
+  if (!expired && !ownerGone) throw new Error("Another HTX CLI update is already running");
+
+  await rm(paths.lock, { force: true });
+  try {
+    return await createLock();
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("Another HTX CLI update acquired the lock while a stale lock was being cleaned");
+    throw error;
+  }
 }
 
 function assertOfficialRelease(release) {
@@ -158,7 +215,8 @@ export async function getHtxInstalledStatus({
     asset,
     installed,
     installedSha256,
-    identityMatchesMetadata,
+    hashVerified: Boolean(installed && verifyHash),
+    identityMatchesMetadata: verifyHash ? identityMatchesMetadata : null,
     installedMetadata,
     sourceManifest,
     lockedAsset,
@@ -227,9 +285,9 @@ function validateCompatibilityPayload(key, payload) {
     fundingCurrent: () => payload?.status === "ok" && payload?.data?.funding_rate !== undefined,
     fundingHistory: () => array(payload?.data?.data) && (!payload.data.data.length || payload.data.data[0].funding_time !== undefined),
     oiCurrent: () => array(payload?.data) && (!payload.data.length || payload.data[0].value !== undefined),
-    oiHistory: () => array(payload?.data?.[0]?.tick) && (!payload.data[0].tick.length || payload.data[0].tick[0].ts !== undefined),
-    eliteAccount: () => array(payload?.data?.[0]?.list),
-    elitePosition: () => array(payload?.data?.[0]?.list),
+    oiHistory: () => array(payload?.data?.tick) && (!payload.data.tick.length || payload.data.tick[0].ts !== undefined),
+    eliteAccount: () => array(payload?.data?.list),
+    elitePosition: () => array(payload?.data?.list),
     liquidations: () => Number(payload?.code) === 200 && array(payload?.data),
     markPrice: () => array(payload?.data) && (!payload.data.length || payload.data[0].id !== undefined),
     premium: () => array(payload?.data) && (!payload.data.length || payload.data[0].id !== undefined),
@@ -376,17 +434,15 @@ export async function updateHtxCli({
   verifyProject = verifyProjectCommands,
   replaceBinary = rename,
   fetchImpl = fetch,
-  now = () => new Date().toISOString()
+  now = () => new Date().toISOString(),
+  pid = process.pid,
+  hostnameValue = hostname(),
+  lockTimeoutMs = HTX_UPDATE_LOCK_TIMEOUT_MS,
+  processExists = defaultProcessExists
 } = {}) {
   const paths = htxRuntimePaths(environment);
   await mkdir(paths.directory, { recursive: true });
-  let lock;
-  try {
-    lock = await open(paths.lock, "wx", 0o600);
-  } catch (error) {
-    if (error.code === "EEXIST") throw new Error("Another HTX CLI update is already running");
-    throw error;
-  }
+  const lock = await acquireUpdateLock(paths, { now, pid, hostnameValue, lockTimeoutMs, processExists });
   let stageDirectory = null;
   let backupPath = null;
   let movedOld = false;

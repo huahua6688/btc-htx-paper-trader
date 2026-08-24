@@ -102,19 +102,22 @@ function assertSuccessfulPayload(payload, skill, subcommand) {
   return payload;
 }
 
-// HTX v2.0.0 returns OI-history and elite-ratio `data` as an object, while
-// older local consumers use the documented one-item array shape. Normalize
-// only those read-only responses at the integration boundary; raw archive
-// storage still preserves the exact CLI payload it actually received.
+// Keep the public integration boundary byte-shape compatible with the frozen
+// V1.2 accessors in analysis-engine.mjs. Only OI-current is consumed as
+// data[0]; OI-history and both elite ratios are consumed as object data.
+// Raw archive storage still preserves the exact CLI payload received.
 export function normalizePublicCommandPayload(skill, subcommand, payload) {
   let normalized = payload;
-  if (skill === "oi-tracker" && ["current", "history"].includes(subcommand)
+  if (skill === "oi-tracker" && subcommand === "current"
     && payload?.data && !Array.isArray(payload.data)) {
     normalized = { ...payload, data: [payload.data] };
   }
+  if (skill === "oi-tracker" && subcommand === "history" && Array.isArray(payload?.data)) {
+    normalized = { ...payload, data: payload.data[0] ?? null };
+  }
   if (skill === "elite-positioning" && ["account-ratio", "position-ratio"].includes(subcommand)
-    && payload?.data && !Array.isArray(payload.data)) {
-    normalized = { ...payload, data: [payload.data] };
+    && Array.isArray(payload?.data)) {
+    normalized = { ...payload, data: payload.data[0] ?? null };
   }
   if (normalized !== payload) Object.defineProperty(normalized, HTX_RAW_PAYLOAD, { value: payload, enumerable: false });
   return normalized;

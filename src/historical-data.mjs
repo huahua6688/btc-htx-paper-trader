@@ -202,7 +202,7 @@ function eventTimeFor(type, row) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function mergeTimedRecords(prior, fetched) {
+export function mergeTimedRecords(prior, fetched) {
   const records = new Map(prior.map((item) => [item.eventTime, item]));
   for (const item of fetched) {
     const existing = records.get(item.eventTime);
@@ -210,7 +210,11 @@ function mergeTimedRecords(prior, fetched) {
       records.set(item.eventTime, item);
       continue;
     }
-    if (existing.rawPayloadHash !== item.rawPayloadHash) {
+    const knownHashes = new Set([
+      existing.rawPayloadHash,
+      ...(existing.revisions ?? []).map((revision) => revision.rawPayloadHash)
+    ].filter(Boolean));
+    if (!knownHashes.has(item.rawPayloadHash)) {
       records.set(item.eventTime, {
         ...existing,
         revisions: [

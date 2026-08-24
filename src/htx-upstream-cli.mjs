@@ -7,6 +7,7 @@ import {
 
 const command = process.argv[2] ?? "status";
 const json = process.argv.includes("--json");
+const verify = process.argv.includes("--verify");
 
 function short(value) { return value ? String(value).slice(0, 16) : "—"; }
 
@@ -21,7 +22,7 @@ function formatStatus(status) {
     `已安装：${status.installed ? "是" : "否"}`,
     `Release：${metadata?.release?.tag ?? status.sourceManifest?.release?.tag ?? "未知"}`,
     `SHA-256：${status.installedSha256 ?? "—"}`,
-    `元数据匹配：${status.installed ? status.identityMatchesMetadata ? "是" : "否/缺少运行时元数据" : "不适用"}`,
+    `Binary SHA 验证：${status.hashVerified ? status.identityMatchesMetadata ? "PASS" : "FAIL/缺少运行时元数据" : "未执行（显示 installed metadata）"}`,
     `上次兼容检查：${compatibility ? `${compatibility.compatible ? "PASS" : "FAIL"} / ${compatibility.checkedAt}` : "尚未运行"}`,
     `上游更新：${status.upstreamUpdateAvailable === null ? "尚未执行 htx:check" : status.upstreamUpdateAvailable ? "有" : "无"}`,
     "安全：状态命令不调用交易接口，不修改 binary。"
@@ -65,7 +66,7 @@ async function main() {
   let result;
   let formatted;
   if (command === "status") {
-    result = await getHtxInstalledStatus();
+    result = await getHtxInstalledStatus({ verifyHash: verify });
     formatted = formatStatus(result);
   } else if (command === "check") {
     result = await checkHtxUpstream();
@@ -74,7 +75,7 @@ async function main() {
     result = await updateHtxCli();
     formatted = formatUpdate(result);
   } else {
-    throw new Error("Usage: npm run htx:status | htx:check | htx:update");
+    throw new Error("Usage: npm run htx:status [-- --verify] | htx:check | htx:update");
   }
   process.stdout.write(json ? `${JSON.stringify(result, null, 2)}\n` : `${formatted}\n`);
 }

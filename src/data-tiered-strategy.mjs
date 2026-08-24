@@ -146,6 +146,8 @@ export function applyTieredDataPolicy(base, market, quality, parameters = DATA_T
     missingByTier: quality.missingByTier,
     historicallyUnavailableKeys: quality.historicallyUnavailableKeys,
     liveFailureKeys: quality.liveFailureKeys,
+    staleKeys: quality.staleKeys,
+    replayArchiveErrorKeys: quality.replayArchiveErrorKeys,
     actions: decisionActions,
     championDecisionUnchanged: base.decision,
     unavailableNeverSynthesized: true
