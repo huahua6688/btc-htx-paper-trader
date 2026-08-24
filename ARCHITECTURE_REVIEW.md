@@ -79,8 +79,15 @@ CONNECTED 只有在「同一个环境里真的把该阶段跑通过一次」时�
 其余所有研究命令只写 `research-output/` 下的 JSON，从不落库。现在所有研究命令都会登记，
 失败也会以 `BLOCKED` 加真实原因入库，并新增 `npm run research:runs` 直接查询。
 
-本环境实测：`persistedResearchRuns` 0 → 2（两条均为 `BLOCKED`），
-`registeredStrategyVersions` 1 → 2（新增 `V1.3-DATA-TIERED-CANDIDATE`，role=CHALLENGER，
+登记簿存放在与生产 Paper 库同级的持久化路径（可用 `PAPER_RESEARCH_DB_PATH` /
+`RESEARCH_DB_PATH` / `--research-db=` 覆盖），解析结果绝不允许指向生产库或 Shadow 库。
+Telegram 的 Strategy Learning / Challenger / Historical Similarity / Research Results
+只读读取同一个登记簿，因此 CLI 持久化之后面板立即可见；Champion 的实时状态仍以生产库
+与冻结源码为准。生产 Paper 库的 `research_runs` 始终保持为 0，不被研究任务污染。
+
+本环境实测：4 次真实 CLI invocation（backtest / replay --strategy=data-tiered / similarity /
+robustness）产生恰好 4 条顶层 run，全部为 `BLOCKED`（无数据集），
+`registeredStrategyVersions` 为 2（新增 `V1.3-DATA-TIERED-CANDIDATE`，role=CHALLENGER，
 lifecycle=CANDIDATE，promotion 明确为 BLOCKED；Champion 仍为 `V1.2-FROZEN` / `FROZEN`）。
 
 ## 结论

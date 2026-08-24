@@ -22,6 +22,12 @@ import { DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
 import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
+import {
+  RESEARCH_REGISTRY,
+  recordResearchRun,
+  registerResearchStrategyVersion,
+  withResearchRegistry
+} from "./research-registry.mjs";
 import { runResearchV2Pipeline } from "./research-v2-pipeline.mjs";
 import { runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
@@ -57,35 +63,11 @@ function range(args, defaults = null) {
 function runId(prefix) { return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`; }
 
 /**
- * 研究运行登记簿。
- *
- * 修复前：只有 research-v2-pipeline.mjs 会调用 recordResearchRun / registerStrategyVersion，
- * 而那个模块没有任何 CLI 入口，等于永远不会被执行。所有研究命令都只把 JSON 写进
- * research-output/，SQLite 里的 research_runs 因此恒为 0 ——「代码存在」但「从未执行」。
- *
- * 修复后：每个研究命令结束时都把运行结果登记进一个独立的研究 SQLite。
- * 它绝不是生产 Paper 库：路径固定在 research-output/ 下，PAPER_DB_PATH 不会被读取，
- * 也不会写入任何仓位或账户。
+ * 研究登记簿位于 src/research-registry.mjs，Telegram 也只读地共用它。
+ * 这里不再自建一份打开逻辑，避免出现「CLI 写这个库、面板读另一个库」的错位。
  */
-export function researchRegistryPath() { return resolveOutputPath("research-registry.sqlite"); }
-
-export function openResearchRegistry(path = researchRegistryPath()) {
-  return openPaperDatabase(path, {
-    ...PAPER_CONFIG,
-    databasePath: path,
-    databasePathSource: "RESEARCH_REGISTRY_NOT_PRODUCTION"
-  });
-}
-
-async function withResearchRegistry(work) {
-  await mkdir(resolveOutputPath("."), { recursive: true });
-  const db = openResearchRegistry();
-  try {
-    return work(db);
-  } finally {
-    db.close();
-  }
-}
+export { RESEARCH_REGISTRY, researchRegistrySnapshot } from "./research-registry.mjs";
+export function researchRegistryPath() { return RESEARCH_REGISTRY.path; }
 
 /**
  * 把一次失败归类成 BLOCKED 还是 FAILED。
@@ -128,14 +110,10 @@ export function classifyResearchFailure(error) {
 
 /**
  * 登记一次研究运行。status 必须如实反映真实结果：
- * PASSED / FAILED / PARTIAL / BLOCKED，绝不允许为了让计数变成 1 而伪造 PASSED。
+ * PASSED / PARTIAL / FAILED / BLOCKED，绝不允许为了让计数变成 1 而伪造 PASSED。
  */
 export async function persistResearchRun(record) {
-  return withResearchRegistry((db) => ({
-    id: db.recordResearchRun(record),
-    registryPath: researchRegistryPath(),
-    totalRuns: db.getResearchRuns({ limit: 1_000_000 }).length
-  }));
+  return recordResearchRun(record);
 }
 
 async function recordRun(runType, startedAt, status, { artifactPath = null, dataManifestHash = null, strategyVersion = null, summary = {} } = {}) {
@@ -212,7 +190,6 @@ export function capitalOptions(args) {
 }
 
 async function backtest(args) {
-  const startedAt = new Date().toISOString();
   const dataset = await load(args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId("backtest"));
@@ -226,31 +203,10 @@ async function backtest(args) {
     champion: compactReplay(comparison.champion), challenger: compactReplay(comparison.challenger)
   });
   process.stdout.write(`${JSON.stringify({ directory, championPath, challengerPath, comparisonPath, sameEvents: comparison.sameEvents, champion: compactReplay(comparison.champion), challenger: compactReplay(comparison.challenger) }, null, 2)}\n`);
-  await recordRun("HISTORICAL_REPLAY_BACKTEST", startedAt, "PASSED", {
-    artifactPath: comparisonPath,
-    dataManifestHash: dataset.manifest.manifestHash,
-    strategyVersion: comparison.challenger.strategyVersion,
-    summary: {
-      capital: comparison.challenger.capital,
-      sameEvents: comparison.sameEvents,
-      championTrades: comparison.champion.tradeCount,
-      challengerTrades: comparison.challenger.tradeCount,
-      championEntryRejections: comparison.champion.entryRejections,
-      challengerEntryRejections: comparison.challenger.entryRejections,
-      challengerPerformance: {
-        netPnlCny: comparison.challenger.performance.cumulativePnlCny,
-        profitFactor: comparison.challenger.performance.profitFactor,
-        expectancyCny: comparison.challenger.performance.expectancyCny,
-        winRatePct: comparison.challenger.performance.winRatePct,
-        maxDrawdownPct: comparison.challenger.performance.maxDrawdownPct
-      }
-    }
-  });
   return { dataset, comparison, directory };
 }
 
 async function researchV2(args) {
-  const startedAt = new Date().toISOString();
   const dataset = await load(args);
   const directory = resolveOutputPath(runId("research-v2"));
   await mkdir(directory, { recursive: true });
@@ -263,34 +219,9 @@ async function researchV2(args) {
     recordPipelineRun: false
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  const promotion = result?.promotion ?? null;
-  const finalUntouchedOos = result?.finalUntouchedOos ?? null;
   // 管线成功跑完就是一次真实的研究运行。晋级与否决定 PASSED / PARTIAL，
   // 而不是把「没有晋级」谎报成 BLOCKED —— BLOCKED 只用于跑不起来。
-  const status = promotion?.status === "PASSED" && promotion?.eligible ? "PASSED" : "PARTIAL";
-  await recordRun("RESEARCH_V2_PIPELINE", startedAt, status, {
-    artifactPath: join(directory, "research-v2-pipeline.json"),
-    dataManifestHash: dataset.manifest.manifestHash,
-    strategyVersion: result?.selectionEvidence?.selected?.version ?? null,
-    summary: {
-      conclusion: result?.conclusion ?? null,
-      promotion,
-      finalUntouchedOos,
-      championChanged: promotion?.championChanged ?? false,
-      // 子阶段作为 evidence 记录在这一条顶层 run 里，不再各自登记成独立 run。
-      stages: {
-        candidateGeneration: result?.candidateGeneration ?? null,
-        experiments: (result?.experiments ?? []).map((item) => ({
-          version: item.candidate?.version ?? null,
-          walkForwardPassed: item.validation?.passed ?? null
-        })),
-        robustness: result?.robustness?.status ?? null,
-        formalShadow: result?.formalShadow?.status ?? null,
-        holdoutRegistry: result?.holdoutRegistry?.holdout?.status ?? null
-      }
-    }
-  });
-  return result;
+  return { dataset, result, directory };
 }
 
 /**
@@ -320,7 +251,6 @@ function defaultParametersFor(strategy) {
  * 它与实时 monitor 共用同一份 tiered policy，不存在第二套行为实现。
  */
 async function replay(args) {
-  const startedAt = new Date().toISOString();
   // 先校验参数再加载数据集：未知策略是用法/逻辑错误（FAILED），
   // 不能因为数据集恰好也不存在而被误判成外部前置条件缺失（BLOCKED）。
   const strategy = strategyOption(args, "strategy", "challenger");
@@ -338,31 +268,10 @@ async function replay(args) {
   });
   const path = await save(join(directory, `${strategy}-replay.json`), report);
   process.stdout.write(`${JSON.stringify({ path, compact: compactReplay(report), capital: report.capital, entryRejections: report.entryRejections }, null, 2)}\n`);
-  await recordRun("HISTORICAL_REPLAY", startedAt, "PASSED", {
-    artifactPath: path,
-    dataManifestHash: dataset.manifest.manifestHash,
-    strategyVersion: report.strategyVersion,
-    summary: {
-      strategy,
-      capital: report.capital,
-      tradeCount: report.tradeCount,
-      entryRejections: report.entryRejections,
-      performance: {
-        netPnlCny: report.performance.cumulativePnlCny,
-        profitFactor: report.performance.profitFactor,
-        expectancyCny: report.performance.expectancyCny,
-        winRatePct: report.performance.winRatePct,
-        maxDrawdownPct: report.performance.maxDrawdownPct
-      },
-      // 回放本身绝不打开未触碰的 Final OOS。
-      touchedFinalOos: false
-    }
-  });
   return { dataset, report, directory };
 }
 
 async function validation(args) {
-  const startedAt = new Date().toISOString();
   const baselineStrategy = strategyOption(args, "baseline-strategy", "challenger");
   const candidateStrategy = strategyOption(args, "candidate-strategy", "challenger");
   const dataset = await load(args);
@@ -377,22 +286,8 @@ async function validation(args) {
     candidateParameters: defaultParametersFor(candidateStrategy)
   });
   const path = await save(join(directory, "validation-report.json"), report);
-  await recordRun("WALK_FORWARD_PURGED_OOS_VALIDATION", startedAt, report.passed ? "PASSED" : "PARTIAL", {
-    artifactPath: path,
-    dataManifestHash: dataset.manifest.manifestHash,
-    strategyVersion: candidateStrategy,
-    summary: {
-      baselineStrategy,
-      candidateStrategy,
-      passed: report.passed,
-      gateReasons: report.gateReasons,
-      windows: report.windows.length,
-      lookaheadPassed: report.lookaheadAudit?.passed ?? null,
-      touchedFinalOos: false
-    }
-  });
   process.stdout.write(`${JSON.stringify({ path, passed: report.passed, gateReasons: report.gateReasons, evidence: report.evidence, windows: report.windows.map((item) => ({ index: item.index, trainEnd: item.trainEnd, testStart: item.testStart, incremental: item.incremental, baselineTrades: item.baseline.tradeCount, candidateTrades: item.candidate.tradeCount })), lookahead: { passed: report.lookaheadAudit.passed, checksRun: report.lookaheadAudit.checksRun } }, null, 2)}\n`);
-  return { dataset, report, directory };
+  return { dataset, report, directory, baselineStrategy, candidateStrategy };
 }
 
 async function similarity(args) {
@@ -665,93 +560,375 @@ async function full(args) {
   return acceptance;
 }
 
+/**
+ * 命令表。
+ *
+ * 每个「真正的研究命令」一次 invocation 必须恰好产生一条顶层 research run：
+ * 成功一条 PASSED/PARTIAL，失败一条 BLOCKED/FAILED，绝不会 0 条也绝不会 2 条。
+ * 子阶段一律放进这条 run 的 summary.stages / evidence，不冒充独立顶层运行。
+ *
+ * exempt 的只是纯查询/登记类命令，它们本身不是一次研究运行。
+ */
+/**
+ * 构造 research:v2 的顶层 run 记录。
+ *
+ * strategyVersion 必须来自管线真实产出的 selectionEvidence 字段：
+ * 通过前置 gate 时是 selectedForFurtherValidation，没有候选通过时退回
+ * bestDiagnosticOnly —— 不能因为字段名写错而无声变成 null。
+ */
+export function researchV2RunRecord(result) {
+  const pipeline = result?.result ?? null;
+  const promotion = pipeline?.promotion ?? null;
+  const evidence = pipeline?.selectionEvidence ?? null;
+  const strategyVersion = evidence?.selectedForFurtherValidation?.version
+    ?? evidence?.bestDiagnosticOnly?.version
+    ?? null;
+  return {
+    status: promotion?.status === "PASSED" && promotion?.eligible ? "PASSED" : "PARTIAL",
+    artifactPath: join(result?.directory ?? ".", "research-v2-pipeline.json"),
+    dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+    strategyVersion,
+    summary: {
+      conclusion: pipeline?.conclusion ?? null,
+      promotion,
+      finalUntouchedOos: pipeline?.finalUntouchedOos ?? null,
+      championChanged: promotion?.championChanged ?? false,
+      selectedForFurtherValidation: evidence?.selectedForFurtherValidation ?? null,
+      bestDiagnosticOnly: evidence?.bestDiagnosticOnly ?? null,
+      stages: {
+        candidateGeneration: pipeline?.candidateGeneration ?? null,
+        experiments: (pipeline?.experiments ?? []).map((item) => ({
+          version: item.candidate?.version ?? null,
+          walkForwardPassed: item.validation?.passed ?? null
+        })),
+        robustness: pipeline?.robustness?.status ?? null,
+        formalShadow: pipeline?.formalShadow?.status ?? null,
+        holdoutRegistry: pipeline?.holdoutRegistry?.holdout?.status ?? null
+      }
+    }
+  };
+}
+
+const dataManifestHashOf = (result) => result?.dataset?.manifest?.manifestHash ?? null;
+
+const COMMANDS = {
+  "data:update": {
+    handler: (args) => dataUpdate(args),
+    runType: "DATA_CATALOG_UPDATE",
+    record: (result) => ({
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: { fetched: result?.fetched ?? null, directory: result?.directory ?? null }
+    })
+  },
+  "data:inspect": {
+    exempt: true,
+    handler: async (args) => {
+      const dataset = await load(args);
+      process.stdout.write(`${JSON.stringify({ directory: dataset.directory, manifest: dataset.manifest }, null, 2)}\n`);
+    }
+  },
+  backtest: {
+    handler: (args) => backtest(args),
+    runType: "HISTORICAL_REPLAY_BACKTEST",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      strategyVersion: result?.comparison?.challenger?.strategyVersion ?? null,
+      summary: {
+        capital: result?.comparison?.challenger?.capital ?? null,
+        sameEvents: result?.comparison?.sameEvents ?? null,
+        stages: {
+          champion: { trades: result?.comparison?.champion?.tradeCount ?? null, entryRejections: result?.comparison?.champion?.entryRejections ?? null },
+          challenger: { trades: result?.comparison?.challenger?.tradeCount ?? null, entryRejections: result?.comparison?.challenger?.entryRejections ?? null }
+        },
+        challengerPerformance: {
+          netPnlCny: result?.comparison?.challenger?.performance?.cumulativePnlCny ?? null,
+          profitFactor: result?.comparison?.challenger?.performance?.profitFactor ?? null,
+          expectancyCny: result?.comparison?.challenger?.performance?.expectancyCny ?? null,
+          winRatePct: result?.comparison?.challenger?.performance?.winRatePct ?? null,
+          maxDrawdownPct: result?.comparison?.challenger?.performance?.maxDrawdownPct ?? null
+        },
+        touchedFinalOos: false
+      }
+    })
+  },
+  replay: {
+    handler: (args) => replay(args),
+    runType: "HISTORICAL_REPLAY",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      strategyVersion: result?.report?.strategyVersion ?? null,
+      summary: {
+        strategy: result?.report?.strategy ?? null,
+        capital: result?.report?.capital ?? null,
+        tradeCount: result?.report?.tradeCount ?? null,
+        entryRejections: result?.report?.entryRejections ?? null,
+        performance: {
+          netPnlCny: result?.report?.performance?.cumulativePnlCny ?? null,
+          profitFactor: result?.report?.performance?.profitFactor ?? null,
+          expectancyCny: result?.report?.performance?.expectancyCny ?? null,
+          winRatePct: result?.report?.performance?.winRatePct ?? null,
+          maxDrawdownPct: result?.report?.performance?.maxDrawdownPct ?? null
+        },
+        touchedFinalOos: false
+      }
+    })
+  },
+  validate: {
+    handler: (args) => validation(args),
+    runType: "WALK_FORWARD_PURGED_OOS_VALIDATION",
+    record: (result) => ({
+      status: result?.report?.passed ? "PASSED" : "PARTIAL",
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      strategyVersion: result?.candidateStrategy ?? null,
+      summary: {
+        baselineStrategy: result?.baselineStrategy ?? null,
+        candidateStrategy: result?.candidateStrategy ?? null,
+        passed: result?.report?.passed ?? null,
+        gateReasons: result?.report?.gateReasons ?? [],
+        stages: {
+          windows: result?.report?.windows?.length ?? 0,
+          lookaheadPassed: result?.report?.lookaheadAudit?.passed ?? null
+        },
+        touchedFinalOos: false
+      }
+    })
+  },
+  similarity: {
+    handler: (args) => similarity(args),
+    runType: "HISTORICAL_SIMILARITY",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      summary: {
+        matrixRows: result?.matrix?.rows?.length ?? 0,
+        matrixHash: result?.matrix?.matrixHash ?? null,
+        stages: { query: result?.query?.status ?? result?.query?.evidence ?? null }
+      }
+    })
+  },
+  robustness: {
+    handler: (args) => robustness(args),
+    runType: "MONTE_CARLO_ROBUSTNESS",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      summary: {
+        status: result?.report?.status ?? null,
+        stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
+      }
+    })
+  },
+  counterfactual: {
+    handler: (args) => counterfactual(args),
+    runType: "COUNTERFACTUAL_REVIEW",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      summary: {
+        decisionCount: result?.report?.decisionCount ?? null,
+        waitTracked: result?.report?.waitTracked ?? null,
+        stages: { tradesReviewed: result?.report?.tradeReviews?.length ?? null },
+        aggregate: result?.report?.aggregate ?? null
+      }
+    })
+  },
+  "external:audit": {
+    handler: (args) => externalAudit(args),
+    runType: "EXTERNAL_FEATURE_CATALOG_AUDIT",
+    record: (result) => ({
+      summary: {
+        features: result?.features?.length ?? null,
+        generatedAt: result?.generatedAt ?? null,
+        stages: { productionWeightsUnchanged: true }
+      }
+    })
+  },
+  optimize: {
+    handler: (args) => optimize(args),
+    runType: "STRATEGY_OPTIMIZATION",
+    record: (result) => ({
+      strategyVersion: result?.selectedCandidate?.version ?? null,
+      summary: {
+        promotion: result?.promotion ?? null,
+        championChanged: result?.championChanged ?? false,
+        stages: {
+          validationPassed: result?.validation?.passed ?? null,
+          robustness: result?.robustness?.status ?? null,
+          shadow: result?.shadowComparison?.status ?? null
+        }
+      }
+    })
+  },
+  diagnose: {
+    handler: (args) => diagnose(args),
+    runType: "CHALLENGER_EDGE_DIAGNOSIS",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      summary: { stages: { diagnosis: result?.report?.summary ?? null } }
+    })
+  },
+  ablation: {
+    handler: (args) => ablation(args),
+    runType: "FEATURE_ABLATION",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      dataManifestHash: dataManifestHashOf(result),
+      summary: { stages: { selected: result?.report?.selected ?? null } }
+    })
+  },
+  "edge:pipeline": {
+    handler: (args) => edgePipeline(args),
+    runType: "EDGE_CANDIDATE_PIPELINE",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      summary: { stages: { promotion: result?.report?.promotion ?? null } }
+    })
+  },
+  "tradable-edge": {
+    handler: (args) => tradableEdge(args),
+    runType: "TRADABLE_EDGE_PIPELINE",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      summary: { stages: { promotion: result?.report?.promotion ?? result?.promotion ?? null } }
+    })
+  },
+  "anti-chase": {
+    handler: (args) => antiChase(args),
+    runType: "ANTI_CHASE_DIAGNOSIS",
+    record: (result) => ({
+      artifactPath: result?.directory ?? null,
+      summary: { stages: { promotion: result?.promotion ?? null } }
+    })
+  },
+  "research:v2": {
+    handler: (args) => researchV2(args),
+    runType: "RESEARCH_V2_PIPELINE",
+    record: (result) => researchV2RunRecord(result)
+  },
+  full: {
+    handler: (args) => full(args),
+    runType: "FULL_RESEARCH_ACCEPTANCE",
+    record: (result) => ({
+      summary: {
+        stages: {
+          optimization: result?.optimization ?? null,
+          counterfactual: result?.counterfactual ?? null
+        },
+        safety: result?.safety ?? null
+      }
+    })
+  },
+  "research:register-candidate": { exempt: true, handler: () => registerCandidate() },
+  "research:runs": { exempt: true, handler: () => showResearchRuns() }
+};
+
+async function registerCandidate() {
+  // 只是登记一份真实存在的源码及其哈希，不是研究结果：没有跑过 OOS，
+  // 因此 lifecycle 为 CANDIDATE、promotion 明确为 BLOCKED。
+  const { readFile } = await import("node:fs/promises");
+  const { sha256 } = await import("./research-utils.mjs");
+  const source = await readFile(new URL("./data-tiered-strategy.mjs", import.meta.url), "utf8");
+  const codeSha256 = sha256(source);
+  const registered = registerResearchStrategyVersion({
+    version: DATA_TIERED_PARAMETERS.version,
+    role: "CHALLENGER",
+    lifecycleStatus: "CANDIDATE",
+    strategyHash: codeSha256,
+    codeSha256,
+    parameters: DATA_TIERED_PARAMETERS,
+    featureSet: ["FROZEN_V12_DIRECTION", "TIERED_DATA_QUALITY_GATE"],
+    promotionReason: "BLOCKED: no OOS/Shadow evidence has been produced for this candidate yet",
+    rollbackVersion: "V1.2-FROZEN"
+  });
+  process.stdout.write(`${JSON.stringify({
+    registered: registered.version, role: registered.role,
+    lifecycleStatus: registered.lifecycle_status, codeSha256,
+    registryPath: RESEARCH_REGISTRY.path,
+    championUnchanged: "V1.2-FROZEN"
+  }, null, 2)}\n`);
+}
+
+function showResearchRuns() {
+  return withResearchRegistry((db) => {
+    const runs = db.getResearchRuns({ limit: 1_000_000 });
+    process.stdout.write(`${JSON.stringify({
+      registryPath: RESEARCH_REGISTRY.path,
+      registryPathSource: RESEARCH_REGISTRY.pathSource,
+      productionPaperDatabasePath: RESEARCH_REGISTRY.productionPaperDatabasePath,
+      persistedResearchRuns: runs.length,
+      registeredStrategyVersions: db.getStrategyVersions({ limit: 1_000_000 }).length,
+      runs: runs.slice(0, 20).map((item) => ({
+        id: item.id, runType: item.run_type, status: item.status,
+        finishedAt: item.finished_at, strategyVersion: item.strategy_version
+      }))
+    }, null, 2)}\n`);
+  });
+}
+
+export const RESEARCH_COMMANDS = Object.freeze(Object.keys(COMMANDS));
+export const EXEMPT_RESEARCH_COMMANDS = Object.freeze(
+  Object.entries(COMMANDS).filter(([, entry]) => entry.exempt).map(([name]) => name)
+);
+
+/**
+ * 执行一个研究命令并保证「恰好一条顶层 run」。
+ *
+ * 成功 → 一条 PASSED/PARTIAL；失败 → 一条 BLOCKED/FAILED。
+ * 导出出来是为了可以直接对这条不变量写测试，而不是只能靠子进程观察。
+ */
+export async function executeResearchCommand({
+  command,
+  args = {},
+  startedAt = new Date().toISOString(),
+  commands = COMMANDS,
+  persist = recordRun
+} = {}) {
+  const entry = commands[command];
+  try {
+    if (!entry) throw new Error(`Unknown research command: ${command}`);
+    const result = await entry.handler(args);
+    if (entry.exempt) return { command, exempt: true, recorded: null, result };
+    const record = entry.record?.(result) ?? {};
+    const recorded = await persist(entry.runType, startedAt, record.status ?? "PASSED", record);
+    return { command, exempt: false, recorded, result };
+  } catch (error) {
+    // 失败也必须留痕，而且必须分类：外部前置条件缺失是 BLOCKED，
+    // 代码异常/断言失败/用法错误是 FAILED，不允许一律记 BLOCKED。
+    if (entry && !entry.exempt) {
+      const { status, interpretation } = classifyResearchFailure(error);
+      await persist(entry.runType, startedAt, status, {
+        summary: {
+          command,
+          arguments: args,
+          failureReason: error.message,
+          errorName: error.name ?? null,
+          errorCode: error.code ?? null,
+          interpretation
+        }
+      });
+    }
+    throw error;
+  }
+}
+
+const command = process.argv[2] ?? "data:inspect";
+const args = argumentsMap();
+const commandStartedAt = new Date().toISOString();
+
 // 这个文件既是 CLI 入口，也导出 classifyResearchFailure / capitalOptions 等给测试与其它模块使用。
 // 只有作为进程入口被直接执行时才跑命令派发；被 import 时绝不能顺手启动一次研究运行。
 const invokedDirectly = Boolean(process.argv[1])
   && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-const command = process.argv[2] ?? "data:inspect";
-const args = argumentsMap();
-const commandStartedAt = new Date().toISOString();
-// 只读命令没有「研究结果」可言，失败时不需要登记。
-const REGISTRY_EXEMPT_COMMANDS = new Set(["data:inspect", "research:runs", "research:register-candidate"]);
-if (invokedDirectly) try {
-  if (command === "data:update") await dataUpdate(args);
-  else if (command === "data:inspect") {
-    const dataset = await load(args);
-    process.stdout.write(`${JSON.stringify({ directory: dataset.directory, manifest: dataset.manifest }, null, 2)}\n`);
-  } else if (command === "backtest") await backtest(args);
-  else if (command === "replay") await replay(args);
-  else if (command === "validate") await validation(args);
-  else if (command === "similarity") await similarity(args);
-  else if (command === "robustness") await robustness(args);
-  else if (command === "counterfactual") await counterfactual(args);
-  else if (command === "external:audit") await externalAudit(args);
-  else if (command === "optimize") await optimize(args);
-  else if (command === "diagnose") await diagnose(args);
-  else if (command === "ablation") await ablation(args);
-  else if (command === "edge:pipeline") await edgePipeline(args);
-  else if (command === "tradable-edge") await tradableEdge(args);
-  else if (command === "anti-chase") await antiChase(args);
-  else if (command === "research:v2") await researchV2(args);
-  else if (command === "research:register-candidate") {
-    // 把 V1.3-DATA-TIERED 登记为 CANDIDATE。这只是登记一份真实存在的源码及其哈希，
-    // 不是研究结果：没有跑过 OOS，因此 lifecycle 为 REGISTERED、promotion 为 BLOCKED。
-    const { readFile } = await import("node:fs/promises");
-    const { sha256 } = await import("./research-utils.mjs");
-    const { DATA_TIERED_PARAMETERS } = await import("./data-tiered-strategy.mjs");
-    const source = await readFile(new URL("./data-tiered-strategy.mjs", import.meta.url), "utf8");
-    const codeSha256 = sha256(source);
-    const registered = await withResearchRegistry((db) => db.registerStrategyVersion({
-      version: DATA_TIERED_PARAMETERS.version,
-      role: "CHALLENGER",
-      lifecycleStatus: "CANDIDATE",
-      strategyHash: codeSha256,
-      codeSha256,
-      parameters: DATA_TIERED_PARAMETERS,
-      featureSet: ["FROZEN_V12_DIRECTION", "TIERED_DATA_QUALITY_GATE"],
-      promotionReason: "BLOCKED: no OOS/Shadow evidence has been produced for this candidate yet",
-      rollbackVersion: "V1.2-FROZEN"
-    }));
-    process.stdout.write(`${JSON.stringify({
-      registered: registered.version, role: registered.role,
-      lifecycleStatus: registered.lifecycle_status, codeSha256,
-      championUnchanged: "V1.2-FROZEN"
-    }, null, 2)}\n`);
+if (invokedDirectly) {
+  try {
+    await executeResearchCommand({ command, args, startedAt: commandStartedAt });
+  } catch (error) {
+    process.stderr.write(`Research command failed safely: ${error.stack ?? error.message}\n`);
+    process.exitCode = 1;
   }
-  else if (command === "research:runs") {
-    // 直接回答「SQLite 里到底登记了多少次研究运行 / 多少个策略版本」。
-    await withResearchRegistry((db) => {
-      const runs = db.getResearchRuns({ limit: 1_000_000 });
-      process.stdout.write(`${JSON.stringify({
-        registryPath: researchRegistryPath(),
-        persistedResearchRuns: runs.length,
-        registeredStrategyVersions: db.getStrategyVersions({ limit: 1_000_000 }).length,
-        runs: runs.slice(0, 20).map((item) => ({
-          id: item.id, runType: item.run_type, status: item.status,
-          finishedAt: item.finished_at, strategyVersion: item.strategy_version
-        }))
-      }, null, 2)}\n`);
-    });
-  }
-  else if (command === "full") await full(args);
-  else throw new Error(`Unknown research command: ${command}`);
-} catch (error) {
-  process.stderr.write(`Research command failed safely: ${error.stack ?? error.message}\n`);
-  // 失败也必须留痕。一次因为没有数据目录、或者公网不可达而跑不起来的研究，
-  // 应该在登记簿里以 BLOCKED 出现，而不是悄悄消失、让 run count 看起来像“从没试过”。
-  if (!REGISTRY_EXEMPT_COMMANDS.has(command)) {
-    const { status, interpretation } = classifyResearchFailure(error);
-    await recordRun(`RESEARCH_CLI_${command.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`, commandStartedAt, status, {
-      summary: {
-        command,
-        arguments: args,
-        failureReason: error.message,
-        errorName: error.name ?? null,
-        errorCode: error.code ?? null,
-        interpretation
-      }
-    });
-  }
-  process.exitCode = 1;
 }

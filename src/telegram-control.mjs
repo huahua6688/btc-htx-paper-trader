@@ -8,6 +8,16 @@ import {
   sendTelegramMessage,
   telegramEnabled
 } from "./telegram-client.mjs";
+// 只读访问研究登记簿。Telegram 绝不 import 研究 CLI 入口，
+// 也绝不因为查看页面而写入研究数据库。
+import { RESEARCH_REGISTRY, researchRegistrySnapshot, researchRunsByType } from "./research-registry.mjs";
+
+// Champion 的身份以冻结源码为准，即使登记簿还没建立也必须显示得出来。
+const FROZEN_CHAMPION = Object.freeze({
+  version: "V1.2-FROZEN",
+  lifecycleStatus: "FROZEN",
+  sha256: "9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6"
+});
 
 const n = (value, digits = 2) => value !== null && value !== undefined && Number.isFinite(Number(value))
   ? Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })
@@ -248,53 +258,78 @@ function marginPanel(settings) {
   };
 }
 
-function championText(db) {
-  const champion = db.getStrategyVersions().find((item) => item.role === "CHAMPION");
+// Champion 的实时状态以生产 Paper 库和冻结源码为准；
+// Challenger / 研究运行 / 相似行情 / 研究结果一律从独立的研究登记簿只读读取。
+function championText(db, registryPath) {
   const snapshot = db.getLatestSnapshot();
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
+  const champion = registry.strategyVersions.find((item) => item.role === "CHAMPION") ?? null;
   return [
     "👑 Paper Champion",
-    `版本：${champion?.version ?? "未登记"}`,
-    `状态：${champion?.lifecycle_status ?? "—"}`,
-    `SHA-256：${champion?.strategy_hash ?? "—"}`,
+    `版本：${champion?.version ?? FROZEN_CHAMPION.version}`,
+    `状态：${champion?.lifecycle_status ?? FROZEN_CHAMPION.lifecycleStatus}`,
+    `SHA-256：${champion?.strategy_hash ?? FROZEN_CHAMPION.sha256}`,
     `最近判断：${snapshot?.decision ?? "尚无"}`,
+    `数据门禁政策：${db.getRuntimeSettings()?.dataPolicyMode ?? "FROZEN_V12_STRICT"}`,
     "冻结 Champion 不允许原地改参数；新版本只能从 Challenger 完整验证后晋级，并保留回滚点。"
   ].join("\n");
 }
 
-function shadowText(db) {
-  const challengers = db.getStrategyVersions().filter((item) => item.role === "CHALLENGER");
+function registryFooter(registry) {
+  return registry.available
+    ? `登记簿：${registry.path}（只读读取，不写入）`
+    : `登记簿尚未创建：${registry.path}`;
+}
+
+function shadowText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
+  const challengers = registry.strategyVersions.filter((item) => item.role === "CHALLENGER");
   return [
     "👥 Challenger / Shadow",
-    ...(challengers.length ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${item.strategy_hash.slice(0, 16)}…`) : ["尚无已登记且通过前置验证的 Challenger。"]),
-    "Shadow 使用独立 SQLite，不能影响 Champion 账户。未证明净 edge 的候选不会晋级。"
+    ...(challengers.length
+      ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${String(item.strategy_hash ?? "").slice(0, 16)}…`)
+      : ["尚无研究记录：还没有登记任何 Challenger。"]),
+    "Shadow 使用独立 SQLite，不能影响 Champion 账户。未证明净 edge 的候选不会晋级。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function learningText(db) {
-  const versions = db.getStrategyVersions();
-  const runs = db.getResearchRuns({ limit: 8 });
+function learningText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 8, path: registryPath });
+  const runs = registry.researchRuns;
   return [
     "🧠 Strategy Learning",
     "闭环：Candidate → Replay → Walk-forward/Purged OOS → untouched Final OOS → Monte Carlo → Shadow → Promotion Gate。",
-    `已登记策略版本：${versions.length}；已持久化研究运行：${runs.length}`,
-    ...(runs.slice(0, 5).map((item) => `- ${item.run_type}：${item.status}（${item.finished_at}）`)),
-    "自动学习不会按单笔输赢即时调参，也不会用已使用 Final OOS 继续选策略。"
+    `已登记策略版本：${registry.strategyVersionCount}；已持久化研究运行：${registry.researchRunCount}`,
+    ...(runs.length
+      ? runs.slice(0, 5).map((item) => `- ${item.run_type}：${item.status}（${item.finished_at}）`)
+      : ["尚无研究记录。"]),
+    "自动学习不会按单笔输赢即时调参，也不会用已使用 Final OOS 继续选策略。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function similarityText(db) {
-  const run = db.getResearchRuns({ limit: 1, runType: "HISTORICAL_SIMILARITY" })[0];
+function similarityText(registryPath) {
+  const run = researchRunsByType("HISTORICAL_SIMILARITY", { limit: 1, path: registryPath })[0] ?? null;
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
   return [
     "📊 Historical Similarity",
-    run ? `最近运行：${run.finished_at}\n状态：${run.status}\n${JSON.stringify(run.summary)}` : "数据库内尚无新的相似行情运行摘要；不会伪造概率。样本不足时必须显示 insufficient evidence。"
+    run
+      ? `最近运行：${run.finished_at}\n状态：${run.status}\n${JSON.stringify(run.summary)}`
+      : "尚无研究记录：登记簿里还没有相似行情运行摘要；不会伪造概率。样本不足时必须显示 insufficient evidence。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function researchResultsText(db) {
-  const runs = db.getResearchRuns({ limit: 10 });
+function researchResultsText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 10, path: registryPath });
+  const runs = registry.researchRuns;
   return [
     "📚 Research Results",
-    ...(runs.length ? runs.map((item) => `- ${item.run_type} / ${item.status} / ${item.finished_at}`) : ["尚无写入生产 SQLite 的研究摘要；research-output 原始产物不会被假装成数据库结果。"])
+    ...(runs.length
+      ? runs.map((item) => `- ${item.run_type} / ${item.status} / ${item.finished_at}`)
+      : ["尚无研究记录；research-output 原始产物不会被假装成数据库结果。"]),
+    registryFooter(registry)
   ].join("\n");
 }
 
@@ -472,8 +507,11 @@ export class TelegramControlPanel {
     getUpdates = getTelegramUpdates,
     send = sendTelegramMessage,
     edit = editTelegramMessage,
-    answer = answerTelegramCallback
+    answer = answerTelegramCallback,
+    // 研究登记簿路径可注入，便于测试与自定义部署；默认走 research-registry 的解析结果。
+    researchRegistryPath = RESEARCH_REGISTRY.path
   } = {}) {
+    this.researchRegistryPath = researchRegistryPath;
     this.db = db;
     this.config = config;
     this.fetchImpl = fetchImpl;
@@ -559,11 +597,11 @@ export class TelegramControlPanel {
     if (name === "position-mode") return positionModePanel(settings);
     if (name === "profile") return indicatorProfilePanel(settings);
     if (name === "cycle") return cyclePanel(settings);
-    if (name === "champion") return { text: championText(this.db), markup: main };
-    if (name === "shadow") return { text: shadowText(this.db), markup: main };
-    if (name === "learning") return { text: learningText(this.db), markup: main };
-    if (name === "similarity") return { text: similarityText(this.db), markup: main };
-    if (name === "results") return { text: researchResultsText(this.db), markup: main };
+    if (name === "champion") return { text: championText(this.db, this.researchRegistryPath), markup: main };
+    if (name === "shadow") return { text: shadowText(this.researchRegistryPath), markup: main };
+    if (name === "learning") return { text: learningText(this.researchRegistryPath), markup: main };
+    if (name === "similarity") return { text: similarityText(this.researchRegistryPath), markup: main };
+    if (name === "results") return { text: researchResultsText(this.researchRegistryPath), markup: main };
     if (name.startsWith("range-")) return rangeControlPanel(settings, name.slice("range-".length));
     if (name === "recent") return { text: recentText(this.db), markup: main };
     return { text: settingsText(settings), markup: main };

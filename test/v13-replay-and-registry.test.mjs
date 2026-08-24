@@ -177,23 +177,36 @@ test("research runs record the real status; PARTIAL is not dressed up and BLOCKE
   });
 });
 
-test("one CLI invocation of the V2 pipeline records exactly one top-level run", async () => {
-  // recordPipelineRun=false 时管线不再自行登记，顶层 run 由 CLI 唯一登记，
-  // 子阶段以 stage/evidence 形式挂在那一条 run 的 summary 里。
-  const source = await (await import("node:fs/promises"))
-    .readFile(new URL("../src/research-v2-pipeline.mjs", import.meta.url), "utf8");
-  assert.match(source, /recordPipelineRun = true/, "管线必须提供可关闭的自登记开关");
-  assert.match(source, /if \(recordPipelineRun\) \{/, "自登记必须受该开关控制");
+test("one CLI invocation maps to exactly one top-level run, sub-stages stay in the summary", async () => {
+  const { RESEARCH_COMMANDS, EXEMPT_RESEARCH_COMMANDS } = await import("../src/research-cli.mjs");
+  // 复核要求覆盖的每一个研究命令都必须在命令表里，并且不是 exempt。
+  const mustRecord = [
+    "backtest", "replay", "validate", "similarity", "robustness", "counterfactual",
+    "external:audit", "optimize", "diagnose", "ablation", "edge:pipeline",
+    "tradable-edge", "anti-chase", "full", "research:v2"
+  ];
+  for (const name of mustRecord) {
+    assert.ok(RESEARCH_COMMANDS.includes(name), `${name} 必须在命令表中`);
+    assert.ok(!EXEMPT_RESEARCH_COMMANDS.includes(name), `${name} 不得被豁免登记`);
+  }
+  for (const name of ["data:inspect", "research:runs", "research:register-candidate"]) {
+    assert.ok(EXEMPT_RESEARCH_COMMANDS.includes(name), `${name} 应当是豁免的纯查询命令`);
+  }
 
-  const cli = await (await import("node:fs/promises"))
-    .readFile(new URL("../src/research-cli.mjs", import.meta.url), "utf8");
+  const read = (await import("node:fs/promises")).readFile;
+  // 管线不再自行登记，顶层 run 唯一由 dispatcher 写入。
+  const pipeline = await read(new URL("../src/research-v2-pipeline.mjs", import.meta.url), "utf8");
+  assert.match(pipeline, /recordPipelineRun = true/, "管线必须提供可关闭的自登记开关");
+  assert.match(pipeline, /if \(recordPipelineRun\) \{/, "自登记必须受该开关控制");
+  const cli = await read(new URL("../src/research-cli.mjs", import.meta.url), "utf8");
   assert.match(cli, /recordPipelineRun: false/, "CLI 必须关闭管线自登记以避免重复登记");
-  // 字段名必须是管线真实返回的 promotion / finalUntouchedOos。
-  assert.match(cli, /result\?\.promotion \?\? null/);
-  assert.match(cli, /result\?\.finalUntouchedOos \?\? null/);
-  assert.doesNotMatch(cli, /promotionGate/, "promotionGate 这个字段并不存在，必须移除");
+  // 各处理函数不得再各自登记；登记只发生在 dispatcher 的成功/失败两条路径。
+  assert.equal((cli.match(/await persist\(/g) ?? []).length, 2,
+    "登记只应在 dispatcher 的成功路径和失败路径各发生一次");
+  const handlerRegion = cli.slice(cli.indexOf("async function backtest(args)"), cli.indexOf("export async function executeResearchCommand"));
+  assert.doesNotMatch(handlerRegion, /await recordRun\(/,
+    "各命令处理函数不得自行登记顶层 run");
 });
-
 test("strategyOption only accepts registered replay strategies", () => {
   assert.equal(strategyOption({ strategy: "data-tiered" }, "strategy", "challenger"), "data-tiered");
   assert.equal(strategyOption({}, "strategy", "challenger"), "challenger");
@@ -214,9 +227,11 @@ test("a bogus strategy is FAILED while a missing dataset is BLOCKED", async () =
 });
 
 test("replay and validate expose the V1.3 candidate through the CLI", async () => {
+  const { RESEARCH_COMMANDS } = await import("../src/research-cli.mjs");
+  assert.ok(RESEARCH_COMMANDS.includes("replay"), "必须有单策略回放入口，V1.3 才能进入研究路径");
+  assert.ok(RESEARCH_COMMANDS.includes("validate"));
   const cli = await (await import("node:fs/promises"))
     .readFile(new URL("../src/research-cli.mjs", import.meta.url), "utf8");
-  assert.match(cli, /command === "replay"/, "必须有单策略回放入口，V1.3 才能进入研究路径");
   assert.match(cli, /candidateStrategy,/, "validate 必须能把候选策略传给 walk-forward/Purged OOS");
   // 参数校验必须发生在数据集加载之前，否则未知策略会被误判成 BLOCKED。
   const replayBody = cli.slice(cli.indexOf("async function replay(args)"), cli.indexOf("async function validation(args)"));
@@ -226,10 +241,22 @@ test("replay and validate expose the V1.3 candidate through the CLI", async () =
   );
 });
 
-test("the V2 pipeline result field names the CLI reads actually exist", async () => {
-  const source = await (await import("node:fs/promises"))
-    .readFile(new URL("../src/research-v2-pipeline.mjs", import.meta.url), "utf8");
+test("research:v2 reads the real selectionEvidence field names", async () => {
+  const read = (await import("node:fs/promises")).readFile;
+  const source = await read(new URL("../src/research-v2-pipeline.mjs", import.meta.url), "utf8");
+  // 管线真实产出的字段。
   assert.match(source, /finalUntouchedOos: finalOos/);
   assert.match(source, /promotion: \{/);
+  assert.match(source, /selectedForFurtherValidation: selected/);
+  assert.match(source, /bestDiagnosticOnly: !selected/);
   assert.doesNotMatch(source, /promotionGate:/);
+
+  const cli = await read(new URL("../src/research-cli.mjs", import.meta.url), "utf8");
+  assert.match(cli, /selectedForFurtherValidation\?\.version/,
+    "strategyVersion 必须读真实字段 selectedForFurtherValidation");
+  assert.match(cli, /bestDiagnosticOnly\?\.version/,
+    "没有候选通过 gate 时必须退回 diagnostic candidate，而不是因为字段名写错变成 null");
+  assert.doesNotMatch(cli, /selectionEvidence\?\.selected\?\./,
+    "selectionEvidence.selected 这个字段并不存在");
+  assert.doesNotMatch(cli, /promotionGate/, "promotionGate 这个字段并不存在，必须移除");
 });

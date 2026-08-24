@@ -108,9 +108,22 @@ margin / notional / totalRisk 同样直接进入 `buildPaperCandidate`。
 
 修复前只有 `research-v2-pipeline.mjs` 会写 `research_runs`，而该模块没有任何 CLI 入口，
 等于永远不会执行——这就是「已登记策略版本 1 / 已持久化研究运行 0」的原因。
-现在所有研究命令都会把运行结果登记进独立的研究 SQLite（`research-output/research-registry.sqlite`，
-不是生产 Paper 库）。一次 CLI invocation 只产生**一条顶层 run**，子阶段作为 stage/evidence
-放进这条 run 的 summary，管线不再自行重复登记。
+现在所有研究命令都会把运行结果登记进独立的研究 SQLite。一次 CLI invocation 只产生
+**一条顶层 run**（成功 PASSED/PARTIAL，失败 BLOCKED/FAILED），子阶段作为 `summary.stages`
+evidence 放进这条 run，管线不再自行重复登记。覆盖 `backtest / replay / validate / similarity /
+robustness / counterfactual / external:audit / optimize / diagnose / ablation / edge:pipeline /
+tradable-edge / anti-chase / full / research:v2 / data:update`；
+`data:inspect / research:runs / research:register-candidate` 是纯查询/登记命令，明确豁免。
+
+**登记簿位置**：默认与生产 Paper 库同级的持久化目录（例如
+`/var/lib/btc-htx-paper/research-registry.sqlite`），**不是**随时可清空的 `research-output/`。
+可用 `PAPER_RESEARCH_DB_PATH`、`RESEARCH_DB_PATH` 或 `--research-db=` 配置，
+但解析结果绝不允许指向生产 Paper 库或 Shadow 库（会直接报错）。
+
+**Telegram 接通**：Strategy Learning、Challenger / Shadow、Historical Similarity、
+Research Results 全部从研究登记簿**只读**读取，因此 CLI 一旦成功持久化，面板立刻能看到，
+不会再出现「CLI 写了、面板显示 0 条」。Champion 的实时状态仍以生产 Paper 库和冻结源码为准。
+登记簿不存在时面板安全显示「尚无研究记录」，不会崩溃，也不会因为查看页面而创建或改动研究数据库。
 
 失败必须分类，不允许一律记 BLOCKED：
 
