@@ -30,13 +30,17 @@ function formatStatus(status) {
 
 function formatCheck(result) {
   const digest = result.selectedAsset.digest ?? "官方未提供";
+  const update = result.updateAvailable === null ? "无法确定（本地 release/asset 身份不足）" : result.updateAvailable ? "是" : "否";
   return [
     "HTX 官方 CLI 上游检查（未修改生产文件）",
     `Installed：${result.installed.release ?? "未安装/身份未知"} / ${short(result.installed.sha256)}…`,
     `Upstream：${result.upstream.tag} / release #${result.upstream.id} / commit ${short(result.upstream.commitSha)}…`,
     `Asset：${result.selectedAsset.name} / ${result.selectedAsset.size} bytes`,
     `官方 Release digest：${digest}`,
-    `需要更新：${result.updateAvailable ? "是" : "否"}`,
+    `officialChecksumProvided：${result.officialChecksumProvided}`,
+    `官方 checksum 已验证：${result.officialChecksumVerified ? "是" : "否"}`,
+    `比较依据：${result.comparison}`,
+    `需要更新：${update}`,
     "htx:check 只读 GitHub Release API，不下载、不替换 binary。"
   ].join("\n");
 }

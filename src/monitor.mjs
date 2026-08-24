@@ -10,7 +10,7 @@ import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2 } from "./research-challenger-v2.mjs";
 import { openMarketArchive } from "./market-archive.mjs";
-import { getHtxInstalledStatus } from "./htx-upstream.mjs";
+import { resolveHtxArchiveIdentity } from "./htx-upstream.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
@@ -59,12 +59,10 @@ try {
   process.stderr.write(`HTX Market Archive disabled safely for this process: ${error.message}\n`);
 }
 try {
-  const installed = await getHtxInstalledStatus({ verifyHash: false });
-  htxIdentity = {
-    release: installed.installedMetadata?.release?.tag ?? installed.sourceManifest?.release?.tag ?? null,
-    sha256: installed.installedMetadata?.installedSha256 ?? installed.installedSha256 ?? null
-  };
+  htxIdentity = await resolveHtxArchiveIdentity();
 } catch (error) {
+  // resolveHtxArchiveIdentity is already fail-safe; retain this final boundary so
+  // provenance collection can never prevent Paper Monitor startup.
   process.stderr.write(`HTX CLI identity unavailable for archive provenance: ${error.message}\n`);
 }
 let stopped = false;

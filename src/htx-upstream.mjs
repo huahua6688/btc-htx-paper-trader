@@ -163,11 +163,56 @@ export async function getHtxInstalledStatus({
     sourceManifest,
     lockedAsset,
     lastCheck,
-    upstreamUpdateAvailable: lastCheck?.upstream?.tag
-      ? installedMetadata?.release?.tag
-        ? lastCheck.upstream.tag !== installedMetadata.release.tag
-        : typeof lastCheck.updateAvailable === "boolean" ? lastCheck.updateAvailable : null
+    upstreamUpdateAvailable: lastCheck && Object.hasOwn(lastCheck, "updateAvailable")
+      ? lastCheck.updateAvailable
       : null
+  };
+}
+
+export async function resolveHtxArchiveIdentity({
+  environment = process.env,
+  cliPath = resolveCliPath(),
+  statusProvider = getHtxInstalledStatus,
+  hashProvider = sha256File,
+  warn = (message) => process.stderr.write(`${message}\n`)
+} = {}) {
+  let installed;
+  try {
+    // Read metadata without hashing here. The binary is hashed exactly once below,
+    // at monitor process startup, and the resulting identity is reused by every cycle.
+    installed = await statusProvider({ environment, cliPath, verifyHash: false });
+  } catch (error) {
+    const message = `HTX CLI identity unavailable for archive provenance: ${error.message}`;
+    warn(message);
+    return { release: null, sha256: null, metadataSha256: null, warnings: [message] };
+  }
+
+  const warnings = [];
+  let actualSha256 = null;
+  if (installed.installed) {
+    try {
+      actualSha256 = await hashProvider(installed.cliPath ?? cliPath);
+    } catch (error) {
+      const message = `HTX CLI binary SHA-256 unavailable for archive provenance: ${error.message}`;
+      warnings.push(message);
+      warn(message);
+    }
+  }
+
+  const metadataSha256 = installed.installedMetadata?.installedSha256 ?? null;
+  if (actualSha256 && metadataSha256 && actualSha256 !== metadataSha256) {
+    const message = `HTX CLI metadata SHA-256 mismatch: archive will use actual binary SHA-256 ${actualSha256}`;
+    warnings.push(message);
+    warn(message);
+  }
+
+  return {
+    release: installed.installedMetadata?.release?.tag ?? installed.sourceManifest?.release?.tag ?? null,
+    // Never substitute a metadata digest for the actual binary digest. A failed
+    // hash remains explicit null so provenance cannot silently claim the wrong CLI.
+    sha256: actualSha256,
+    metadataSha256,
+    warnings
   };
 }
 
@@ -239,20 +284,54 @@ export function buildHtxCapabilityReport(compatibility = null) {
 
 export async function checkHtxUpstream(options = {}) {
   const upstream = await (options.releaseProvider ?? fetchLatestHtxRelease)(options);
-  const installed = await getHtxInstalledStatus(options);
+  const installed = await (options.installedStatusProvider ?? getHtxInstalledStatus)(options);
   const assetName = platformAssetName(options);
   const asset = upstream.assets.find((item) => item.name === assetName) ?? null;
   if (!asset) throw new Error(`Official release ${upstream.tag} has no ${assetName} asset`);
+  const expectedSha256 = officialDigest(asset);
+  const installedRelease = installed.installedMetadata?.release ?? installed.sourceManifest?.release ?? null;
+  const installedAsset = installed.installedMetadata?.asset ?? installed.lockedAsset ?? null;
+  let updateAvailable = null;
+  let comparison;
+  if (!installed.installed) {
+    updateAvailable = true;
+    comparison = "NOT_INSTALLED";
+  } else if (expectedSha256) {
+    updateAvailable = installed.installedSha256
+      ? installed.installedSha256.toLowerCase() !== expectedSha256
+      : null;
+    comparison = installed.installedSha256 ? "OFFICIAL_SHA256" : "INSTALLED_SHA256_UNAVAILABLE";
+  } else if (installedRelease?.tag && installedAsset?.name) {
+    updateAvailable = installedRelease.tag !== upstream.tag || installedAsset.name !== asset.name;
+    comparison = updateAvailable ? "RELEASE_OR_ASSET_CHANGED" : "RELEASE_AND_ASSET_MATCH";
+  } else if (installedRelease?.tag) {
+    updateAvailable = installedRelease.tag !== upstream.tag;
+    comparison = updateAvailable ? "RELEASE_CHANGED" : "ASSET_IDENTITY_UNAVAILABLE";
+  } else if (installedAsset?.name && installedAsset.name !== asset.name) {
+    updateAvailable = true;
+    comparison = "ASSET_CHANGED";
+  } else {
+    // An absent official digest is not evidence that an update exists. Keep the
+    // result unknown when there is insufficient installed release identity.
+    comparison = "INSUFFICIENT_IDENTITY_WITHOUT_OFFICIAL_CHECKSUM";
+  }
   const result = {
     checkedAt: new Date().toISOString(),
     installed: {
       present: installed.installed,
-      release: installed.installedMetadata?.release?.tag ?? null,
+      release: installedRelease?.tag ?? null,
+      releaseId: installedRelease?.id ?? null,
+      commitSha: installedRelease?.commitSha ?? null,
+      assetName: installedAsset?.name ?? null,
       sha256: installed.installedSha256
     },
     upstream,
     selectedAsset: asset,
-    updateAvailable: !installed.installed || installed.installedSha256 !== String(asset.digest ?? "").replace(/^sha256:/i, "")
+    officialChecksumProvided: Boolean(expectedSha256),
+    officialChecksumVerified: Boolean(expectedSha256 && installed.installedSha256
+      && installed.installedSha256.toLowerCase() === expectedSha256),
+    comparison,
+    updateAvailable
   };
   await writeJsonAtomic(htxRuntimePaths(options.environment).upstreamCheck, result);
   return result;

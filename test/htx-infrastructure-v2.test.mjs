@@ -1,12 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
+import { gzipSync } from "node:zlib";
 import { openPaperDatabase } from "../src/db.mjs";
 import { runPublicCommandWithBinary } from "../src/htx-cli.mjs";
-import { platformAssetName, updateHtxCli } from "../src/htx-upstream.mjs";
+import {
+  checkHtxUpstream,
+  htxRuntimePaths,
+  platformAssetName,
+  resolveHtxArchiveIdentity,
+  updateHtxCli
+} from "../src/htx-upstream.mjs";
 import { MarketArchive } from "../src/market-archive.mjs";
 import { HtxPublicResearchClient, HTX_RESEARCH_ENDPOINTS } from "../src/htx-public-research-client.mjs";
 import { readDataInfrastructureStatusSync } from "../src/data-infrastructure-status.mjs";
@@ -119,6 +127,126 @@ test("HTX updater records a local digest without claiming an official checksum w
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("monitor archive identity hashes a manually installed binary without installed.json", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-runtime-identity-"));
+  const target = join(directory, "manual-cli.exe");
+  const content = Buffer.from("manually-installed-htx-cli");
+  await writeFile(target, content);
+  try {
+    const identity = await resolveHtxArchiveIdentity({
+      cliPath: target,
+      environment: { HTX_CLI_STATE_DIR: join(directory, "state") },
+      warn: () => {}
+    });
+    assert.equal(identity.sha256, sha256(content));
+    assert.equal(identity.metadataSha256, null);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("monitor warns on HTX metadata mismatch and archives the actual binary SHA", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-runtime-mismatch-"));
+  const target = join(directory, "cli.exe");
+  const environment = { HTX_CLI_STATE_DIR: join(directory, "state") };
+  const content = Buffer.from("actual-running-cli");
+  const metadataSha = "0".repeat(64);
+  await writeFile(target, content);
+  await mkdir(environment.HTX_CLI_STATE_DIR, { recursive: true });
+  await writeFile(htxRuntimePaths(environment).installedMetadata, JSON.stringify({
+    installedSha256: metadataSha,
+    release: { tag: "v2.0.0" },
+    asset: { name: platformAssetName() }
+  }));
+  const warnings = [];
+  try {
+    const identity = await resolveHtxArchiveIdentity({ cliPath: target, environment, warn: (message) => warnings.push(message) });
+    assert.equal(identity.sha256, sha256(content));
+    assert.equal(identity.metadataSha256, metadataSha);
+    assert.match(warnings.join(" "), /metadata SHA-256 mismatch/);
+
+    const archive = new MarketArchive(":memory:");
+    try {
+      archive.archiveSnapshot({ ticker: { status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78000" } } }, {
+        observedAt: "2026-08-24T00:00:01.000Z",
+        cliRelease: identity.release,
+        cliSha256: identity.sha256
+      });
+      assert.equal(archive.getEvent(1).cli_sha256, sha256(content));
+      assert.notEqual(archive.getEvent(1).cli_sha256, metadataSha);
+    } finally { archive.close(); }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("HTX binary SHA failure is warning-only and cannot crash monitor identity setup", async () => {
+  const warnings = [];
+  const identity = await resolveHtxArchiveIdentity({
+    statusProvider: async () => ({
+      installed: true,
+      cliPath: "unreadable-cli",
+      installedMetadata: { installedSha256: "f".repeat(64), release: { tag: "v2.0.0" } },
+      sourceManifest: null
+    }),
+    hashProvider: async () => { throw new Error("permission denied"); },
+    warn: (message) => warnings.push(message)
+  });
+  assert.equal(identity.sha256, null);
+  assert.match(warnings.join(" "), /permission denied/);
+});
+
+test("htx:check uses official digest when one is published", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-check-digest-"));
+  const content = Buffer.from("installed-official-cli");
+  const release = fakeRelease(content);
+  try {
+    const result = await checkHtxUpstream({
+      environment: { HTX_CLI_STATE_DIR: join(directory, "state") },
+      releaseProvider: async () => release,
+      installedStatusProvider: async () => ({
+        installed: true,
+        installedSha256: sha256(content),
+        installedMetadata: { release: { tag: release.tag }, asset: { name: platformAssetName() } },
+        sourceManifest: null,
+        lockedAsset: null
+      })
+    });
+    assert.equal(result.officialChecksumProvided, true);
+    assert.equal(result.officialChecksumVerified, true);
+    assert.equal(result.comparison, "OFFICIAL_SHA256");
+    assert.equal(result.updateAvailable, false);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("htx:check without digest compares release and asset instead of inventing an update", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-check-no-digest-"));
+  const release = fakeRelease(Buffer.from("no-digest"));
+  release.assets[0].digest = null;
+  const installedStatusProvider = async (tag) => ({
+    installed: true,
+    installedSha256: "a".repeat(64),
+    installedMetadata: { release: { id: 1, tag, commitSha: "a".repeat(40) }, asset: { name: platformAssetName() } },
+    sourceManifest: null,
+    lockedAsset: null
+  });
+  try {
+    const current = await checkHtxUpstream({
+      environment: { HTX_CLI_STATE_DIR: join(directory, "current") },
+      releaseProvider: async () => release,
+      installedStatusProvider: () => installedStatusProvider(release.tag)
+    });
+    assert.equal(current.officialChecksumProvided, false);
+    assert.equal(current.officialChecksumVerified, false);
+    assert.equal(current.comparison, "RELEASE_AND_ASSET_MATCH");
+    assert.equal(current.updateAvailable, false);
+
+    const newer = await checkHtxUpstream({
+      environment: { HTX_CLI_STATE_DIR: join(directory, "newer") },
+      releaseProvider: async () => release,
+      installedStatusProvider: () => installedStatusProvider("v9.9.8")
+    });
+    assert.equal(newer.updateAvailable, true);
+    assert.equal(newer.comparison, "RELEASE_OR_ASSET_CHANGED");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("HTX CLI subprocess receives no exchange or Telegram secrets", async () => {
   const secretNames = ["HTX_API_KEY", "HTX_SECRET_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_ADMIN_USER_ID"];
   const saved = Object.fromEntries(secretNames.map((key) => [key, process.env[key]]));
@@ -177,17 +305,85 @@ test("archive failure is a warning and cannot fail the monitor cycle", async () 
   } finally { db.close(); }
 });
 
-test("archive event unique key is idempotent and raw payload stays immutable", () => {
+test("archive deduplicates an identical event revision by raw SHA", () => {
   const archive = new MarketArchive(":memory:");
   const snapshot = { ticker: { status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78000" } } };
   try {
     const first = archive.archiveSnapshot(snapshot, { observedAt: "2026-08-24T00:00:01.000Z", cliRelease: "v2.0.0", cliSha256: "abc" });
-    const second = archive.archiveSnapshot({ ticker: { ...snapshot.ticker, tick: { close: "99999" } } }, { observedAt: "2026-08-24T00:00:02.000Z" });
+    const second = archive.archiveSnapshot(snapshot, { observedAt: "2026-08-24T00:00:02.000Z" });
     assert.equal(first.inserted, 1);
     assert.equal(second.inserted, 0);
     assert.equal(archive.count("ticker"), 1);
     assert.equal(archive.getEvent(1).raw.tick.close, "78000");
   } finally { archive.close(); }
+});
+
+test("archive preserves changed payload revisions at the same event time", () => {
+  const archive = new MarketArchive(":memory:");
+  const first = { ticker: { status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78000" } } };
+  const second = { ticker: { status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78100" } } };
+  try {
+    assert.equal(archive.archiveSnapshot(first, { observedAt: "2026-08-24T00:00:01.000Z" }).inserted, 1);
+    assert.equal(archive.archiveSnapshot(second, { observedAt: "2026-08-24T00:00:03.000Z" }).inserted, 1);
+    assert.equal(archive.count("ticker"), 2);
+    assert.equal(archive.getEvent(1).raw.tick.close, "78000");
+    assert.equal(archive.getEvent(2).raw.tick.close, "78100");
+    assert.notEqual(archive.getEvent(1).raw_sha256, archive.getEvent(2).raw_sha256);
+  } finally { archive.close(); }
+});
+
+test("point-in-time archive query selects the latest revision observed by visibleAt", () => {
+  const archive = new MarketArchive(":memory:");
+  const eventTime = Date.UTC(2026, 7, 24);
+  try {
+    archive.archiveSnapshot({ ticker: { status: "ok", ts: eventTime, tick: { close: "78000" } } }, { observedAt: "2026-08-24T00:00:01.000Z" });
+    archive.archiveSnapshot({ ticker: { status: "ok", ts: eventTime, tick: { close: "78100" } } }, { observedAt: "2026-08-24T00:00:03.000Z" });
+    const beforeAnyObservation = archive.getVisiblePayload("ticker", "2026-08-24T00:00:00.500Z");
+    const beforeRevision = archive.getVisiblePayload("ticker", "2026-08-24T00:00:02.000Z");
+    const afterRevision = archive.getVisiblePayload("ticker", "2026-08-24T00:00:04.000Z");
+    assert.equal(beforeAnyObservation.provenance, "HISTORICAL_UNAVAILABLE");
+    assert.equal(beforeRevision.payload.tick.close, "78000");
+    assert.equal(beforeRevision.observedAt, "2026-08-24T00:00:01.000Z");
+    assert.equal(afterRevision.payload.tick.close, "78100");
+    assert.equal(afterRevision.observedAt, "2026-08-24T00:00:03.000Z");
+  } finally { archive.close(); }
+});
+
+test("archive v2 unique-key migration is safe, preserves rows, and is idempotent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-archive-v2-migration-"));
+  const archivePath = join(directory, "market-archive.sqlite");
+  const raw = JSON.stringify({ status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78000" } });
+  const legacy = new DatabaseSync(archivePath);
+  legacy.exec(`
+    CREATE TABLE archive_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, source TEXT NOT NULL,
+      event_time INTEGER NOT NULL, observed_at TEXT NOT NULL, provenance TEXT NOT NULL,
+      schema_version INTEGER NOT NULL, raw_codec TEXT NOT NULL, raw_payload BLOB NOT NULL,
+      raw_sha256 TEXT NOT NULL, normalized_json TEXT NOT NULL, normalized_schema_version INTEGER NOT NULL,
+      cli_release TEXT, cli_sha256 TEXT, created_at TEXT NOT NULL,
+      UNIQUE(event_type, source, event_time)
+    );
+  `);
+  legacy.prepare(`INSERT INTO archive_events(
+    event_type, source, event_time, observed_at, provenance, schema_version, raw_codec, raw_payload,
+    raw_sha256, normalized_json, normalized_schema_version, cli_release, cli_sha256, created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run("ticker", "HTX_PUBLIC_CLI", Date.UTC(2026, 7, 24), "2026-08-24T00:00:01.000Z", "SELF_ARCHIVED", 2,
+      "gzip-json-utf8", gzipSync(Buffer.from(raw)), sha256(raw), JSON.stringify({ close: 78000 }), 2,
+      "v2.0.0", "abc", "2026-08-24T00:00:01.000Z");
+  legacy.close();
+  try {
+    const firstOpen = new MarketArchive(archivePath);
+    assert.equal(firstOpen.count("ticker"), 1);
+    assert.equal(firstOpen.getEvent(1).raw.tick.close, "78000");
+    assert.equal(firstOpen.archiveSnapshot({ ticker: { status: "ok", ts: Date.UTC(2026, 7, 24), tick: { close: "78100" } } }, { observedAt: "2026-08-24T00:00:03.000Z" }).inserted, 1);
+    firstOpen.close();
+
+    const secondOpen = new MarketArchive(archivePath);
+    assert.equal(secondOpen.count("ticker"), 2);
+    assert.equal(Number(secondOpen.db.prepare("SELECT COUNT(*) AS count FROM archive_schema_migrations WHERE version=3").get().count), 1);
+    secondOpen.close();
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("current Funding archives at observation time while preserving its future settlement time", () => {

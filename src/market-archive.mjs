@@ -9,7 +9,7 @@ import { collectProviderTimestamps } from "./market-context.mjs";
 import { HTX_RAW_PAYLOAD, normalizePublicCommandPayload } from "./htx-cli.mjs";
 
 const TYPE_METADATA = new Map(MARKET_TASKS.map(([key, skill, subcommand]) => [key, { skill, subcommand }]));
-const ARCHIVE_SCHEMA_VERSION = 2;
+const ARCHIVE_SCHEMA_VERSION = 3;
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
 function json(value) { return JSON.stringify(value ?? null); }
@@ -58,6 +58,30 @@ function decodeRaw(row) {
   return JSON.parse(gunzipSync(row.raw_payload).toString("utf8"));
 }
 
+function archiveEventsTableSql(tableName) {
+  if (!["archive_events", "archive_events_v3"].includes(tableName)) throw new Error("Invalid archive migration table name");
+  return `
+    CREATE TABLE ${tableName} (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      source TEXT NOT NULL,
+      event_time INTEGER NOT NULL,
+      observed_at TEXT NOT NULL,
+      provenance TEXT NOT NULL CHECK (provenance IN ('SELF_ARCHIVED','LIVE_OBSERVED')),
+      schema_version INTEGER NOT NULL,
+      raw_codec TEXT NOT NULL,
+      raw_payload BLOB NOT NULL,
+      raw_sha256 TEXT NOT NULL,
+      normalized_json TEXT NOT NULL,
+      normalized_schema_version INTEGER NOT NULL,
+      cli_release TEXT,
+      cli_sha256 TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(event_type, source, event_time, raw_sha256)
+    )
+  `;
+}
+
 export class MarketArchive {
   constructor(path = MARKET_ARCHIVE_CONFIG.path, { readOnly = false } = {}) {
     this.path = path;
@@ -73,25 +97,10 @@ export class MarketArchive {
 
   initialize() {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS archive_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_type TEXT NOT NULL,
-        source TEXT NOT NULL,
-        event_time INTEGER NOT NULL,
-        observed_at TEXT NOT NULL,
-        provenance TEXT NOT NULL CHECK (provenance IN ('SELF_ARCHIVED','LIVE_OBSERVED')),
-        schema_version INTEGER NOT NULL,
-        raw_codec TEXT NOT NULL,
-        raw_payload BLOB NOT NULL,
-        raw_sha256 TEXT NOT NULL,
-        normalized_json TEXT NOT NULL,
-        normalized_schema_version INTEGER NOT NULL,
-        cli_release TEXT,
-        cli_sha256 TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(event_type, source, event_time)
+      CREATE TABLE IF NOT EXISTS archive_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS archive_events_visible_idx ON archive_events(event_type, event_time, observed_at);
       CREATE TABLE IF NOT EXISTS archive_ingest_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         observed_at TEXT NOT NULL,
@@ -101,6 +110,49 @@ export class MarketArchive {
         errors_json TEXT NOT NULL
       );
     `);
+    const archiveEventsExists = Boolean(this.db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='archive_events'").get());
+    if (!archiveEventsExists) this.db.exec(archiveEventsTableSql("archive_events"));
+    this.migrateRevisionSchema();
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS archive_events_visible_idx
+        ON archive_events(event_type, source, event_time, observed_at);
+      PRAGMA user_version=${ARCHIVE_SCHEMA_VERSION};
+    `);
+    this.db.prepare("INSERT OR IGNORE INTO archive_schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(ARCHIVE_SCHEMA_VERSION, new Date().toISOString());
+  }
+
+  migrateRevisionSchema() {
+    const uniqueIndexes = this.db.prepare("PRAGMA index_list(archive_events)").all()
+      .filter((index) => Number(index.unique) === 1);
+    const hasRevisionIdentity = uniqueIndexes.some((index) => {
+      const columns = this.db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").all(index.name).map((row) => row.name);
+      return columns.join(",") === "event_type,source,event_time,raw_sha256";
+    });
+    if (hasRevisionIdentity) return;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec("DROP TABLE IF EXISTS archive_events_v3");
+      this.db.exec(archiveEventsTableSql("archive_events_v3"));
+      this.db.exec(`
+        INSERT OR IGNORE INTO archive_events_v3(
+          id, event_type, source, event_time, observed_at, provenance, schema_version,
+          raw_codec, raw_payload, raw_sha256, normalized_json, normalized_schema_version,
+          cli_release, cli_sha256, created_at
+        )
+        SELECT id, event_type, source, event_time, observed_at, provenance, schema_version,
+          raw_codec, raw_payload, raw_sha256, normalized_json, normalized_schema_version,
+          cli_release, cli_sha256, created_at
+        FROM archive_events ORDER BY id;
+        DROP TABLE archive_events;
+        ALTER TABLE archive_events_v3 RENAME TO archive_events;
+      `);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   archiveSnapshot(snapshot, {
@@ -181,7 +233,7 @@ export class MarketArchive {
     const row = this.db.prepare(`
       SELECT * FROM archive_events
       WHERE event_type=? AND source=? AND event_time<=? AND observed_at<=?
-      ORDER BY event_time DESC, id DESC LIMIT 1
+      ORDER BY event_time DESC, observed_at DESC, id DESC LIMIT 1
     `).get(type, source, visibleMs, visibleIso);
     if (!row) return { payload: null, provenance: "HISTORICAL_UNAVAILABLE", eventTime: null, observedAt: null, ageMs: null };
     const ageMs = visibleMs - Number(row.event_time);
