@@ -94,7 +94,10 @@ test("historical Dataset Manager downloads fixed public ranges, audits gaps, cac
     });
   };
   try {
-    const result = await updateHistoricalDataset({ from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), directory, fetchImpl });
+    const result = await updateHistoricalDataset({
+      from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(),
+      directory, fetchImpl, dataTypes: ["kline", "funding"]
+    });
     assert.equal(result.manifest.candles.count, 5);
     assert.equal(result.manifest.candles.missingRate, 0);
     assert.deepEqual(result.manifest.candles.gaps, []);

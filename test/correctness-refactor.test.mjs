@@ -10,6 +10,7 @@ import {
   classifyDataQuality,
   DATA_POLICIES,
   DATA_STATUS,
+  formatDataQuality,
   PROVENANCE
 } from "../src/data-quality.mjs";
 import { applyTieredDataPolicy, DATA_TIERED_PARAMETERS } from "../src/data-tiered-strategy.mjs";
@@ -123,6 +124,19 @@ test("historically unavailable is distinguished from a live failure and never sy
   });
   assert.deepEqual(liveQuality.liveFailureKeys, ["orderBook"]);
   assert.deepEqual(liveQuality.historicallyUnavailableKeys, []);
+});
+
+test("STALE replay evidence has its own quality bucket and display label", () => {
+  const report = fullReport();
+  report.derivatives = { ...report.derivatives, oiUsd: null };
+  const quality = classifyDataQuality(report, {
+    dataProvenance: { oiCurrent: PROVENANCE.STALE, oiHistory: PROVENANCE.STALE },
+    replay: { pointInTime: true, unavailableSources: ["openInterest"] }
+  }, { policy: DATA_POLICIES.TIERED_DEGRADED });
+  assert.ok(quality.staleKeys.includes("openInterest"));
+  assert.equal(quality.historicallyUnavailableKeys.includes("openInterest"), false);
+  assert.equal(quality.liveFailureKeys.includes("openInterest"), false);
+  assert.match(formatDataQuality(quality), /数据过期/);
 });
 
 test("historical replay without point-in-time depth is no longer forced to WAIT forever", () => {

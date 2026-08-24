@@ -12,11 +12,29 @@ function durationText(openedAt, closedAt) {
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
 }
 
-function closeReason(position, exit) {
+export function classifyCloseTelegram(position) {
+  if (["TP", "EARLY_PROFIT"].includes(position.exit_reason)) return "PROFIT";
+  if (position.exit_reason !== "SL") return "RISK_CONTROL";
+
+  const entry = Number(position.entry_price);
+  const stop = Number(position.stop_loss);
+  if (!Number.isFinite(entry) || !Number.isFinite(stop)) return "RISK_STOP";
+  const configuredTick = Number(position.price_tick ?? position.price_tick_size);
+  const tick = Number.isFinite(configuredTick) && configuredTick > 0 ? configuredTick : 0.1;
+  const tolerance = Math.max(tick, Math.abs(entry) * 1e-8, Number.EPSILON * Math.abs(entry) * 8);
+  const distance = stop - entry;
+  if (Math.abs(distance) <= tolerance) return "BREAKEVEN_STOP";
+  const protectsProfit = position.side === "LONG" ? distance > tolerance : distance < -tolerance;
+  return protectsProfit ? "PROFIT_PROTECT_STOP" : "RISK_STOP";
+}
+
+function closeReason(position, exit, classification) {
+  if (classification === "PROFIT_PROTECT_STOP") return "价格触及盈利保护止损";
+  if (classification === "BREAKEVEN_STOP") return "价格触及保本止损";
+  if (classification === "RISK_STOP") return "价格触及风险止损";
   if (exit?.managementReason) return exit.managementReason;
   const labels = {
     TP: "价格触及模拟止盈",
-    SL: "价格触及模拟止损",
     LIQUIDATION: "价格触及 Paper 估算强平区域",
     EARLY_PROFIT: "市场结构明显变化，提前保护利润",
     SIGNAL_INVALIDATED: "原开仓逻辑连续确认失效，提前控制亏损"
@@ -56,15 +74,23 @@ export function formatOpenTelegram(position) {
 }
 
 export function formatCloseTelegram(position, exit = null) {
-  const takeProfit = ["TP", "EARLY_PROFIT"].includes(position.exit_reason);
+  const classification = classifyCloseTelegram(position);
+  const heading = {
+    PROFIT: "✅ 模拟平仓（盈利）",
+    PROFIT_PROTECT_STOP: "🟢 模拟平仓（盈利保护）",
+    BREAKEVEN_STOP: "🟡 模拟平仓（保本保护）",
+    RISK_STOP: "🛑 模拟平仓（风险止损）",
+    RISK_CONTROL: "🛑 模拟平仓（风险控制）"
+  }[classification];
   const fees = Number(position.entry_fee_cny) + Number(position.exit_fee_cny);
   const slippage = Number(position.entry_slippage_cny ?? 0) + Number(position.exit_slippage_cny ?? 0);
   const returnPct = Number(position.account_equity_cny) > 0
     ? Number(position.net_pnl_cny) / Number(position.account_equity_cny)
     : null;
   return [
-    `${takeProfit ? "✅ 模拟平仓（盈利）" : "🛑 模拟平仓（风险控制）"} #${position.id}`,
-    `平仓原因：${closeReason(position, exit)}`,
+    `${heading} #${position.id}`,
+    `平仓原因：${closeReason(position, exit, classification)}`,
+    ...(classification === "PROFIT_PROTECT_STOP" ? [`保护止损：${number(position.stop_loss, 1)} USDT`] : []),
     `入场价：${number(position.entry_price, 1)} USDT`,
     `平仓价：${number(position.exit_price, 1)} USDT`,
     `持仓时间：${durationText(position.opened_at, position.closed_at)}`,

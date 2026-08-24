@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "sourceRepo": "https://github.com/htx-exchange/htx-skills-hub",
+  "release": {
+    "id": 335729036,
+    "tag": "v2.0.0",
+    "publishedAt": "2026-06-08T02:53:50Z",
+    "url": "https://github.com/htx-exchange/htx-skills-hub/releases/tag/v2.0.0",
+    "commitSha": "1b7094675c7c93931d6b424b8a8fa9c71bcca60e"
+  },
+  "assets": {
+    "linux-x64": {
+      "name": "htx-cli-linux-x64",
+      "size": 94738560,
+      "sha256": "cffbdebd18d22aa6367cb3779a735e3fbfabaaf03f0e559eac833130b5172fe0"
+    },
+    "win32-x64": {
+      "name": "htx-cli-windows-x64.exe",
+      "size": 98629632,
+      "sha256": "f53c7a79acf22f25a7e9ac4171211cdb5204bdf1f9906bbc01ee2a0d8c2f8cdc"
+    }
+  },
+  "capturedAt": "2026-08-24T00:00:00.000Z",
+  "identitySource": "GitHub Release API digest plus the release tag commit; no local binary is committed"
+}

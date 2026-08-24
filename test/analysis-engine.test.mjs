@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { analyzeSnapshot, deriveMarketRegime } from "../src/analysis-engine.mjs";
+import { normalizePublicCommandPayload } from "../src/htx-cli.mjs";
 
 const NOW_SECONDS = 1_780_000_000;
 
@@ -102,4 +103,41 @@ test("missing public market data is the hard gate and prevents paper entry", () 
   assert.equal(report.entryAssessment.enterNow, false);
   assert.equal(report.dataQuality.validForEntry, false);
   assert.match(report.riskGates.join(" "), /Order Book/);
+});
+
+test("HTX CLI v2 object payloads retain the exact shapes consumed by frozen V1.2", () => {
+  const now = NOW_SECONDS * 1000;
+  const upstream = {
+    oiCurrent: { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", ts: now, value: "1100000000" } },
+    oiHistory: { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", tick: [
+      { ts: now - 86_400_000, value: "1000000000" }, { ts: now, value: "1100000000" }
+    ] } },
+    eliteAccount: { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", list: [
+      { ts: now, buy_ratio: "0.58", sell_ratio: "0.42" }
+    ] } },
+    elitePosition: { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", list: [
+      { ts: now, buy_ratio: "0.55", sell_ratio: "0.45" }
+    ] } }
+  };
+  const adapted = {
+    oiCurrent: normalizePublicCommandPayload("oi-tracker", "current", upstream.oiCurrent),
+    oiHistory: normalizePublicCommandPayload("oi-tracker", "history", upstream.oiHistory),
+    eliteAccount: normalizePublicCommandPayload("elite-positioning", "account-ratio", upstream.eliteAccount),
+    elitePosition: normalizePublicCommandPayload("elite-positioning", "position-ratio", upstream.elitePosition)
+  };
+  assert.equal(Array.isArray(upstream.oiCurrent.data), false);
+  assert.equal(Array.isArray(adapted.oiCurrent.data), true);
+  assert.equal(Array.isArray(adapted.oiHistory.data), false);
+  assert.equal(Array.isArray(adapted.oiHistory.data.tick), true);
+  assert.equal(Array.isArray(adapted.eliteAccount.data), false);
+  assert.equal(Array.isArray(adapted.eliteAccount.data.list), true);
+  assert.equal(Array.isArray(adapted.elitePosition.data.list), true);
+
+  const report = analyzeSnapshot({ ...marketSnapshot({ direction: 1 }), ...adapted });
+  assert.equal(report.derivatives.oiUsd, 1_100_000_000);
+  assert.equal(report.derivatives.oiDelta24Pct, 10);
+  assert.equal(report.derivatives.eliteAccountRatio, 1.381);
+  assert.equal(report.derivatives.elitePositionRatio, 1.222);
+  assert.equal(report.dataQuality.validForEntry, true);
+  assert.equal(report.decision, "LONG", "adapter shape must not force frozen V1.2 into permanent WAIT");
 });

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PaperDatabase } from "../src/db.mjs";
 import { editTelegramMessage, sendTelegramMessage } from "../src/telegram-client.mjs";
-import { formatCloseTelegram, formatOpenTelegram } from "../src/telegram-format.mjs";
+import { classifyCloseTelegram, formatCloseTelegram, formatOpenTelegram } from "../src/telegram-format.mjs";
 import { shanghaiClock, TelegramNotifier } from "../src/telegram-notifier.mjs";
 import { directCandidate, paperReport } from "./helpers.mjs";
 
@@ -124,7 +124,78 @@ test("paper LONG/SHORT and TP/SL messages contain the required trade fields", ()
   assert.match(formatOpenTelegram({ ...common, side: "LONG" }), /模拟开多/);
   assert.match(formatOpenTelegram({ ...common, side: "SHORT" }), /模拟开空/);
   assert.match(formatCloseTelegram({ ...common, side: "LONG", exit_reason: "TP" }), /模拟止盈/);
-  assert.match(formatCloseTelegram({ ...common, side: "SHORT", exit_reason: "SL" }), /模拟止损/);
+  assert.match(formatCloseTelegram({ ...common, side: "SHORT", exit_reason: "SL", stop_loss: 105 }), /风险止损/);
+});
+
+function closePosition(overrides = {}) {
+  return {
+    id: 12,
+    side: "LONG",
+    exit_reason: "SL",
+    opened_at: "2026-08-21T01:00:00.000Z",
+    closed_at: "2026-08-21T02:00:00.000Z",
+    entry_price: 100,
+    stop_loss: 95,
+    exit_price: 95,
+    gross_pnl_cny: -5,
+    entry_fee_cny: 0.1,
+    exit_fee_cny: 0.1,
+    entry_slippage_cny: 0.02,
+    exit_slippage_cny: 0.02,
+    funding_cny: 0,
+    net_pnl_cny: -5.24,
+    account_equity_cny: 1000,
+    ...overrides
+  };
+}
+
+test("Telegram classifies LONG risk, profit-protect, and breakeven stops by stop location", () => {
+  const risk = closePosition({ side: "LONG", stop_loss: 95 });
+  const protectedProfit = closePosition({ side: "LONG", stop_loss: 105, exit_price: 105, net_pnl_cny: 4.7 });
+  const breakeven = closePosition({ side: "LONG", stop_loss: 100.05, exit_price: 100.05, net_pnl_cny: -0.2 });
+  assert.equal(classifyCloseTelegram(risk), "RISK_STOP");
+  assert.match(formatCloseTelegram(risk), /🛑 模拟平仓（风险止损）/);
+  assert.match(formatCloseTelegram(risk), /价格触及风险止损/);
+  assert.equal(classifyCloseTelegram(protectedProfit), "PROFIT_PROTECT_STOP");
+  assert.match(formatCloseTelegram(protectedProfit), /🟢 模拟平仓（盈利保护）/);
+  assert.match(formatCloseTelegram(protectedProfit), /保护止损：105\.0 USDT/);
+  assert.equal(classifyCloseTelegram(breakeven), "BREAKEVEN_STOP");
+  assert.match(formatCloseTelegram(breakeven), /🟡 模拟平仓（保本保护）/);
+  assert.match(formatCloseTelegram(breakeven), /价格触及保本止损/);
+});
+
+test("Telegram classifies SHORT risk, profit-protect, and breakeven stops by stop location", () => {
+  const risk = closePosition({ side: "SHORT", stop_loss: 105 });
+  const protectedProfit = closePosition({ side: "SHORT", stop_loss: 95, exit_price: 95, net_pnl_cny: 4.7 });
+  const breakeven = closePosition({ side: "SHORT", stop_loss: 99.95, exit_price: 99.95, net_pnl_cny: -0.2 });
+  assert.equal(classifyCloseTelegram(risk), "RISK_STOP");
+  assert.match(formatCloseTelegram(risk), /价格触及风险止损/);
+  assert.equal(classifyCloseTelegram(protectedProfit), "PROFIT_PROTECT_STOP");
+  assert.match(formatCloseTelegram(protectedProfit), /价格触及盈利保护止损/);
+  assert.equal(classifyCloseTelegram(breakeven), "BREAKEVEN_STOP");
+  assert.match(formatCloseTelegram(breakeven), /价格触及保本止损/);
+});
+
+test("profit-protect stop stays profit-protect when costs make net PnL non-positive", () => {
+  const position = closePosition({
+    side: "LONG", stop_loss: 102, exit_price: 102, gross_pnl_cny: 1,
+    entry_fee_cny: 0.6, exit_fee_cny: 0.6, net_pnl_cny: -0.2
+  });
+  assert.equal(classifyCloseTelegram(position), "PROFIT_PROTECT_STOP");
+  assert.match(formatCloseTelegram(position), /模拟平仓（盈利保护）/);
+});
+
+test("TP, EARLY_PROFIT, and SIGNAL_INVALIDATED display semantics remain unchanged", () => {
+  const takeProfit = formatCloseTelegram(closePosition({ exit_reason: "TP", stop_loss: 95, exit_price: 110, net_pnl_cny: 9 }));
+  const earlyProfit = formatCloseTelegram(closePosition({ exit_reason: "EARLY_PROFIT", stop_loss: 95, exit_price: 103, net_pnl_cny: 2 }));
+  const invalidated = formatCloseTelegram(closePosition({ exit_reason: "SIGNAL_INVALIDATED", stop_loss: 105 }));
+  assert.match(takeProfit, /✅ 模拟平仓（盈利）/);
+  assert.match(takeProfit, /价格触及模拟止盈/);
+  assert.match(earlyProfit, /✅ 模拟平仓（盈利）/);
+  assert.match(earlyProfit, /提前保护利润/);
+  assert.match(invalidated, /🛑 模拟平仓（风险控制）/);
+  assert.match(invalidated, /原开仓逻辑连续确认失效/);
+  assert.doesNotMatch(invalidated, /盈利保护止损|保本止损/);
 });
 
 test("Telegram failures are logged and never escape the monitor notification layer", async () => {

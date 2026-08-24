@@ -58,12 +58,33 @@ export async function runMonitorCycle(db, {
   collect = collectMarketSnapshot,
   analyze = analyzeSnapshot,
   config = PAPER_CONFIG,
-  now = () => new Date().toISOString()
+  now = () => new Date().toISOString(),
+  archive = null
 } = {}) {
   const startedAt = now();
   let snapshotId = null;
   try {
-    const market = await collect();
+    const market = { ...(await collect()) };
+    let archiveResult = null;
+    if (archive) {
+      try {
+        // The snapshot becomes observable only after collection has completed.
+        // Using cycle start here could expose a response a few seconds before it
+        // was actually received during point-in-time replay.
+        archiveResult = await archive(market, { observedAt: now() });
+        if (archiveResult?.errors?.length) {
+          market.collectionWarnings = [
+            ...(market.collectionWarnings ?? []),
+            ...archiveResult.errors.map((item) => `archive/${item.type}: ${item.error}`)
+          ];
+        }
+      } catch (error) {
+        // Archive is research infrastructure. It must never block price safety,
+        // position management, or the Paper account lifecycle.
+        archiveResult = { failed: true, error: error.message };
+        market.collectionWarnings = [...(market.collectionWarnings ?? []), `marketArchive: ${error.message}`];
+      }
+    }
     const coreReport = analyze(market);
     // 分级数据质量始终计算并展示（DATA_OK / DATA_DEGRADED / DATA_BLOCKED）。
     // 是否据此改变交易行为由 dataPolicyMode 决定：默认 FROZEN_V12_STRICT 只做展示，
@@ -220,6 +241,7 @@ export async function runMonitorCycle(db, {
       dynamicLimits: entryGate?.dynamicLimits ?? null,
       exposure: entryGate?.exposure ?? null,
       marketSnapshot: market,
+      archiveResult,
       collectionWarnings: market.collectionWarnings ?? []
     };
   } catch (error) {

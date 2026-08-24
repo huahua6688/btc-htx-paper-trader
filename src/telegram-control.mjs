@@ -11,6 +11,7 @@ import {
 // 只读访问研究登记簿。Telegram 绝不 import 研究 CLI 入口，
 // 也绝不因为查看页面而写入研究数据库。
 import { RESEARCH_REGISTRY, researchRegistrySnapshot, researchRunsByType } from "./research-registry.mjs";
+import { formatDataInfrastructureStatus, readDataInfrastructureStatusSync } from "./data-infrastructure-status.mjs";
 
 // Champion 的身份以冻结源码为准，即使登记簿还没建立也必须显示得出来。
 const FROZEN_CHAMPION = Object.freeze({
@@ -36,6 +37,7 @@ function mainButtons(settings = { newEntriesPaused: false }) {
     [{ text: "🧠 Strategy Learning", callback_data: "paper:view:learning" }, { text: "👑 Champion", callback_data: "paper:view:champion" }],
     [{ text: "👥 Challenger / Shadow", callback_data: "paper:view:shadow" }],
     [{ text: "📊 Historical Similarity", callback_data: "paper:view:similarity" }, { text: "📚 Research Results", callback_data: "paper:view:results" }],
+    [{ text: "🛰 数据状态", callback_data: "paper:view:data-status" }],
     [{ text: "✨ 一键启用新版自动区间", callback_data: "paper:preset:autoRanges" }],
     [settings.newEntriesPaused
       ? { text: "▶️ 取消手动暂停", callback_data: "paper:set:newEntriesPaused:false" }
@@ -146,8 +148,14 @@ export function dataQualityLines(report) {
   const gate = report?.dataQualityGate;
   if (!gate) return ["数据质量：未记录"];
   const tierName = (tier) => tier === "CRITICAL" ? "核心" : tier === "IMPORTANT" ? "重要" : "辅助";
+  const provenanceName = (provenance) => ({
+    HISTORICAL_UNAVAILABLE: "历史无档案",
+    LIVE_FAILURE: "实时失败",
+    STALE: "数据过期",
+    REPLAY_ARCHIVE_ERROR: "回放档案错误"
+  })[provenance] ?? provenance;
   const missing = gate.missing?.length
-    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${item.provenance === "HISTORICAL_UNAVAILABLE" ? "历史无档案" : "实时失败"}]`).join("、")
+    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${provenanceName(item.provenance)}]`).join("、")
     : "无";
   return [
     `数据质量：${gate.status}（政策 ${gate.policy}）`,
@@ -207,6 +215,14 @@ function researchText(db) {
     "",
     "只有成本后严格样本外、walk-forward 和增量贡献稳定通过，才允许晋级 enabled。"
   ].join("\n");
+}
+
+function dataInfrastructureText(db) {
+  try {
+    return `🛰 数据状态（只读）\n${formatDataInfrastructureStatus(readDataInfrastructureStatusSync(db))}`;
+  } catch (error) {
+    return `🛰 数据状态（只读）\n读取失败：${error.message}\n这不会改变 Paper 仓位或交易逻辑。`;
+  }
 }
 
 function indicatorProfilePanel(settings) {
@@ -602,6 +618,7 @@ export class TelegramControlPanel {
     if (name === "learning") return { text: learningText(this.researchRegistryPath), markup: main };
     if (name === "similarity") return { text: similarityText(this.researchRegistryPath), markup: main };
     if (name === "results") return { text: researchResultsText(this.researchRegistryPath), markup: main };
+    if (name === "data-status") return { text: dataInfrastructureText(this.db), markup: main };
     if (name.startsWith("range-")) return rangeControlPanel(settings, name.slice("range-".length));
     if (name === "recent") return { text: recentText(this.db), markup: main };
     return { text: settingsText(settings), markup: main };

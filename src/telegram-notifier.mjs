@@ -3,6 +3,7 @@ import { NotificationStateStore } from "./notification-state.mjs";
 import { calculateAccountState, calculatePerformance, getDailyRiskState } from "./paper-engine.mjs";
 import { sendTelegramMessage, telegramEnabled } from "./telegram-client.mjs";
 import {
+  classifyCloseTelegram,
   formatCloseTelegram,
   formatDailySummaryTelegram,
   formatHealthTelegram,
@@ -100,7 +101,15 @@ export class TelegramNotifier {
         if (["OPEN", "ADD_POSITION"].includes(action.type)) {
           await this.sendSafely(action.position.side === "LONG" ? "paper-long" : "paper-short", formatOpenTelegram(action.position));
         } else if (action.type === "CLOSE") {
-          await this.sendSafely(["TP", "EARLY_PROFIT"].includes(action.exit.exitReason) ? "paper-tp" : "paper-sl", formatCloseTelegram(action.position, action.exit));
+          const closeClass = classifyCloseTelegram(action.position);
+          const label = {
+            PROFIT: "paper-tp",
+            RISK_STOP: "paper-risk-stop",
+            PROFIT_PROTECT_STOP: "paper-profit-protect-stop",
+            BREAKEVEN_STOP: "paper-breakeven-stop",
+            RISK_CONTROL: "paper-risk-control"
+          }[closeClass];
+          await this.sendSafely(label, formatCloseTelegram(action.position, action.exit));
         } else if (action.type === "NO_ENTRY" && action.dailyRisk?.paused) {
           await this.notifyRiskPause(action.dailyRisk);
         }

@@ -15,3 +15,7 @@ data/research/
 research-output/
 vendor/htx-cli-linux-x64
 vendor/htx-cli-windows-x64.exe
+vendor/.htx-runtime/
+vendor/.htx-staging-*/
+vendor/rollback/
+data/market-archive.sqlite*

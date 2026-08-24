@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
 import { PAPER_CONFIG } from "./config.mjs";
 import { openPaperDatabase } from "./db.mjs";
-import { evaluateHealth, formatHealth } from "./health-check.mjs";
+import { evaluateHealthWithInfrastructure, formatHealth } from "./health-check.mjs";
 import { TelegramNotifier } from "./telegram-notifier.mjs";
+import { buildDataInfrastructureStatus } from "./data-infrastructure-status.mjs";
 
 const json = process.argv.includes("--json");
 
@@ -21,7 +22,9 @@ async function main() {
   } else {
     try {
       db = openPaperDatabase(PAPER_CONFIG.databasePath, PAPER_CONFIG, { readOnly: true });
-      result = evaluateHealth(db);
+      result = await evaluateHealthWithInfrastructure(db, {
+        infrastructureBuilder: buildDataInfrastructureStatus
+      });
     } catch (error) {
       result = {
         healthy: false,

@@ -31,8 +31,13 @@ export const DATA_STATUS = Object.freeze({
 });
 
 export const PROVENANCE = Object.freeze({
+  HTX_HISTORICAL: "HTX_HISTORICAL",
+  SELF_ARCHIVED: "SELF_ARCHIVED",
+  LIVE_OBSERVED: "LIVE_OBSERVED",
   LIVE_FAILURE: "LIVE_FAILURE",
-  HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE"
+  HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE",
+  STALE: "STALE",
+  REPLAY_ARCHIVE_ERROR: "REPLAY_ARCHIVE_ERROR"
 });
 
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
@@ -113,6 +118,22 @@ export const DATA_QUALITY_CHECKS = Object.freeze(CHECKS.map(({ key, tier, label,
 
 // 缺失来源判定：回放时点没有档案 vs 实时接口失败。绝不因为「历史没有」就用当前值回填。
 function resolveProvenance(key, report, market) {
+  const sourceKeys = {
+    price: ["ticker"],
+    kline15m: ["kline15m"],
+    higherTimeframes: ["kline1h", "kline4h", "kline1d"],
+    orderBook: ["depth"],
+    funding: ["fundingCurrent", "fundingHistory"],
+    openInterest: ["oiCurrent", "oiHistory"],
+    elitePositioning: ["eliteAccount", "elitePosition"],
+    markBasis: ["markPrice", "basis"],
+    pressureComponents: ["fundingCurrent", "oiCurrent", "eliteAccount", "elitePosition", "liquidations", "basis"]
+  }[key] ?? [key];
+  const declared = sourceKeys.map((sourceKey) => market?.dataProvenance?.[sourceKey]).filter(Boolean);
+  if (declared.includes(PROVENANCE.STALE)) return PROVENANCE.STALE;
+  if (declared.includes(PROVENANCE.REPLAY_ARCHIVE_ERROR)) return PROVENANCE.REPLAY_ARCHIVE_ERROR;
+  if (declared.includes(PROVENANCE.LIVE_FAILURE)) return PROVENANCE.LIVE_FAILURE;
+  if (declared.length && declared.every((item) => item === PROVENANCE.HISTORICAL_UNAVAILABLE)) return PROVENANCE.HISTORICAL_UNAVAILABLE;
   // 回放里 report.replay 可能要等策略跑完才被填上，因此也要看行情快照自己的
   // point-in-time 标记，否则「历史天然无档案」会被误标成「实时接口失败」。
   const replay = report.replay ?? market?.replay ?? null;
@@ -210,14 +231,26 @@ export function classifyDataQuality(report, market = {}, {
     liveFailureKeys: missing
       .filter((item) => item.provenance === PROVENANCE.LIVE_FAILURE)
       .map((item) => item.key),
+    staleKeys: missing
+      .filter((item) => item.provenance === PROVENANCE.STALE)
+      .map((item) => item.key),
+    replayArchiveErrorKeys: missing
+      .filter((item) => item.provenance === PROVENANCE.REPLAY_ARCHIVE_ERROR)
+      .map((item) => item.key),
     hardBlockReasons,
     unavailableNeverSynthesized: true
   };
 }
 
 export function formatDataQuality(quality) {
+  const provenanceLabel = {
+    [PROVENANCE.HISTORICAL_UNAVAILABLE]: "历史无档案",
+    [PROVENANCE.LIVE_FAILURE]: "实时失败",
+    [PROVENANCE.STALE]: "数据过期",
+    [PROVENANCE.REPLAY_ARCHIVE_ERROR]: "回放档案错误"
+  };
   const missing = quality.missing.length
-    ? quality.missing.map((item) => `${item.label}(${item.tier === DATA_TIERS.CRITICAL ? "核心" : item.tier === DATA_TIERS.IMPORTANT ? "重要" : "辅助"}/${item.provenance === PROVENANCE.HISTORICAL_UNAVAILABLE ? "历史无档案" : "实时失败"})`).join("、")
+    ? quality.missing.map((item) => `${item.label}(${item.tier === DATA_TIERS.CRITICAL ? "核心" : item.tier === DATA_TIERS.IMPORTANT ? "重要" : "辅助"}/${provenanceLabel[item.provenance] ?? item.provenance})`).join("、")
     : "无";
   return `${quality.status}｜缺失：${missing}｜降级权重 ${quality.degradationScore}｜风险系数 ${quality.riskMultiplier}`;
 }
