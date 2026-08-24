@@ -259,7 +259,10 @@ test("historical backfill checkpoint resumes without downloading completed Kline
       })) });
     }
     if (fundingFails) return response({}, { ok: false, status: 503 });
-    return response({ status: "ok", data: { total_page: 1, data: [{ funding_time: String(start), funding_rate: "0.0001" }] } });
+    return response({ status: "ok", data: { total_page: 1, data: [
+      { funding_time: String(start), funding_rate: "0.0001" },
+      { funding_time: String(end + 8 * 60 * 60 * 1000), funding_rate: "0.0002" }
+    ] } });
   };
   const args = { from: new Date(start).toISOString(), to: new Date(end).toISOString(), directory, fetchImpl, dataTypes: ["kline", "funding"], attempts: 1, delay: async () => {} };
   try {
@@ -268,6 +271,10 @@ test("historical backfill checkpoint resumes without downloading completed Kline
     const result = await updateHistoricalDataset(args);
     assert.equal(klineCalls, 1);
     assert.equal(result.manifest.checkpoint.status, "COMPLETE");
+    assert.equal(result.manifest.sources.funding.records, 1);
+    assert.equal(result.manifest.sources.funding.latest, new Date(start).toISOString());
+    assert.equal(result.manifest.funding.count, 1);
+    assert.equal(result.manifest.funding.coverageTo, new Date(start).toISOString());
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

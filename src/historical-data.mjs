@@ -374,7 +374,7 @@ export async function updateHistoricalDataset({
   let allFunding = priorFunding;
   if (selected.has("funding") && (!checkpoint.completed.funding || !priorFunding.length)) {
     checkpoint.attempts.funding = Number(checkpoint.attempts.funding ?? 0) + 1;
-    const fetchedFunding = await fetchFundingRange(requestedStart, requestedEnd + 8 * HOUR_MS, options);
+    const fetchedFunding = await fetchFundingRange(requestedStart, requestedEnd, options);
     fetched.funding = fetchedFunding.length;
     allFunding = [...new Map([...priorFunding, ...fetchedFunding].map((row) => [row.timestamp, row])).values()].sort((a, b) => a.timestamp - b.timestamp);
     await writeJsonAtomic(fundingPath, allFunding);
@@ -411,7 +411,7 @@ export async function updateHistoricalDataset({
     duplicateEventTimes: audit.duplicates,
     futureBackfillUsed: false
   };
-  const fundingInRange = allFunding.filter((row) => row.timestamp >= requestedStart && row.timestamp <= requestedEnd + 8 * HOUR_MS);
+  const fundingInRange = allFunding.filter((row) => row.timestamp >= requestedStart && row.timestamp <= requestedEnd);
   const fundingAudit = auditTimedRecords(fundingInRange.map((row) => ({ eventTime: row.timestamp })), 8 * HOUR_MS);
   sources.funding = {
     type: "funding",
@@ -518,9 +518,9 @@ export async function updateHistoricalDataset({
       sha256: sha256(serializedCandles)
     },
     funding: {
-      count: allFunding.length,
-      coverageFrom: allFunding.length ? new Date(allFunding[0].timestamp).toISOString() : null,
-      coverageTo: allFunding.length ? new Date(allFunding.at(-1).timestamp).toISOString() : null,
+      count: fundingInRange.length,
+      coverageFrom: fundingInRange.length ? new Date(fundingInRange[0].timestamp).toISOString() : null,
+      coverageTo: fundingInRange.length ? new Date(fundingInRange.at(-1).timestamp).toISOString() : null,
       sha256: sha256(serializedFunding),
       missingPolicy: "Funding settlement uses only the exact timestamped historical rate. Between settlements, the last observed rate may be labeled and used only as an entry-cost estimate; it is never represented as the future settlement rate."
     },

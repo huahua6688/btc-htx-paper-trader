@@ -41,7 +41,7 @@ The legacy liquidation endpoint described as 90-day history returned an HTX erro
 An unselected continuous verification range, `2026-08-17 00:00 UTC` through `2026-08-23 00:00 UTC`, was downloaded after implementation. The resulting manifest was `VALID` and recorded:
 
 - 577 closed 15m Klines, zero gaps and zero duplicates.
-- 20 Funding observations.
+- 19 Funding settlements inside the requested range. A cached settlement eight hours after the requested end is excluded from manifest coverage and Replay evidence.
 - 145 OI observations.
 - 145 Mark Price, 145 Premium and 145 Basis observations.
 - No Elite observations inside that requested range because the endpoint's actual 30-hour window started later.
