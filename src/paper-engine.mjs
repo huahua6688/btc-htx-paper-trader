@@ -255,9 +255,34 @@ export function buildPaperCandidateResult(
     volatilityPct,
     marketRiskFactor
   }) * opportunityRiskFactor(report, side);
-  const riskPct = clamp(requestedRiskPct, runtimeSettings.riskMinPct, config.absoluteMaxRiskPerTradePct);
+  // AUTO 的动态单笔风险上限必须是真正的硬上限，而不是只在 Telegram 上显示。
+  // materializeRuntimeSettings/applyDynamicLimits 把它写进 riskPerTradePct。
+  const dynamicRiskCeiling = finite(runtimeSettings.riskPerTradePct)
+    ? Number(runtimeSettings.riskPerTradePct)
+    : config.absoluteMaxRiskPerTradePct;
+  // 先按用户区间夹紧，再施加动态上限：上限必须赢过 riskMin 下限，
+  // 否则一个比下限还低的动态上限会被下限顶回去，等于没生效。
+  const boundedRiskPct = Math.min(
+    clamp(requestedRiskPct, runtimeSettings.riskMinPct, config.absoluteMaxRiskPerTradePct),
+    dynamicRiskCeiling
+  );
+  // 数据降级的风险系数必须真正收缩仓位。它作用在 riskMin 下限之后：
+  // 证据不足时允许低于平常的最小风险，这是收紧而不是放宽。
+  const dataRiskMultiplier = finite(report.dataPolicy?.riskMultiplier)
+    ? clamp(Number(report.dataPolicy.riskMultiplier), 0, 1)
+    : 1;
+  const riskPct = boundedRiskPct * dataRiskMultiplier;
   const riskBudgetCny = Math.min(accountEquityCny * riskPct, availableRisk);
-  if (!(riskBudgetCny > 0)) return reject("RISK_BUDGET_ZERO", { riskPct, availableRisk, accountEquityCny });
+  if (!(riskBudgetCny > 0)) {
+    return reject("RISK_BUDGET_ZERO", {
+      riskPct,
+      requestedRiskPct: round(requestedRiskPct, 8),
+      dynamicRiskCeiling: round(dynamicRiskCeiling, 8),
+      dataRiskMultiplier,
+      availableRisk,
+      accountEquityCny
+    });
+  }
 
   const fundingRate = finite(report.derivatives?.fundingRatePct) ? Number(report.derivatives.fundingRatePct) / 100 : 0;
   const viableTargets = candidateTargets(report).map((takeProfit) => ({
@@ -282,9 +307,15 @@ export function buildPaperCandidateResult(
   const perBtc = selected.economics;
   const quantityByRisk = riskBudgetCny / perBtc.expectedLoss;
 
+  // AUTO 下必须使用动态解出的 userMaxLeverage，而不是静态的区间上限 leverageMax，
+  // 否则 Telegram 显示的「本轮杠杆上限」和实际用于建仓的上限会不一致。
+  // 动态值永远 <= leverageMax，这里再取一次 min 作为防御。
   const configuredLeverageMaximum = runtimeSettings.leverageMode === "MANUAL"
-    ? runtimeSettings.leverageManual
-    : runtimeSettings.leverageMax;
+    ? Number(runtimeSettings.leverageManual)
+    : Math.min(
+        Number(runtimeSettings.leverageMax),
+        finite(runtimeSettings.userMaxLeverage) ? Number(runtimeSettings.userMaxLeverage) : Number(runtimeSettings.leverageMax)
+      );
   const hardMaxLeverage = Math.min(configuredLeverageMaximum, exchangeConstraints.hardMaxLeverage);
   const hardMinLeverage = Math.max(1, Math.min(runtimeSettings.leverageMin, hardMaxLeverage));
   const unitSafeMargin = minimumMarginForStopBeforeLiquidation({

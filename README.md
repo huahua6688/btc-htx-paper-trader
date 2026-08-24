@@ -60,11 +60,28 @@
 - 次要衍生品缺失：标记 missing、收缩风险预算、提高入场质量门槛；只有累计降级权重达到预算
   才升级为 HARD BLOCK。
 
+降级不是只记一个数字：`riskMultiplier` 会真正乘进单笔风险预算，
+`entryScoreBonus` 会真正抬高入场机会分门槛。
+
 `dataPolicyMode` 运行时设置控制是否据此改变交易行为：
 
 - `FROZEN_V12_STRICT`（默认）：完全复现冻结 V1.2 的一票否决行为，作为可复现 baseline。
 - `TIERED_DEGRADED`：启用 `V1.3-DATA-TIERED-CANDIDATE` 候选策略的降级放行。
   该候选**没有**通过任何 OOS/Shadow/Promotion Gate，Champion 保持不变。
+
+该候选同时是回放的一等策略 id，可以进入研究路径：
+
+```bash
+# 单策略逐事件回放；--strategy 只接受 replay-engine 已登记的 id
+npm run replay -- --strategy=data-tiered --from=... --to=...
+
+# 走 walk-forward / Purged OOS 门禁
+npm run validate -- --candidate-strategy=data-tiered
+```
+
+回放与实时共用 `analyzeDataTiered → applyTieredDataPolicy`，没有第二份行为实现。
+**接线可用不等于阶段已执行**：在真实数据上跑出 Replay / Walk-forward / Purged OOS /
+Monte Carlo 结果之前，这些阶段一律记为未执行，Promotion 保持 BLOCKED。
 
 ### 真正动态的 AUTO 风险参数
 
@@ -72,6 +89,11 @@ AUTO 曾经对 risk / margin / leverage / notional 直接取区间上限。现�
 权益、机会质量、波动、止损距离、已有敞口、保证金占用、总风险、回撤、日内亏损、连亏
 和仓位数动态计算，并始终夹在用户区间内、且不超过写入 SQLite 的天花板（原子复核因此仍然成立）。
 Telegram 风险面板与「🤖 本轮自动限额」页会显示自动范围、本轮实际值和选择理由。
+
+这些动态值是**真正的硬上限，不是展示值**：`riskPerTradePct` 会压住单笔风险预算
+（并且赢过 `riskMin` 下限），AUTO 杠杆使用动态 `userMaxLeverage` 而不是静态 `leverageMax`，
+margin / notional / totalRisk 同样直接进入 `buildPaperCandidate`。
+测试断言 Telegram 展示的「本轮实际值」与真正用于建仓的值完全一致。
 
 ### 研究：两种资金视角
 
@@ -82,12 +104,21 @@ Telegram 风险面板与「🤖 本轮自动限额」页会显示自动范围、
 - `EDGE_REFERENCE_CAPITAL`：`--capital=reference --reference-capital=50000`，仅供研究，
   回答「策略本身有没有 edge」，永不影响生产账户。
 
-### 研究运行登记
+### 研究运行登记与失败分类
 
 修复前只有 `research-v2-pipeline.mjs` 会写 `research_runs`，而该模块没有任何 CLI 入口，
 等于永远不会执行——这就是「已登记策略版本 1 / 已持久化研究运行 0」的原因。
 现在所有研究命令都会把运行结果登记进独立的研究 SQLite（`research-output/research-registry.sqlite`，
-不是生产 Paper 库），失败也会如实记为 `BLOCKED` 并写明原因。
+不是生产 Paper 库）。一次 CLI invocation 只产生**一条顶层 run**，子阶段作为 stage/evidence
+放进这条 run 的 summary，管线不再自行重复登记。
+
+失败必须分类，不允许一律记 BLOCKED：
+
+- `BLOCKED`：已知外部前置条件缺失 —— 本地数据目录不存在、公网端点不可达、holdout 未成熟。
+- `FAILED`：代码异常、断言失败、内部逻辑错误、参数用法错误。默认就是 FAILED，
+  只有明确匹配到外部前置条件才降级为 BLOCKED。
+
+`research-cli.mjs` 现在也只在被直接执行时才派发命令；被 `import` 时不会顺手启动一次研究运行。
 
 ```bash
 npm run research:runs                 # 查看真实的持久化运行数与策略版本数

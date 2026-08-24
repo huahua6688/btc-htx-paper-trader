@@ -23,6 +23,7 @@ import { BAR_MS, hashObject, mean, round, standardDeviation } from "./research-u
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
+import { analyzeDataTiered, DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 
 /**
  * 研究资金视角。两者必须分开报告，绝不能混为一谈：
@@ -90,6 +91,16 @@ function summarizeEntryRejections(rejectionCounts) {
       + (rejectionCounts.PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER ?? 0)
   };
 }
+
+/**
+ * 回放支持的策略 id。`data-tiered` 就是实时 monitor 在 dataPolicyMode=TIERED_DEGRADED
+ * 时使用的同一个 V1.3 候选：两边都走 analyzeDataTiered → applyTieredDataPolicy，
+ * 没有第二份行为实现。
+ */
+export const REPLAY_STRATEGIES = Object.freeze([
+  "champion", "challenger", "historical-compatible",
+  "tradable-edge", "anti-chase", "research-v2", "data-tiered"
+]);
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
   signalClock: "decision at completed 15m candle close",
@@ -194,6 +205,8 @@ function executePending(db, signal, candle, market, actions, config, delayBars, 
 function buildReport(strategy, market, parameters, config) {
   const report = strategy === "champion"
     ? analyzeSnapshot(market, config)
+    : strategy === "data-tiered"
+      ? analyzeDataTiered(market, parameters, config)
     : strategy === "historical-compatible"
       ? analyzeHistoricalCompatible(market, parameters, config)
       : strategy === "tradable-edge"
@@ -362,10 +375,11 @@ export async function runHistoricalReplay(dataset, {
   capitalProfile = CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
   referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY
 } = {}) {
-  if (!["champion", "challenger", "historical-compatible", "tradable-edge", "anti-chase", "research-v2"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
+  if (!REPLAY_STRATEGIES.includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
   if (strategy === "historical-compatible" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = HISTORICAL_COMPATIBLE_PARAMETERS;
   if (strategy === "anti-chase" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = ANTI_CHASE_PARAMETERS;
   if (strategy === "research-v2" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = RESEARCH_CHALLENGER_V2_PARAMETERS;
+  if (strategy === "data-tiered" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = DATA_TIERED_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
   const warmupIndex = firstReplayableIndex(dataset.candles);
@@ -502,6 +516,11 @@ export async function runHistoricalReplay(dataset, {
         "Tradable Edge uses a frozen non-ML empirical model trained only on its declared pre-OOS interval.",
         "Every entry still passes the unchanged Paper risk/execution core after the net-edge gate.",
         "Unavailable historical execution and derivatives fields remain absent and are never synthesized."
+      ] : strategy === "data-tiered" ? [
+        "V1.3-DATA-TIERED is a CANDIDATE. It reuses the frozen V1.2 direction, scoring and regime unchanged and only replaces the all-or-nothing data gate with the tiered CRITICAL/IMPORTANT/AUXILIARY policy.",
+        "Replay calls the same analyzeDataTiered/applyTieredDataPolicy used by live monitor under dataPolicyMode=TIERED_DEGRADED; there is no second behavioural implementation.",
+        "Historically unavailable order book/OI/elite/mark-basis stay absent and are never synthesized; they degrade the risk budget and raise the entry score bar instead of forcing WAIT.",
+        "This replay does not promote anything and must not touch the untouched Final OOS."
       ] : strategy === "research-v2" ? [
         "Research V2 uses only point-in-time closed OHLCV and timestamp-visible Funding in historical replay.",
         "Its independent-dimension scoring, price-extension gate, structure target and Tradable Edge calculation are shared with live Shadow; it does not modify the frozen V1.2 Champion.",

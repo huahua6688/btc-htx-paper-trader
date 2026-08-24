@@ -63,7 +63,10 @@ export async function runResearchV2Pipeline(dataset, {
   outputDirectory,
   databasePath,
   robustnessIterations = 1_000,
-  onProgress = null
+  onProgress = null,
+  // 一次 CLI invocation 只应产生一个顶层 research run。CLI 自己登记那一条，
+  // 并把这里的阶段结果作为 stage/evidence 放进它的 summary，因此传 false。
+  recordPipelineRun = true
 } = {}) {
   if (!outputDirectory) throw new Error("Research V2 pipeline requires outputDirectory");
   const development = datasetView(dataset, V2_DEVELOPMENT_RANGE);
@@ -142,12 +145,14 @@ export async function runResearchV2Pipeline(dataset, {
         promotionReason: experiment.validation.passed ? "Walk-forward gate passed; awaiting future untouched holdout" : experiment.validation.gateReasons.join("; "),
         rollbackVersion: "V1.2-FROZEN"
       }));
-      db.recordResearchRun({
-        runType: "RESEARCH_V2_PIPELINE", startedAt: selectionEvidence.generatedAt, finishedAt: new Date().toISOString(),
-        status: selected ? "PARTIAL" : "FAILED", artifactPath: outputDirectory,
-        dataManifestHash: dataset.manifest.manifestHash, strategyVersion: selectedDiagnostic.candidate.version,
-        summary: { eligibleCandidates: eligible.length, diagnosticPerformance: diagnosticReplay.performance, holdoutStatus: holdout.holdout.status }
-      });
+      if (recordPipelineRun) {
+        db.recordResearchRun({
+          runType: "RESEARCH_V2_PIPELINE", startedAt: selectionEvidence.generatedAt, finishedAt: new Date().toISOString(),
+          status: selected ? "PARTIAL" : "FAILED", artifactPath: outputDirectory,
+          dataManifestHash: dataset.manifest.manifestHash, strategyVersion: selectedDiagnostic.candidate.version,
+          summary: { eligibleCandidates: eligible.length, diagnosticPerformance: diagnosticReplay.performance, holdoutStatus: holdout.holdout.status }
+        });
+      }
       strategyRegistry = records;
     } finally { db.close(); }
   }

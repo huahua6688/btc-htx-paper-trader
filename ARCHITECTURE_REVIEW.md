@@ -41,16 +41,38 @@
 
 ### 研究闭环的真实状态
 
+CONNECTED 只有在「同一个环境里真的把该阶段跑通过一次」时才允许标是。
+本环境没有数据集，因此除了纯接线层面的单元测试之外，任何阶段都不得标 CONNECTED/EXECUTED。
+
 | 步骤 | IMPLEMENTED | CONNECTED | EXECUTED | PERSISTED |
 |---|---|---|---|---|
-| Candidate 生成 | 是 | 是 | 否（无数据） | — |
-| Replay | 是 | 是 | 否（无数据） | — |
-| Walk-forward | 是 | 是 | 否（无数据） | — |
-| Purged OOS | 是 | 是 | 否（无数据） | — |
-| Final untouched OOS | 是 | 是 | 否（未成熟） | — |
-| Monte Carlo / block bootstrap | 是 | 是 | 否（无数据） | — |
-| Shadow | 是 | 是 | 否（无 CLI 二进制） | — |
-| Promotion Gate | 是 | 是 | 否 | — |
+| Candidate 生成 | 是 | 未验证（无数据集） | 否 | 否 |
+| Replay | 是 | 未验证（无数据集） | 否 | 否 |
+| Walk-forward | 是 | 未验证（无数据集） | 否 | 否 |
+| Purged OOS | 是 | 未验证（无数据集） | 否 | 否 |
+| Final untouched OOS | 是 | 未验证（未成熟，且本轮不得触碰） | 否 | 否 |
+| Monte Carlo / block bootstrap | 是 | 未验证（无数据集） | 否 | 否 |
+| Shadow | 是 | 未验证（无 CLI 二进制） | 否 | 否 |
+| Promotion Gate | 是 | 未验证 | 否 | 否 |
+
+#### V1.3-DATA-TIERED 的阶段状态
+
+`data-tiered` 已经成为 `runHistoricalReplay` 的一等策略 id，并且与实时 monitor
+共用同一份 `analyzeDataTiered → applyTieredDataPolicy` 实现（有测试断言两条路径输出一致，
+不存在第二份行为副本）。但是**接线可用不等于阶段已经执行**：
+
+| V1.3 阶段 | 状态 | 说明 |
+|---|---|---|
+| Replay 接线 | IMPLEMENTED，单元测试已覆盖 | 策略 id 被接受、派发到同一个 tiered policy |
+| Replay 执行 | **未执行** | 没有数据集，一根真实 K 线都没有回放过 |
+| Walk-forward / Purged OOS | **未执行** | 同上 |
+| Monte Carlo / block bootstrap | **未执行** | 同上 |
+| Final untouched OOS | **未触碰** | 本轮明确不打开 |
+| Shadow | **未启动** | 没有 HTX CLI 二进制 |
+| Promotion | **BLOCKED** | 无任何 OOS/Shadow 证据 |
+
+在这些阶段真正跑出结果之前，不得把 V1.3 的任何阶段报告为 CONNECTED 或 EXECUTED，
+也不得据此声称它优于冻结 Champion。
 
 「已持久化研究运行 = 0」的根因已经查清并修复：`recordResearchRun` 与 `registerStrategyVersion`
 只在 `research-v2-pipeline.mjs` 中被调用，而该模块**没有任何 CLI 入口**，属于不可达代码；

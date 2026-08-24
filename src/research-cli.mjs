@@ -1,5 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { CHALLENGER_BASE_PARAMETERS, HISTORICAL_COMPATIBLE_PARAMETERS } from "./challenger-strategy.mjs";
 import { openPaperDatabase } from "./db.mjs";
 import { runCounterfactualReview } from "./counterfactual-review.mjs";
@@ -13,9 +14,11 @@ import { runStrategyOptimization } from "./optimization-engine.mjs";
 import {
   CAPITAL_PROFILES,
   DEFAULT_REFERENCE_CAPITAL_CNY,
+  REPLAY_STRATEGIES,
   runChampionChallengerComparison,
   runHistoricalReplay
 } from "./replay-engine.mjs";
+import { DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
 import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
@@ -82,6 +85,45 @@ async function withResearchRegistry(work) {
   } finally {
     db.close();
   }
+}
+
+/**
+ * 把一次失败归类成 BLOCKED 还是 FAILED。
+ *
+ *   BLOCKED —— 已知的外部前置条件缺失：本地数据目录不存在、公网端点不可达、
+ *              holdout 尚未成熟。代码本身没有问题，换个环境就能跑。
+ *   FAILED  —— 代码异常、断言失败、内部逻辑错误、参数用法错误。
+ *              这类必须暴露出来，绝不允许被 BLOCKED 掩盖。
+ *
+ * 默认是 FAILED：只有明确匹配到外部前置条件才降级为 BLOCKED。
+ */
+export function classifyResearchFailure(error) {
+  const message = String(error?.message ?? error ?? "");
+  const code = String(error?.code ?? "");
+  const missingArtifact = /\bENOENT\b|no such file or directory/i.test(message) || code === "ENOENT";
+  const networkUnreachable = /\bHTTP (?:401|403|407|408|429|5\d{2})\b|fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|network|Blocked non-HTX historical URL/i.test(message)
+    || ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"].includes(code)
+    || error?.name === "AbortError" || error?.name === "TimeoutError";
+  const immatureHoldout = /holdout .*(?:not mature|immature|UNTOUCHED|insufficient)|尚未成熟|not enough bars/i.test(message);
+  if (missingArtifact) {
+    return {
+      status: "BLOCKED",
+      interpretation: "本地历史数据目录不存在（data/research 未提交 Git），需要先运行 data:update"
+    };
+  }
+  if (networkUnreachable) {
+    return {
+      status: "BLOCKED",
+      interpretation: "无法访问 HTX 公开历史端点，本环境网络策略不允许出站到 api.hbdm.com"
+    };
+  }
+  if (immatureHoldout) {
+    return { status: "BLOCKED", interpretation: "未触碰 Final OOS 尚未成熟，按规则不得提前打开" };
+  }
+  return {
+    status: "FAILED",
+    interpretation: "代码异常/断言失败/内部逻辑错误，不是外部前置条件问题"
+  };
 }
 
 /**
@@ -216,22 +258,139 @@ async function researchV2(args) {
   const result = await runResearchV2Pipeline(dataset, {
     outputDirectory: directory,
     // 研究登记簿，不是生产 Paper 库。
-    databasePath: researchRegistryPath()
+    databasePath: researchRegistryPath(),
+    // 顶层 run 由这里登记一次；管线内部不再重复登记。
+    recordPipelineRun: false
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  await recordRun("RESEARCH_V2_PIPELINE_CLI", startedAt, result?.promotionGate?.status === "PASSED" ? "PASSED" : "BLOCKED", {
+  const promotion = result?.promotion ?? null;
+  const finalUntouchedOos = result?.finalUntouchedOos ?? null;
+  // 管线成功跑完就是一次真实的研究运行。晋级与否决定 PASSED / PARTIAL，
+  // 而不是把「没有晋级」谎报成 BLOCKED —— BLOCKED 只用于跑不起来。
+  const status = promotion?.status === "PASSED" && promotion?.eligible ? "PASSED" : "PARTIAL";
+  await recordRun("RESEARCH_V2_PIPELINE", startedAt, status, {
     artifactPath: join(directory, "research-v2-pipeline.json"),
     dataManifestHash: dataset.manifest.manifestHash,
-    summary: { promotionGate: result?.promotionGate ?? null, finalOos: result?.finalOos ?? null }
+    strategyVersion: result?.selectionEvidence?.selected?.version ?? null,
+    summary: {
+      conclusion: result?.conclusion ?? null,
+      promotion,
+      finalUntouchedOos,
+      championChanged: promotion?.championChanged ?? false,
+      // 子阶段作为 evidence 记录在这一条顶层 run 里，不再各自登记成独立 run。
+      stages: {
+        candidateGeneration: result?.candidateGeneration ?? null,
+        experiments: (result?.experiments ?? []).map((item) => ({
+          version: item.candidate?.version ?? null,
+          walkForwardPassed: item.validation?.passed ?? null
+        })),
+        robustness: result?.robustness?.status ?? null,
+        formalShadow: result?.formalShadow?.status ?? null,
+        holdoutRegistry: result?.holdoutRegistry?.holdout?.status ?? null
+      }
+    }
   });
   return result;
 }
 
+/**
+ * 解析 --strategy / --baseline-strategy / --candidate-strategy。
+ * 只接受 replay-engine 已登记的策略 id，未知值直接报错而不是悄悄回退到 challenger。
+ */
+export function strategyOption(args, key, fallback) {
+  const raw = args[key];
+  if (raw === undefined || raw === true) return fallback;
+  const value = String(raw);
+  if (!REPLAY_STRATEGIES.includes(value)) {
+    throw new Error(`Unknown replay strategy: ${value}. Known: ${REPLAY_STRATEGIES.join(", ")}`);
+  }
+  return value;
+}
+
+function defaultParametersFor(strategy) {
+  if (strategy === "data-tiered") return DATA_TIERED_PARAMETERS;
+  if (strategy === "historical-compatible") return HISTORICAL_COMPATIBLE_PARAMETERS;
+  if (strategy === "anti-chase") return ANTI_CHASE_PARAMETERS;
+  return CHALLENGER_BASE_PARAMETERS;
+}
+
+/**
+ * 单策略逐事件回放。这是 V1.3-DATA-TIERED 进入研究路径的入口：
+ *   npm run replay -- --strategy=data-tiered --from=... --to=...
+ * 它与实时 monitor 共用同一份 tiered policy，不存在第二套行为实现。
+ */
+async function replay(args) {
+  const startedAt = new Date().toISOString();
+  // 先校验参数再加载数据集：未知策略是用法/逻辑错误（FAILED），
+  // 不能因为数据集恰好也不存在而被误判成外部前置条件缺失（BLOCKED）。
+  const strategy = strategyOption(args, "strategy", "challenger");
+  const dataset = await load(args);
+  const selected = range(args, dataset.manifest.requestedCoverage);
+  const directory = resolveOutputPath(runId(`replay-${strategy}`));
+  await mkdir(directory, { recursive: true });
+  const capital = capitalOptions(args);
+  const report = await runHistoricalReplay(dataset, {
+    strategy,
+    parameters: defaultParametersFor(strategy),
+    ...selected,
+    ...capital,
+    outputDirectory: directory
+  });
+  const path = await save(join(directory, `${strategy}-replay.json`), report);
+  process.stdout.write(`${JSON.stringify({ path, compact: compactReplay(report), capital: report.capital, entryRejections: report.entryRejections }, null, 2)}\n`);
+  await recordRun("HISTORICAL_REPLAY", startedAt, "PASSED", {
+    artifactPath: path,
+    dataManifestHash: dataset.manifest.manifestHash,
+    strategyVersion: report.strategyVersion,
+    summary: {
+      strategy,
+      capital: report.capital,
+      tradeCount: report.tradeCount,
+      entryRejections: report.entryRejections,
+      performance: {
+        netPnlCny: report.performance.cumulativePnlCny,
+        profitFactor: report.performance.profitFactor,
+        expectancyCny: report.performance.expectancyCny,
+        winRatePct: report.performance.winRatePct,
+        maxDrawdownPct: report.performance.maxDrawdownPct
+      },
+      // 回放本身绝不打开未触碰的 Final OOS。
+      touchedFinalOos: false
+    }
+  });
+  return { dataset, report, directory };
+}
+
 async function validation(args) {
+  const startedAt = new Date().toISOString();
+  const baselineStrategy = strategyOption(args, "baseline-strategy", "challenger");
+  const candidateStrategy = strategyOption(args, "candidate-strategy", "challenger");
   const dataset = await load(args);
   const directory = resolveOutputPath(runId("validation"));
-  const report = await runValidationEngine(dataset, { outputDirectory: directory });
+  const report = await runValidationEngine(dataset, {
+    outputDirectory: directory,
+    baselineStrategy,
+    candidateStrategy,
+    baselineParameters: baselineStrategy === "challenger"
+      ? undefined
+      : defaultParametersFor(baselineStrategy),
+    candidateParameters: defaultParametersFor(candidateStrategy)
+  });
   const path = await save(join(directory, "validation-report.json"), report);
+  await recordRun("WALK_FORWARD_PURGED_OOS_VALIDATION", startedAt, report.passed ? "PASSED" : "PARTIAL", {
+    artifactPath: path,
+    dataManifestHash: dataset.manifest.manifestHash,
+    strategyVersion: candidateStrategy,
+    summary: {
+      baselineStrategy,
+      candidateStrategy,
+      passed: report.passed,
+      gateReasons: report.gateReasons,
+      windows: report.windows.length,
+      lookaheadPassed: report.lookaheadAudit?.passed ?? null,
+      touchedFinalOos: false
+    }
+  });
   process.stdout.write(`${JSON.stringify({ path, passed: report.passed, gateReasons: report.gateReasons, evidence: report.evidence, windows: report.windows.map((item) => ({ index: item.index, trainEnd: item.trainEnd, testStart: item.testStart, incremental: item.incremental, baselineTrades: item.baseline.tradeCount, candidateTrades: item.candidate.tradeCount })), lookahead: { passed: report.lookaheadAudit.passed, checksRun: report.lookaheadAudit.checksRun } }, null, 2)}\n`);
   return { dataset, report, directory };
 }
@@ -506,17 +665,23 @@ async function full(args) {
   return acceptance;
 }
 
+// 这个文件既是 CLI 入口，也导出 classifyResearchFailure / capitalOptions 等给测试与其它模块使用。
+// 只有作为进程入口被直接执行时才跑命令派发；被 import 时绝不能顺手启动一次研究运行。
+const invokedDirectly = Boolean(process.argv[1])
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
 const command = process.argv[2] ?? "data:inspect";
 const args = argumentsMap();
 const commandStartedAt = new Date().toISOString();
 // 只读命令没有「研究结果」可言，失败时不需要登记。
 const REGISTRY_EXEMPT_COMMANDS = new Set(["data:inspect", "research:runs", "research:register-candidate"]);
-try {
+if (invokedDirectly) try {
   if (command === "data:update") await dataUpdate(args);
   else if (command === "data:inspect") {
     const dataset = await load(args);
     process.stdout.write(`${JSON.stringify({ directory: dataset.directory, manifest: dataset.manifest }, null, 2)}\n`);
   } else if (command === "backtest") await backtest(args);
+  else if (command === "replay") await replay(args);
   else if (command === "validate") await validation(args);
   else if (command === "similarity") await similarity(args);
   else if (command === "robustness") await robustness(args);
@@ -576,16 +741,15 @@ try {
   // 失败也必须留痕。一次因为没有数据目录、或者公网不可达而跑不起来的研究，
   // 应该在登记簿里以 BLOCKED 出现，而不是悄悄消失、让 run count 看起来像“从没试过”。
   if (!REGISTRY_EXEMPT_COMMANDS.has(command)) {
-    await recordRun(`RESEARCH_CLI_${command.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`, commandStartedAt, "BLOCKED", {
+    const { status, interpretation } = classifyResearchFailure(error);
+    await recordRun(`RESEARCH_CLI_${command.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`, commandStartedAt, status, {
       summary: {
         command,
         arguments: args,
-        blockedReason: error.message,
-        interpretation: /ENOENT/.test(error.message)
-          ? "本地历史数据目录不存在（data/research 未提交 Git），需要先运行 data:update"
-          : /HTTP 40[357]|fetch failed|ENOTFOUND|EAI_AGAIN/.test(error.message)
-            ? "无法访问 HTX 公开历史端点，本环境网络策略不允许出站到 api.hbdm.com"
-            : "见 blockedReason"
+        failureReason: error.message,
+        errorName: error.name ?? null,
+        errorCode: error.code ?? null,
+        interpretation
       }
     });
   }

@@ -349,8 +349,16 @@ export function applyDynamicLimits(settings, context = {}) {
   const resolved = resolveDynamicLimits(settings, context);
   const applied = { ...settings };
   for (const item of Object.values(resolved.limits)) applied[item.key] = item.value;
-  // 单笔风险不得高于当前动态总风险上限。
-  if (applied.riskPerTradePct > applied.maxTotalRiskPct) applied.riskPerTradePct = applied.maxTotalRiskPct;
+  // 单笔风险不得高于当前动态总风险上限。收紧之后必须把 limits 一起改写，
+  // 否则 Telegram 显示的「本轮实际值」会和 buildPaperCandidate 真正使用的值不一致。
+  if (applied.riskPerTradePct > applied.maxTotalRiskPct) {
+    applied.riskPerTradePct = applied.maxTotalRiskPct;
+    resolved.limits.risk = {
+      ...resolved.limits.risk,
+      value: applied.maxTotalRiskPct,
+      reasons: [...resolved.limits.risk.reasons, `被当前总风险上限 ${round2(applied.maxTotalRiskPct * 100)}% 压低`]
+    };
+  }
   return { settings: applied, ...resolved };
 }
 

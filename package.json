@@ -33,7 +33,8 @@
     "check:safety": "node scripts/check-safety.mjs",
     "research:v2": "node src/research-cli.mjs research:v2",
     "research:runs": "node src/research-cli.mjs research:runs",
-    "research:register-candidate": "node src/research-cli.mjs research:register-candidate"
+    "research:register-candidate": "node src/research-cli.mjs research:register-candidate",
+    "replay": "node src/research-cli.mjs replay"
   },
   "engines": {
     "node": ">=24"

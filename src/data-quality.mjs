@@ -113,11 +113,14 @@ export const DATA_QUALITY_CHECKS = Object.freeze(CHECKS.map(({ key, tier, label,
 
 // 缺失来源判定：回放时点没有档案 vs 实时接口失败。绝不因为「历史没有」就用当前值回填。
 function resolveProvenance(key, report, market) {
-  const replayUnavailable = report.replay?.unavailableSources;
+  // 回放里 report.replay 可能要等策略跑完才被填上，因此也要看行情快照自己的
+  // point-in-time 标记，否则「历史天然无档案」会被误标成「实时接口失败」。
+  const replay = report.replay ?? market?.replay ?? null;
+  const replayUnavailable = replay?.unavailableSources;
   if (Array.isArray(replayUnavailable) && replayUnavailable.length) {
     return PROVENANCE.HISTORICAL_UNAVAILABLE;
   }
-  if (report.replay?.pointInTime) return PROVENANCE.HISTORICAL_UNAVAILABLE;
+  if (replay?.pointInTime || replay?.visibleAt !== undefined) return PROVENANCE.HISTORICAL_UNAVAILABLE;
   const warnings = market?.collectionWarnings;
   if (Array.isArray(warnings) && warnings.some((item) => String(item).startsWith(`${key}:`))) {
     return PROVENANCE.LIVE_FAILURE;
