@@ -373,7 +373,8 @@ export async function runHistoricalReplay(dataset, {
   collectTrace = true,
   forceCloseAtEnd = true,
   capitalProfile = CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
-  referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY
+  referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY,
+  archive = null
 } = {}) {
   if (!REPLAY_STRATEGIES.includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
   if (strategy === "historical-compatible" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = HISTORICAL_COMPATIBLE_PARAMETERS;
@@ -424,7 +425,11 @@ export async function runHistoricalReplay(dataset, {
       // cannot use the 12-row summary-cache shortcut.
       const compactCachedFrame = ["challenger", "historical-compatible", "tradable-edge"].includes(strategy)
         && hasChallengerFrameCache(candle.timestamp + BAR_MS, candle.close);
-      const market = buildPointInTimeMarket(dataset.candles, dataset.funding, index, { maximumBars: compactCachedFrame ? 12 : 260 });
+      const market = buildPointInTimeMarket(dataset.candles, dataset.funding, index, {
+        maximumBars: compactCachedFrame ? 12 : 260,
+        historicalSeries: dataset.series ?? {},
+        archive
+      });
       if (pending?.remaining === 1) {
         executePending(db, pending.report, candle, market, actions, config, executionDelayBars, rejectionCounts);
         pending = null;
@@ -442,6 +447,7 @@ export async function runHistoricalReplay(dataset, {
         eventClose: candle.close,
         timestamp: report.generatedAt,
         visibleAt: report.replay.visibleAt,
+        replayFields: market.replay.fieldStatus,
         price: report.currentPrice,
         decision: report.decision,
         candidateDecision: report.candidateDecision,
@@ -474,6 +480,14 @@ export async function runHistoricalReplay(dataset, {
       }
     }
     const closedTrades = db.getClosedPositions();
+    const replayFieldNames = [...new Set(trace.flatMap((item) => Object.keys(item.replayFields ?? {})))];
+    const replayDataCoverage = Object.fromEntries(replayFieldNames.map((field) => [field, {
+      availableEvents: trace.filter((item) => item.replayFields?.[field]?.available).length,
+      staleEvents: trace.filter((item) => item.replayFields?.[field]?.provenance === "STALE").length,
+      unavailableEvents: trace.filter((item) => item.replayFields?.[field]?.provenance === "HISTORICAL_UNAVAILABLE").length
+    }]));
+    const derivativeFields = ["depth", "openInterest", "eliteAccount", "elitePosition", "liquidations", "markPrice", "premium", "basis"];
+    const noDerivativeEvidence = derivativeFields.every((field) => Number(replayDataCoverage[field]?.availableEvents ?? 0) === 0);
     const report = {
       schemaVersion: 1,
       runType: "HISTORICAL_REPLAY",
@@ -496,6 +510,13 @@ export async function runHistoricalReplay(dataset, {
         highTimeframeCloseBoundaryEnforced: true,
         futureRowsPassedToStrategy: false,
         historicalMissingValuesSynthesized: false
+      },
+      replayDataCoverage: {
+        fields: replayDataCoverage,
+        noDerivativeEvidence,
+        warning: noDerivativeEvidence
+          ? "NO_DERIVATIVES_HISTORY: replay decisions may all WAIT under the frozen strict data gate; this is a coverage limitation, not strategy evidence"
+          : null
       },
       performance: {
         ...enrichPerformance(db, trace),

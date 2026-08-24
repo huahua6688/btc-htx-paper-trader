@@ -54,6 +54,8 @@ test("Telegram control accepts only the configured administrator and persists at
     assert.equal(panel.view("main").markup.inline_keyboard.flat().some((button) => button.text.includes("恢复")), false);
     assert.ok(panel.view("details").text.includes("仅实际生效因素"));
     assert.ok(panel.view("research").text.includes("权重为 0"));
+    assert.ok(panel.view("data-status").text.includes("数据状态（只读）"));
+    assert.ok(panel.view("data-status").text.includes("Replay 字段"));
   } finally {
     db.close();
     assert.equal(readFileSync(path).includes(Buffer.from(token)), false, "Bot Token 不得写入 SQLite");

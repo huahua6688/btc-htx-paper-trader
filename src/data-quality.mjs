@@ -31,8 +31,12 @@ export const DATA_STATUS = Object.freeze({
 });
 
 export const PROVENANCE = Object.freeze({
+  HTX_HISTORICAL: "HTX_HISTORICAL",
+  SELF_ARCHIVED: "SELF_ARCHIVED",
+  LIVE_OBSERVED: "LIVE_OBSERVED",
   LIVE_FAILURE: "LIVE_FAILURE",
-  HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE"
+  HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE",
+  STALE: "STALE"
 });
 
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
@@ -113,6 +117,21 @@ export const DATA_QUALITY_CHECKS = Object.freeze(CHECKS.map(({ key, tier, label,
 
 // 缺失来源判定：回放时点没有档案 vs 实时接口失败。绝不因为「历史没有」就用当前值回填。
 function resolveProvenance(key, report, market) {
+  const sourceKeys = {
+    price: ["ticker"],
+    kline15m: ["kline15m"],
+    higherTimeframes: ["kline1h", "kline4h", "kline1d"],
+    orderBook: ["depth"],
+    funding: ["fundingCurrent", "fundingHistory"],
+    openInterest: ["oiCurrent", "oiHistory"],
+    elitePositioning: ["eliteAccount", "elitePosition"],
+    markBasis: ["markPrice", "basis"],
+    pressureComponents: ["fundingCurrent", "oiCurrent", "eliteAccount", "elitePosition", "liquidations", "basis"]
+  }[key] ?? [key];
+  const declared = sourceKeys.map((sourceKey) => market?.dataProvenance?.[sourceKey]).filter(Boolean);
+  if (declared.includes(PROVENANCE.STALE)) return PROVENANCE.STALE;
+  if (declared.includes(PROVENANCE.LIVE_FAILURE)) return PROVENANCE.LIVE_FAILURE;
+  if (declared.length && declared.every((item) => item === PROVENANCE.HISTORICAL_UNAVAILABLE)) return PROVENANCE.HISTORICAL_UNAVAILABLE;
   // 回放里 report.replay 可能要等策略跑完才被填上，因此也要看行情快照自己的
   // point-in-time 标记，否则「历史天然无档案」会被误标成「实时接口失败」。
   const replay = report.replay ?? market?.replay ?? null;

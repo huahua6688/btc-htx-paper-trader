@@ -194,12 +194,20 @@ Feature Registry 记录每项特征的数据源、时间层、当前权重、适
 
 研究模块现在是可运行实现，不是验证字段或 README 占位。冻结的 V1.2 Champion 源码哈希保持为 `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`。研究运行不会修改 Champion，也不会改变实时 Risk Gate。
 
-数据目录从 HTX 固定公开端点下载 BTC-USDT 永续 15m K 线与历史 Funding，按请求时间范围分页、校验、缓存和增量合并。`manifest.json` 记录来源、下载时间、覆盖范围、时间戳语义、缺口、重复、缺失率和文件 SHA-256。Order Book、历史 OI、精英持仓、清算与 Basis 如果没有可靠时点历史，会保持 `null`；绝不从 K 线合成。
+Historical Catalog V2 从 HTX 固定公开端点下载 BTC-USDT 永续 Kline、Funding，以及官方端点在请求时仍能提供的 OI、精英账户/仓位比、Mark Price、Premium、Basis 和最近清算。Kline 与 Funding 可分页；其余端点只有有限的最新窗口，Depth 只有实时快照。`manifest.json` 对每类数据记录来源、抓取时间、事件时间、实际端点覆盖、缺口、重复、原始 payload SHA-256、schema 和 provenance。超出官方真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md)。
+
+实时 monitor 每轮把已成功取得的 HTX 原始响应和 normalized 研究字段 best-effort 写入独立 `market-archive.sqlite`。归档失败只产生警告，不影响 Paper 仓位管理；原始 payload 不会因 parser 升级被重写，normalized 字段可从原始数据重新生成。Replay V2 只读取 `eventTime <= visibleAt` 且没有超过字段 TTL 的 Catalog/Archive 记录，并逐字段标记 `HTX_HISTORICAL / SELF_ARCHIVED / HISTORICAL_UNAVAILABLE / STALE / LIVE_FAILURE`。
 
 ```bash
 # 必须显式给出连续区间；不会自动挑选收益最好看的时期
 npm run data:update -- --from=2024-09-01T00:00:00.000Z --to=2026-07-31T23:45:00.000Z
 npm run data:inspect
+
+# 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
+npm run htx:status
+npm run htx:check
+npm run htx:update
+npm run archive:status
 
 # Champion 与 Challenger 同事件、独立 SQLite 的逐 15m 回放
 npm run backtest -- --from=2024-09-01T00:00:00.000Z --to=2026-07-31T23:45:00.000Z
@@ -298,6 +306,10 @@ npm run analyze
 npm run monitor
 npm run status
 npm run health
+npm run htx:status
+npm run htx:check
+npm run htx:update
+npm run archive:status
 npm run report
 npm run gate:report
 npm run telegram:test
@@ -309,6 +321,10 @@ npm run check:safety
 - `monitor`：立即运行一次，之后每 5 分钟分析、写 SQLite 并管理模拟仓位。
 - `status`：第一部分显示实际数据库路径，并显示权益、可用资金、已/未实现盈亏、保证金、名义仓位、有效杠杆、净仓位、当前风险、最近判断和数据源质量。
 - `health`：只读 SQLite；超过 15 分钟没有成功 monitor、最近运行失败或数据库不可用时返回非零退出码。
+- `htx:status`：显示已安装 release、SHA-256、最后一次上游检查和兼容性报告，不访问交易账户。
+- `htx:check`：只查询官方 GitHub Release 并比较身份，不修改生产 binary。
+- `htx:update`：下载到 staging，验证官方 release 身份/可用 checksum、跑全部已采用 public command 的兼容测试、项目测试和安全扫描，全部通过才原子替换并保留 rollback。它不会自动扩大白名单。
+- `archive:status`：只读显示独立 Market Archive 的覆盖、缺口和存储统计。
 - `report`：输出多/空交易、均盈亏、Profit Factor、Expectancy、最大回撤、RR、实际杠杆、保证金使用、毛收益、手续费、Funding、滑点、净收益和账户收益率。
 - `gate:report`：统计方向偏好、动态入场方式和真实硬性拦截。
 
@@ -393,22 +409,22 @@ cd /opt/btc-htx-paper
 
 用户已存在时可以忽略 `useradd` 的提示。
 
-### 3. 安装固定版本的 HTX 官方公开行情 CLI
+### 3. 受控安装或更新 HTX 官方公开行情 CLI
 
-应用只允许白名单内的公开行情命令，不安装或调用交易 Skills。
+应用只允许既有白名单内的公开行情命令，不安装或调用交易 Skills。`htx:check` 只检查；`htx:update` 先在 staging 对所有项目实际使用的命令做兼容验证，再跑完整测试和安全扫描，全部成功后才原子替换。失败时原 binary 保持不变，旧 binary 保存在 `vendor/rollback/`。
 
 ```bash
-sudo curl -fL \
-  https://github.com/htx-exchange/htx-skills-hub/releases/download/v2.0.0/htx-cli-linux-x64 \
-  -o /opt/btc-htx-paper/vendor/htx-cli-linux-x64
+sudo install -d -m 0750 -o root -g btc-htx /var/lib/btc-htx-paper/htx-cli
+cd /opt/btc-htx-paper
+sudo env HTX_CLI_STATE_DIR=/var/lib/btc-htx-paper/htx-cli npm run htx:check
+sudo env HTX_CLI_STATE_DIR=/var/lib/btc-htx-paper/htx-cli npm run htx:update
+sudo env HTX_CLI_STATE_DIR=/var/lib/btc-htx-paper/htx-cli npm run htx:status
 
-echo "cffbdebd18d22aa6367cb3779a735e3fbfabaaf03f0e559eac833130b5172fe0  /opt/btc-htx-paper/vendor/htx-cli-linux-x64" \
-  | sha256sum -c -
-
-sudo chmod 0750 /opt/btc-htx-paper/vendor/htx-cli-linux-x64
 sudo chown -R root:btc-htx /opt/btc-htx-paper
 sudo chmod -R g+rX,o-rwx /opt/btc-htx-paper
 ```
+
+若 GitHub Release 提供 `sha256:` digest，updater 必须匹配后才继续；若上游没有发布 checksum，状态会明确显示 `officialChecksumProvided=false`，仅记录本地 SHA-256 和 release identity，绝不会冒充官方 checksum 验证。
 
 ### 4. 部署前验证
 
@@ -435,6 +451,8 @@ sudo logrotate --debug /etc/logrotate.d/btc-htx-paper
 
 ```text
 PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite
+MARKET_ARCHIVE_DB_PATH=/var/lib/btc-htx-paper/market-archive.sqlite
+HTX_CLI_STATE_DIR=/var/lib/btc-htx-paper/htx-cli
 PAPER_HEALTH_MAX_AGE_MS=900000
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -458,6 +476,7 @@ sudo -u btc-htx /usr/bin/env PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.
 sudo -u btc-htx /usr/bin/env PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite PAPER_HEALTH_MAX_AGE_MS=900000 /usr/bin/node src/health.mjs
 sudo -u btc-htx /usr/bin/env PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite /usr/bin/node src/report.mjs
 sudo -u btc-htx /usr/bin/env PAPER_DB_PATH=/var/lib/btc-htx-paper/paper-trading.sqlite /usr/bin/node src/gate-report.mjs --hours=24
+sudo -u btc-htx /usr/bin/env MARKET_ARCHIVE_DB_PATH=/var/lib/btc-htx-paper/market-archive.sqlite /usr/bin/node src/market-archive-cli.mjs status
 ```
 
 Telegram 测试不会把 Token 放入进程参数：
@@ -468,7 +487,7 @@ sudo -u btc-htx /bin/bash -c 'set -a; . /etc/btc-htx-paper.env; set +a; cd /opt/
 
 systemd 使用 `Restart=on-failure`，程序异常后自动重启；`enable` 保证 VPS 重启后自动启动。程序优雅处理 SIGTERM/SIGINT，并在结束前停止 Telegram polling、等待当前周期并关闭 SQLite。
 
-SQLite 位于 `/var/lib/btc-htx-paper/paper-trading.sqlite`，Telegram 去重状态位于同目录的 `notification-state/`。日志位于 `/var/log/btc-htx-paper/monitor.log`，每日轮转、达到 10MB 提前轮转、压缩并保留 14 份。
+Paper SQLite 位于 `/var/lib/btc-htx-paper/paper-trading.sqlite`，研究 registry 位于独立的 `research-registry.sqlite`，长期 HTX 公开行情归档位于独立的 `market-archive.sqlite`；三者不会混表。Telegram 去重状态位于同目录的 `notification-state/`。日志位于 `/var/log/btc-htx-paper/monitor.log`，每日轮转、达到 10MB 提前轮转、压缩并保留 14 份。
 
 ## 已部署 VPS 的最少升级步骤
 

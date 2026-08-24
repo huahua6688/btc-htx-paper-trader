@@ -616,8 +616,9 @@ const COMMANDS = {
     handler: (args) => dataUpdate(args),
     runType: "DATA_CATALOG_UPDATE",
     record: (result) => ({
+      status: result?.manifest?.quality === "VALID" ? "PASSED" : "PARTIAL",
       dataManifestHash: result?.manifest?.manifestHash ?? null,
-      summary: { fetched: result?.fetched ?? null, directory: result?.directory ?? null }
+      summary: { fetched: result?.fetched ?? null, directory: result?.directory ?? null, quality: result?.manifest?.quality ?? null, fetchErrors: result?.manifest?.fetchErrors ?? [] }
     })
   },
   "data:inspect": {

@@ -7,7 +7,8 @@ const validDateMs = (value) => {
 
 export function evaluateHealth(db, {
   nowMs = Date.now(),
-  maxAgeMs = HEALTH_CONFIG.maxAgeMs
+  maxAgeMs = HEALTH_CONFIG.maxAgeMs,
+  infrastructure = null
 } = {}) {
   const failures = [];
   const account = db.getAccount();
@@ -45,7 +46,8 @@ export function evaluateHealth(db, {
       cashCny: Number(account.cash_cny),
       initialCapitalCny: Number(account.initial_capital_cny),
       openPosition: Boolean(db.getOpenPosition())
-    } : null
+    } : null,
+    infrastructure
   };
 }
 
@@ -57,6 +59,15 @@ export function formatHealth(result) {
   if (result.monitor) lines.push(`最近 monitor：${result.monitor.status} / ${result.monitor.finishedAt} / ${result.monitor.ageSeconds}s 前`);
   if (result.snapshot) lines.push(`快照：${result.snapshot.count} 次 / ${result.snapshot.decision} / ${result.snapshot.price} USDT`);
   if (result.account) lines.push(`模拟现金：${result.account.cashCny} CNY / 模拟持仓：${result.account.openPosition ? "有" : "无"}`);
+  if (result.infrastructure) {
+    const infra = result.infrastructure;
+    lines.push(
+      `HTX CLI：${infra.htx.installed ? infra.htx.release ?? "INSTALLED" : "MISSING"} / SHA ${infra.htx.sha256 ?? "—"}`,
+      `命令兼容：${infra.htx.compatibility ? infra.htx.compatibility.compatible ? "PASS" : "FAIL" : "尚未运行"}`,
+      `Archive：${infra.archive.available ? `${infra.archive.storage.records} 条 / latest ${infra.archive.coverage.map((item) => item.latest).sort().at(-1) ?? "—"}` : "尚未建立"}`,
+      `Catalog：${infra.catalog.available ? `v${infra.catalog.schemaVersion} / ${infra.catalog.quality}` : "尚未建立"}`
+    );
+  }
   if (result.failures.length) lines.push("失败原因：", ...result.failures.map((item) => `- ${item}`));
   lines.push("安全：health 只读取本地 SQLite，不调用交易所接口。");
   return lines.join("\n");

@@ -5,6 +5,8 @@ import { dirname, join, resolve } from "node:path";
 const configuredHealthAge = Number(process.env.PAPER_HEALTH_MAX_AGE_MS);
 const projectDatabasePath = fileURLToPath(new URL("../data/paper-trading.sqlite", import.meta.url));
 const productionDatabasePath = "/var/lib/btc-htx-paper/paper-trading.sqlite";
+const projectArchivePath = fileURLToPath(new URL("../data/market-archive.sqlite", import.meta.url));
+const productionArchivePath = "/var/lib/btc-htx-paper/market-archive.sqlite";
 
 export function resolveDatabaseLocation({
   argv = process.argv,
@@ -23,6 +25,25 @@ export function resolveDatabaseLocation({
 }
 
 const databaseLocation = resolveDatabaseLocation();
+
+export function resolveMarketArchiveLocation({
+  environment = process.env,
+  platform = process.platform
+} = {}) {
+  const environmentValue = environment.MARKET_ARCHIVE_DB_PATH?.trim();
+  if (environmentValue) return { path: resolve(environmentValue), source: "MARKET_ARCHIVE_DB_PATH" };
+  if (platform === "linux") return { path: productionArchivePath, source: "VPS_PERSISTENT_DEFAULT" };
+  return { path: projectArchivePath, source: "PROJECT_DEFAULT" };
+}
+
+const marketArchiveLocation = resolveMarketArchiveLocation();
+
+export const MARKET_ARCHIVE_CONFIG = Object.freeze({
+  path: marketArchiveLocation.path,
+  pathSource: marketArchiveLocation.source,
+  schemaVersion: 2,
+  source: "HTX_PUBLIC_READ_ONLY"
+});
 
 export const PAPER_CONFIG = Object.freeze({
   version: "V1.2",

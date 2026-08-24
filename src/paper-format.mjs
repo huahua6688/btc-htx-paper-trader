@@ -49,7 +49,7 @@ export function formatCycle(result) {
   return lines.join("\n");
 }
 
-export function formatStatus(db) {
+export function formatStatus(db, infrastructure = null) {
   const snapshot = db.getLatestSnapshot();
   const report = snapshot?.report;
   const state = calculateAccountState(db, snapshot?.price);
@@ -129,6 +129,17 @@ export function formatStatus(db) {
     "新增研究特征在 OOS + walk-forward + Shadow Paper + 明确晋级前权重为 0；长期层不能触发分钟级交易。",
     "安全：没有 API Key、私有接口、真实调杠杆或真实下单能力。"
   );
+  if (infrastructure) {
+    lines.push(
+      "",
+      "HTX / Research Data Infrastructure V2",
+      `HTX CLI：${infrastructure.htx.installed ? infrastructure.htx.release ?? "已安装" : "MISSING"} / SHA ${infrastructure.htx.sha256 ?? "—"}`,
+      `兼容检查：${infrastructure.htx.compatibility ? infrastructure.htx.compatibility.compatible ? "PASS" : "FAIL" : "尚未运行"}；上游更新 ${infrastructure.htx.updateAvailable === null ? "未检查" : infrastructure.htx.updateAvailable ? "有" : "无"}`,
+      `Market Archive：${infrastructure.archive.available ? `${infrastructure.archive.storage.records} 条 / ${infrastructure.archive.path}` : `尚未建立 / ${infrastructure.archive.path}`}`,
+      `Historical Catalog：${infrastructure.catalog.available ? `v${infrastructure.catalog.schemaVersion} / ${infrastructure.catalog.quality}` : "尚未建立"}`,
+      `Replay：${infrastructure.replayFields.filter((item) => item.provenance !== "HISTORICAL_UNAVAILABLE").map((item) => item.field).join("、") || "仅 Kline/Funding"}`
+    );
+  }
   return lines.join("\n");
 }
 

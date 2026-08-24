@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+export const HTX_RAW_PAYLOAD = Symbol.for("btc-htx-paper.htxRawPayload");
 
 export function resolveCliPath({ platform = process.platform, arch = process.arch } = {}) {
   if (arch !== "x64") throw new Error(`Unsupported HTX CLI architecture: ${platform}/${arch}`);
@@ -49,7 +50,8 @@ const SECRET_NAMES = [
   "ACCESS_KEY",
   "SECRET_KEY",
   "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHAT_ID"
+  "TELEGRAM_CHAT_ID",
+  "TELEGRAM_ADMIN_USER_ID"
 ];
 
 export function scrubEnvironment(source = process.env) {
@@ -100,15 +102,35 @@ function assertSuccessfulPayload(payload, skill, subcommand) {
   return payload;
 }
 
-export async function runPublicCommand(skill, subcommand, params = {}) {
+// HTX v2.0.0 returns OI-history and elite-ratio `data` as an object, while
+// older local consumers use the documented one-item array shape. Normalize
+// only those read-only responses at the integration boundary; raw archive
+// storage still preserves the exact CLI payload it actually received.
+export function normalizePublicCommandPayload(skill, subcommand, payload) {
+  let normalized = payload;
+  if (skill === "oi-tracker" && ["current", "history"].includes(subcommand)
+    && payload?.data && !Array.isArray(payload.data)) {
+    normalized = { ...payload, data: [payload.data] };
+  }
+  if (skill === "elite-positioning" && ["account-ratio", "position-ratio"].includes(subcommand)
+    && payload?.data && !Array.isArray(payload.data)) {
+    normalized = { ...payload, data: [payload.data] };
+  }
+  if (normalized !== payload) Object.defineProperty(normalized, HTX_RAW_PAYLOAD, { value: payload, enumerable: false });
+  return normalized;
+}
+
+export async function runPublicCommandWithBinary(cliPath, skill, subcommand, params = {}, {
+  execFileImpl = execFileAsync,
+  timeoutMs = 20_000
+} = {}) {
   assertAllowedCommand(skill, subcommand, params);
-  const cliPath = resolveCliPath();
   const args = [skill, subcommand];
   for (const [key, value] of Object.entries(params)) args.push("-p", `${key}=${value}`);
 
-  const { stdout, stderr } = await execFileAsync(cliPath, args, {
+  const { stdout, stderr } = await execFileImpl(cliPath, args, {
     windowsHide: true,
-    timeout: 20_000,
+    timeout: timeoutMs,
     maxBuffer: 12 * 1024 * 1024,
     env: scrubEnvironment()
   });
@@ -120,7 +142,11 @@ export async function runPublicCommand(skill, subcommand, params = {}) {
   } catch {
     throw new Error(`${skill}/${subcommand} returned invalid JSON`);
   }
-  return assertSuccessfulPayload(payload, skill, subcommand);
+  return normalizePublicCommandPayload(skill, subcommand, assertSuccessfulPayload(payload, skill, subcommand));
+}
+
+export async function runPublicCommand(skill, subcommand, params = {}) {
+  return runPublicCommandWithBinary(resolveCliPath(), skill, subcommand, params);
 }
 
 export const publicCommandRules = RULES;

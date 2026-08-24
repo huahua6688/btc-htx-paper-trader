@@ -35,10 +35,13 @@ export function runLookaheadAudit(dataset, {
   const step = Math.max(1, Math.floor((last - first) / samples));
   const checks = [];
   for (let index = first; index <= last && checks.length < samples; index += step) {
-    const fullMarket = buildPointInTimeMarket(dataset.candles, dataset.funding, index);
+    const fullMarket = buildPointInTimeMarket(dataset.candles, dataset.funding, index, { historicalSeries: dataset.series ?? {} });
     const prefixCandles = dataset.candles.slice(0, index + 1);
     const prefixFunding = dataset.funding.filter((item) => item.timestamp <= fullMarket.replay.visibleAt);
-    const prefixMarket = buildPointInTimeMarket(prefixCandles, prefixFunding, prefixCandles.length - 1);
+    const prefixSeries = Object.fromEntries(Object.entries(dataset.series ?? {}).map(([key, rows]) => [key,
+      rows.filter((row) => Number(row.eventTime) <= fullMarket.replay.visibleAt)
+    ]));
+    const prefixMarket = buildPointInTimeMarket(prefixCandles, prefixFunding, prefixCandles.length - 1, { historicalSeries: prefixSeries });
     for (const strategy of strategies) {
       const analyze = strategy === "champion"
         ? (market) => analyzeSnapshot(market)

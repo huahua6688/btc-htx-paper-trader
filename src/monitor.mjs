@@ -9,6 +9,8 @@ import { readJson, resolveResearchPath } from "./research-utils.mjs";
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2 } from "./research-challenger-v2.mjs";
+import { openMarketArchive } from "./market-archive.mjs";
+import { getHtxInstalledStatus } from "./htx-upstream.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
@@ -49,6 +51,22 @@ const shadowDb = SHADOW_CONFIG.enabled
   : null;
 const telegram = new TelegramNotifier();
 const telegramControl = new TelegramControlPanel(db);
+let marketArchive = null;
+let htxIdentity = null;
+try {
+  marketArchive = openMarketArchive();
+} catch (error) {
+  process.stderr.write(`HTX Market Archive disabled safely for this process: ${error.message}\n`);
+}
+try {
+  const installed = await getHtxInstalledStatus({ verifyHash: false });
+  htxIdentity = {
+    release: installed.installedMetadata?.release?.tag ?? installed.sourceManifest?.release?.tag ?? null,
+    sha256: installed.installedMetadata?.installedSha256 ?? installed.installedSha256 ?? null
+  };
+} catch (error) {
+  process.stderr.write(`HTX CLI identity unavailable for archive provenance: ${error.message}\n`);
+}
 let stopped = false;
 let running = false;
 let timer = null;
@@ -56,7 +74,15 @@ let databaseClosed = false;
 
 async function cycle() {
   try {
-    const result = await runMonitorCycle(db);
+    const result = await runMonitorCycle(db, {
+      archive: marketArchive
+        ? (market, { observedAt }) => marketArchive.archiveSnapshot(market, {
+            observedAt,
+            cliRelease: htxIdentity?.release ?? null,
+            cliSha256: htxIdentity?.sha256 ?? null
+          })
+        : null
+    });
     process.stdout.write(`${formatCycle(result)}\n`);
     await telegram.notifyMonitorResult(result, db);
     if (shadowDb) {
@@ -87,6 +113,7 @@ async function main() {
     await telegramControl.pollOnce();
     await cycle();
     shadowDb?.close();
+    marketArchive?.close();
     db.close();
     return;
   }
@@ -96,6 +123,7 @@ async function main() {
     databaseClosed = true;
     telegramControl.stop();
     shadowDb?.close();
+    marketArchive?.close();
     db.close();
     process.stdout.write("V1.2 monitor 已停止。\n");
     process.exit(0);

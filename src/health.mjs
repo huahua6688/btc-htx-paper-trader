@@ -3,6 +3,7 @@ import { PAPER_CONFIG } from "./config.mjs";
 import { openPaperDatabase } from "./db.mjs";
 import { evaluateHealth, formatHealth } from "./health-check.mjs";
 import { TelegramNotifier } from "./telegram-notifier.mjs";
+import { buildDataInfrastructureStatus } from "./data-infrastructure-status.mjs";
 
 const json = process.argv.includes("--json");
 
@@ -21,7 +22,8 @@ async function main() {
   } else {
     try {
       db = openPaperDatabase(PAPER_CONFIG.databasePath, PAPER_CONFIG, { readOnly: true });
-      result = evaluateHealth(db);
+      const infrastructure = await buildDataInfrastructureStatus(db);
+      result = evaluateHealth(db, { infrastructure });
     } catch (error) {
       result = {
         healthy: false,

@@ -1,0 +1,396 @@
+import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile
+} from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { MARKET_TASKS } from "./market-data.mjs";
+import { resolveCliPath, runPublicCommandWithBinary } from "./htx-cli.mjs";
+
+const execFileAsync = promisify(execFile);
+const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+const sourceManifestPath = fileURLToPath(new URL("../vendor/htx-cli-source.json", import.meta.url));
+const GITHUB_API = "https://api.github.com/repos/htx-exchange/htx-skills-hub";
+const SOURCE_REPO = "https://github.com/htx-exchange/htx-skills-hub";
+const RELEASE_ASSET_TIMEOUT_MS = 10 * 60_000;
+
+export const HTX_UPSTREAM = Object.freeze({
+  sourceRepo: SOURCE_REPO,
+  releasesApi: `${GITHUB_API}/releases/latest`,
+  sourceManifestPath
+});
+
+function runtimeDirectory(environment = process.env) {
+  const configured = environment.HTX_CLI_STATE_DIR?.trim();
+  return configured ? resolve(configured) : fileURLToPath(new URL("../vendor/.htx-runtime/", import.meta.url));
+}
+
+export function htxRuntimePaths(environment = process.env) {
+  const directory = runtimeDirectory(environment);
+  return {
+    directory,
+    installedMetadata: join(directory, "installed.json"),
+    upstreamCheck: join(directory, "upstream-check.json"),
+    lock: join(directory, "update.lock")
+  };
+}
+
+export function platformAssetName({ platform = process.platform, arch = process.arch } = {}) {
+  if (arch !== "x64") throw new Error(`Unsupported HTX CLI architecture: ${platform}/${arch}`);
+  if (platform === "linux") return "htx-cli-linux-x64";
+  if (platform === "win32") return "htx-cli-windows-x64.exe";
+  throw new Error(`Unsupported HTX CLI platform: ${platform}/${arch}`);
+}
+
+async function exists(path) {
+  try { await access(path); return true; } catch { return false; }
+}
+
+export async function sha256File(path) {
+  const hash = createHash("sha256");
+  const stream = createReadStream(path);
+  for await (const chunk of stream) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function readJson(path, fallback = null) {
+  try { return JSON.parse(await readFile(path, "utf8")); } catch { return fallback; }
+}
+
+async function writeJsonAtomic(path, value) {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(temporary, path);
+}
+
+function assertOfficialRelease(release) {
+  if (!release || release.draft || release.prerelease) throw new Error("Latest HTX release is missing, draft, or prerelease");
+  if (!/^v\d+\.\d+\.\d+$/.test(String(release.tag_name))) throw new Error("Unexpected HTX release tag");
+  if (!String(release.html_url ?? "").startsWith(`${SOURCE_REPO}/releases/tag/`)) throw new Error("HTX release identity is not from the official repository");
+  return release;
+}
+
+function assertNormalizedReleaseIdentity(release) {
+  if (!release || !/^v\d+\.\d+\.\d+$/.test(String(release.tag))) throw new Error("Unexpected HTX release identity");
+  if (!String(release.url ?? "").startsWith(`${SOURCE_REPO}/releases/tag/`)) {
+    throw new Error("HTX release identity is not from the official repository");
+  }
+  return release;
+}
+
+async function fetchJson(url, { fetchImpl = fetch } = {}) {
+  const parsed = new URL(url);
+  if (parsed.origin !== "https://api.github.com" || !parsed.pathname.startsWith("/repos/htx-exchange/htx-skills-hub/")) {
+    throw new Error("Blocked non-official HTX upstream URL");
+  }
+  const response = await fetchImpl(parsed, {
+    headers: { accept: "application/vnd.github+json", "user-agent": "btc-htx-paper-updater/2" },
+    signal: AbortSignal.timeout(30_000)
+  });
+  if (!response.ok) throw new Error(`HTX upstream query failed: HTTP ${response.status}`);
+  return response.json();
+}
+
+export async function fetchLatestHtxRelease({ fetchImpl = fetch } = {}) {
+  const release = assertOfficialRelease(await fetchJson(HTX_UPSTREAM.releasesApi, { fetchImpl }));
+  let commitSha = null;
+  try {
+    const commit = await fetchJson(`${GITHUB_API}/commits/${encodeURIComponent(release.tag_name)}`, { fetchImpl });
+    commitSha = /^[0-9a-f]{40}$/i.test(String(commit.sha)) ? commit.sha : null;
+  } catch {
+    // Release identity remains usable even if the supplementary commit lookup is unavailable.
+  }
+  return {
+    id: release.id,
+    tag: release.tag_name,
+    name: release.name || null,
+    publishedAt: release.published_at,
+    url: release.html_url,
+    targetCommitish: release.target_commitish,
+    commitSha,
+    assets: (release.assets ?? []).map((asset) => ({
+      id: asset.id,
+      name: asset.name,
+      size: Number(asset.size),
+      digest: asset.digest ?? null,
+      downloadUrl: asset.browser_download_url,
+      createdAt: asset.created_at
+    }))
+  };
+}
+
+export async function getHtxInstalledStatus({
+  environment = process.env,
+  cliPath = resolveCliPath(),
+  verifyHash = true
+} = {}) {
+  const paths = htxRuntimePaths(environment);
+  const [sourceManifest, installedMetadata, lastCheck] = await Promise.all([
+    readJson(sourceManifestPath),
+    readJson(paths.installedMetadata),
+    readJson(paths.upstreamCheck)
+  ]);
+  const installed = await exists(cliPath);
+  const installedSha256 = installed && verifyHash ? await sha256File(cliPath) : installedMetadata?.installedSha256 ?? null;
+  const asset = platformAssetName();
+  const lockedAsset = sourceManifest?.assets?.[`${process.platform}-${process.arch}`] ?? null;
+  const identityMatchesMetadata = Boolean(installed && installedMetadata?.installedSha256 && installedSha256 === installedMetadata.installedSha256);
+  return {
+    sourceRepo: SOURCE_REPO,
+    cliPath,
+    asset,
+    installed,
+    installedSha256,
+    identityMatchesMetadata,
+    installedMetadata,
+    sourceManifest,
+    lockedAsset,
+    lastCheck,
+    upstreamUpdateAvailable: lastCheck?.upstream?.tag
+      ? installedMetadata?.release?.tag
+        ? lastCheck.upstream.tag !== installedMetadata.release.tag
+        : typeof lastCheck.updateAvailable === "boolean" ? lastCheck.updateAvailable : null
+      : null
+  };
+}
+
+function validateCompatibilityPayload(key, payload) {
+  const array = (value) => Array.isArray(value);
+  const finite = (value) => Number.isFinite(Number(value));
+  const checks = {
+    ticker: () => payload?.status === "ok" && finite(payload?.tick?.close) && finite(payload?.ts ?? payload?.tick?.ts),
+    kline15m: () => array(payload?.data) && payload.data.length > 0 && ["id", "open", "high", "low", "close"].every((field) => payload.data[0]?.[field] !== undefined),
+    kline1h: () => checks.kline15m(), kline4h: () => checks.kline15m(), kline1d: () => checks.kline15m(),
+    depth: () => array(payload?.tick?.bids) && array(payload?.tick?.asks) && finite(payload?.tick?.ts ?? payload?.ts),
+    fundingCurrent: () => payload?.status === "ok" && payload?.data?.funding_rate !== undefined,
+    fundingHistory: () => array(payload?.data?.data) && (!payload.data.data.length || payload.data.data[0].funding_time !== undefined),
+    oiCurrent: () => array(payload?.data) && (!payload.data.length || payload.data[0].value !== undefined),
+    oiHistory: () => array(payload?.data?.[0]?.tick) && (!payload.data[0].tick.length || payload.data[0].tick[0].ts !== undefined),
+    eliteAccount: () => array(payload?.data?.[0]?.list),
+    elitePosition: () => array(payload?.data?.[0]?.list),
+    liquidations: () => Number(payload?.code) === 200 && array(payload?.data),
+    markPrice: () => array(payload?.data) && (!payload.data.length || payload.data[0].id !== undefined),
+    premium: () => array(payload?.data) && (!payload.data.length || payload.data[0].id !== undefined),
+    basis: () => array(payload?.data) && (!payload.data.length || payload.data[0].basis_rate !== undefined),
+    contractElements: () => array(payload?.data) && (!payload.data.length || payload.data[0].contract_code === "BTC-USDT")
+  };
+  return Boolean(checks[key]?.());
+}
+
+export async function runHtxCompatibilitySmokeTest(cliPath, {
+  commandRunner = (path, skill, subcommand, params) => runPublicCommandWithBinary(path, skill, subcommand, params, { timeoutMs: 30_000 }),
+  concurrency = 3
+} = {}) {
+  const results = [];
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(4, concurrency)) }, async () => {
+    while (cursor < MARKET_TASKS.length) {
+      const index = cursor++;
+      const [key, skill, subcommand, params] = MARKET_TASKS[index];
+      try {
+        const payload = await commandRunner(cliPath, skill, subcommand, params);
+        const compatible = validateCompatibilityPayload(key, payload);
+        results[index] = { key, skill, subcommand, compatible, error: compatible ? null : "required JSON fields missing" };
+      } catch (error) {
+        results[index] = { key, skill, subcommand, compatible: false, error: error.message };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return {
+    checkedAt: new Date().toISOString(),
+    compatible: results.every((item) => item.compatible),
+    commands: results
+  };
+}
+
+export function buildHtxCapabilityReport(compatibility = null) {
+  const current = MARKET_TASKS.map(([key, skill, subcommand]) => ({ key, skill, subcommand }));
+  return {
+    currentSupported: current,
+    upstreamPublicNotAdopted: [
+      "spot-market public family",
+      "futures-market bbo/trade/history-trade/index/contract-info/risk-info/timestamp/heartbeat",
+      "funding-rate batch/estimated-kline",
+      "settlement public family"
+    ],
+    upstreamRestrictedNotAdopted: ["account and exchange-write families"],
+    incompatible: compatibility?.commands?.filter((item) => !item.compatible) ?? [],
+    whitelistAutoExpanded: false
+  };
+}
+
+export async function checkHtxUpstream(options = {}) {
+  const upstream = await (options.releaseProvider ?? fetchLatestHtxRelease)(options);
+  const installed = await getHtxInstalledStatus(options);
+  const assetName = platformAssetName(options);
+  const asset = upstream.assets.find((item) => item.name === assetName) ?? null;
+  if (!asset) throw new Error(`Official release ${upstream.tag} has no ${assetName} asset`);
+  const result = {
+    checkedAt: new Date().toISOString(),
+    installed: {
+      present: installed.installed,
+      release: installed.installedMetadata?.release?.tag ?? null,
+      sha256: installed.installedSha256
+    },
+    upstream,
+    selectedAsset: asset,
+    updateAvailable: !installed.installed || installed.installedSha256 !== String(asset.digest ?? "").replace(/^sha256:/i, "")
+  };
+  await writeJsonAtomic(htxRuntimePaths(options.environment).upstreamCheck, result);
+  return result;
+}
+
+async function downloadOfficialAsset(asset, path, { fetchImpl = fetch } = {}) {
+  const url = new URL(asset.downloadUrl);
+  if (url.origin !== "https://github.com" || !url.pathname.startsWith("/htx-exchange/htx-skills-hub/releases/download/")) {
+    throw new Error("Blocked non-official HTX release asset URL");
+  }
+  const response = await fetchImpl(url, {
+    headers: { accept: "application/octet-stream", "user-agent": "btc-htx-paper-updater/2" },
+    redirect: "follow",
+    // Official CLI assets are close to 100 MB. Keep the operation bounded, but do
+    // not reject a valid release merely because a VPS/GitHub route is slower than
+    // three minutes. Nothing is installed until this stream and every later gate pass.
+    signal: AbortSignal.timeout(RELEASE_ASSET_TIMEOUT_MS)
+  });
+  if (!response.ok || !response.body) throw new Error(`HTX asset download failed: HTTP ${response.status}`);
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(path, { mode: 0o700, flags: "wx" }));
+}
+
+async function verifyProjectCommands({ projectDirectory = projectRoot } = {}) {
+  const options = { cwd: projectDirectory, windowsHide: true, timeout: 15 * 60_000, maxBuffer: 16 * 1024 * 1024 };
+  // Invoke the exact entry points behind npm test/check:safety without a shell.
+  // This behaves identically on Linux and Windows and avoids npm.cmd spawn EINVAL.
+  await execFileAsync(process.execPath, ["--test", "test/*.test.mjs"], options);
+  await execFileAsync(process.execPath, ["scripts/check-safety.mjs"], options);
+}
+
+function officialDigest(asset) {
+  const match = /^sha256:([0-9a-f]{64})$/i.exec(String(asset.digest ?? ""));
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+export async function updateHtxCli({
+  environment = process.env,
+  cliPath = resolveCliPath(),
+  releaseProvider = fetchLatestHtxRelease,
+  downloadAsset = downloadOfficialAsset,
+  smokeTest = runHtxCompatibilitySmokeTest,
+  verifyProject = verifyProjectCommands,
+  replaceBinary = rename,
+  fetchImpl = fetch,
+  now = () => new Date().toISOString()
+} = {}) {
+  const paths = htxRuntimePaths(environment);
+  await mkdir(paths.directory, { recursive: true });
+  let lock;
+  try {
+    lock = await open(paths.lock, "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("Another HTX CLI update is already running");
+    throw error;
+  }
+  let stageDirectory = null;
+  let backupPath = null;
+  let movedOld = false;
+  let installedNew = false;
+  try {
+    const release = assertNormalizedReleaseIdentity(await releaseProvider({ fetchImpl }));
+    const assetName = platformAssetName();
+    const asset = release.assets.find((item) => item.name === assetName);
+    if (!asset) throw new Error(`Official release ${release.tag} does not contain ${assetName}`);
+    await mkdir(dirname(cliPath), { recursive: true });
+    stageDirectory = await mkdtemp(join(dirname(cliPath), ".htx-staging-"));
+    const stagedPath = join(stageDirectory, assetName);
+    await downloadAsset(asset, stagedPath, { fetchImpl });
+    if (process.platform !== "win32") await chmod(stagedPath, 0o755);
+    const stagedSize = Number((await stat(stagedPath)).size);
+    if (Number.isFinite(Number(asset.size)) && Number(asset.size) > 0 && stagedSize !== Number(asset.size)) {
+      throw new Error(`Official asset size mismatch for ${assetName}: expected ${asset.size}, received ${stagedSize}`);
+    }
+    const localSha256 = await sha256File(stagedPath);
+    const expected = officialDigest(asset);
+    if (expected && localSha256 !== expected) throw new Error(`Official checksum mismatch for ${assetName}`);
+    const compatibility = await smokeTest(stagedPath);
+    if (!compatibility.compatible) throw new Error("HTX CLI compatibility smoke test failed");
+    await verifyProject({ projectDirectory: projectRoot });
+
+    const oldExists = await exists(cliPath);
+    const oldSha256 = oldExists ? await sha256File(cliPath) : null;
+    if (oldExists && oldSha256 === localSha256) {
+      const metadata = {
+        schemaVersion: 1,
+        sourceRepo: SOURCE_REPO,
+        release,
+        asset: { ...asset, officialChecksumProvided: Boolean(expected), officialChecksumVerified: Boolean(expected) },
+        installedSha256: localSha256,
+        installedAt: (await readJson(paths.installedMetadata))?.installedAt ?? now(),
+        lastVerifiedAt: now(),
+        compatibility,
+        capabilityReport: buildHtxCapabilityReport(compatibility)
+      };
+      await writeJsonAtomic(paths.installedMetadata, metadata);
+      return { changed: false, metadata, compatibility, backupPath: null };
+    }
+
+    if (oldExists) {
+      const rollbackDirectory = join(dirname(cliPath), "rollback");
+      await mkdir(rollbackDirectory, { recursive: true });
+      backupPath = join(rollbackDirectory, `${assetName}.${oldSha256}.bak`);
+      if (await exists(backupPath)) await unlink(cliPath);
+      else await rename(cliPath, backupPath);
+      movedOld = true;
+    }
+    await replaceBinary(stagedPath, cliPath);
+    installedNew = true;
+    const metadata = {
+      schemaVersion: 1,
+      sourceRepo: SOURCE_REPO,
+      release,
+      asset: { ...asset, officialChecksumProvided: Boolean(expected), officialChecksumVerified: Boolean(expected) },
+      installedSha256: localSha256,
+      installedAt: now(),
+      previous: oldSha256 ? { sha256: oldSha256, backupPath } : null,
+      compatibility,
+      capabilityReport: buildHtxCapabilityReport(compatibility)
+    };
+    await writeJsonAtomic(paths.installedMetadata, metadata);
+    return { changed: true, metadata, compatibility, backupPath };
+  } catch (error) {
+    // Replacement is a single failure domain: once the old binary moved, every
+    // later error (candidate rename or metadata write included) restores it.
+    if (installedNew && await exists(cliPath)) await unlink(cliPath);
+    if (movedOld && backupPath && await exists(backupPath) && !await exists(cliPath)) {
+      await copyFile(backupPath, cliPath);
+    }
+    throw error;
+  } finally {
+    await lock?.close();
+    await rm(paths.lock, { force: true });
+    if (stageDirectory) await rm(stageDirectory, { recursive: true, force: true });
+  }
+}
+
+export async function verifyHtxSourceLock() {
+  const manifest = await readJson(sourceManifestPath);
+  if (!manifest?.sourceRepo || !manifest?.release?.tag) throw new Error("HTX source lock is missing or invalid");
+  return manifest;
+}

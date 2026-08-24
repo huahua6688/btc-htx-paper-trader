@@ -9,6 +9,27 @@ const TIMEFRAMES = Object.freeze({
 
 const aggregateCache = new WeakMap();
 
+export const REPLAY_PROVENANCE = Object.freeze({
+  HTX_HISTORICAL: "HTX_HISTORICAL",
+  SELF_ARCHIVED: "SELF_ARCHIVED",
+  LIVE_OBSERVED: "LIVE_OBSERVED",
+  HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE",
+  STALE: "STALE",
+  LIVE_FAILURE: "LIVE_FAILURE"
+});
+
+export const REPLAY_FIELD_TTL_MS = Object.freeze({
+  depth: 2 * 60 * 1000,
+  openInterest: 2 * 60 * 60 * 1000,
+  eliteAccount: 2 * 60 * 60 * 1000,
+  elitePosition: 2 * 60 * 60 * 1000,
+  markPrice: 2 * 60 * 60 * 1000,
+  premium: 2 * 60 * 60 * 1000,
+  basis: 2 * 60 * 60 * 1000,
+  liquidations: 24 * 60 * 60 * 1000,
+  contractElements: 7 * 24 * 60 * 60 * 1000
+});
+
 function aggregateClosed(baseCandles, intervalMs, visibleAt) {
   if (intervalMs === BAR_MS) return baseCandles.filter((row) => row.timestamp + BAR_MS <= visibleAt);
   const groups = new Map();
@@ -71,7 +92,51 @@ function htxRows(rows) {
 
 function payload(rows) { return { status: "ok", data: htxRows(rows) }; }
 
-export function buildPointInTimeMarket(candles, funding, index, { maximumBars = 260 } = {}) {
+function visibleHistoricalRecords(records = [], visibleAt, ttlMs) {
+  const visible = records.filter((item) => Number(item.eventTime) <= visibleAt && Number(item.visibleAt ?? item.eventTime) <= visibleAt);
+  const latest = visible.at(-1) ?? null;
+  if (!latest) return { records: [], provenance: REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE, ageMs: null };
+  const ageMs = visibleAt - Number(latest.eventTime);
+  if (Number.isFinite(ttlMs) && ageMs > ttlMs) return { records: [], provenance: REPLAY_PROVENANCE.STALE, ageMs };
+  return { records: visible, provenance: REPLAY_PROVENANCE.HTX_HISTORICAL, ageMs };
+}
+
+function historicalPayload(type, historicalSeries, visibleAt) {
+  const ttlMs = REPLAY_FIELD_TTL_MS[type];
+  const result = visibleHistoricalRecords(historicalSeries?.[type] ?? [], visibleAt, ttlMs);
+  if (!result.records.length) return { payload: null, provenance: result.provenance, ageMs: result.ageMs };
+  const rows = result.records.map((item) => item.normalized);
+  let value;
+  if (type === "openInterest") value = { status: "ok", data: [{ symbol: "BTC", contract_code: "BTC-USDT", tick: rows.slice(-200) }] };
+  else if (type === "eliteAccount" || type === "elitePosition") value = { status: "ok", data: [{ symbol: "BTC", contract_code: "BTC-USDT", list: rows.slice(-30) }] };
+  else if (["markPrice", "premium", "basis"].includes(type)) value = { status: "ok", data: rows.slice(-2000) };
+  else if (type === "liquidations") value = { code: 200, msg: "success", data: rows.filter((row) => Number(row.created_at) >= visibleAt - 24 * 60 * 60 * 1000).slice(-50), ts: visibleAt };
+  else value = null;
+  return { payload: value, provenance: result.provenance, ageMs: result.ageMs };
+}
+
+function replayField(type, historicalSeries, archive, visibleAt) {
+  if (archive?.getVisiblePayload) {
+    try {
+      const archiveType = type === "openInterest" ? "oiHistory" : type;
+      const archived = archive.getVisiblePayload(archiveType, new Date(visibleAt).toISOString(), { ttlMs: REPLAY_FIELD_TTL_MS[type] });
+      if (archived?.payload) return archived;
+      if (archived?.provenance === REPLAY_PROVENANCE.STALE) {
+        const historical = historicalPayload(type, historicalSeries, visibleAt);
+        return historical.payload ? historical : archived;
+      }
+    } catch (error) {
+      return { payload: null, provenance: REPLAY_PROVENANCE.LIVE_FAILURE, error: error.message };
+    }
+  }
+  return historicalPayload(type, historicalSeries, visibleAt);
+}
+
+export function buildPointInTimeMarket(candles, funding, index, {
+  maximumBars = 260,
+  historicalSeries = {},
+  archive = null
+} = {}) {
   const closed = candles[index];
   if (!closed) throw new Error(`Replay candle index out of bounds: ${index}`);
   const visibleAt = closed.timestamp + BAR_MS;
@@ -95,13 +160,28 @@ export function buildPointInTimeMarket(candles, funding, index, { maximumBars = 
   };
   const fundingVisible = funding.filter((item) => item.timestamp <= visibleAt);
   const currentFunding = fundingVisible.at(-1) ?? null;
+  const replayFields = {
+    depth: replayField("depth", historicalSeries, archive, visibleAt),
+    openInterest: replayField("openInterest", historicalSeries, archive, visibleAt),
+    eliteAccount: replayField("eliteAccount", historicalSeries, archive, visibleAt),
+    elitePosition: replayField("elitePosition", historicalSeries, archive, visibleAt),
+    liquidations: replayField("liquidations", historicalSeries, archive, visibleAt),
+    markPrice: replayField("markPrice", historicalSeries, archive, visibleAt),
+    premium: replayField("premium", historicalSeries, archive, visibleAt),
+    basis: replayField("basis", historicalSeries, archive, visibleAt),
+    contractElements: replayField("contractElements", historicalSeries, archive, visibleAt)
+  };
+  const oiPayload = replayFields.openInterest.payload;
+  const unavailableSources = Object.entries(replayFields)
+    .filter(([, item]) => !item.payload)
+    .map(([key]) => key);
   return {
     ticker: { status: "ok", ts: visibleAt, tick: { close: closed.close, open: closed.open, high: closed.high, low: closed.low } },
     kline15m: payload([...byTimeframe["15m"].slice(-(maximumBars - 1)), syntheticOpen]),
     kline1h: payload(byTimeframe["1h"]),
     kline4h: payload(byTimeframe["4h"]),
     kline1d: payload(byTimeframe["1d"]),
-    depth: null,
+    depth: replayFields.depth.payload,
     fundingCurrent: currentFunding ? { status: "ok", data: {
       funding_rate: String(currentFunding.fundingRate),
       funding_time: String(currentFunding.timestamp),
@@ -109,20 +189,48 @@ export function buildPointInTimeMarket(candles, funding, index, { maximumBars = 
       age_ms: visibleAt - currentFunding.timestamp
     } } : null,
     fundingHistory: { status: "ok", data: { data: fundingVisible.slice(-30).map((item) => ({ funding_rate: String(item.fundingRate), funding_time: String(item.timestamp) })) } },
-    oiCurrent: null,
-    oiHistory: null,
-    eliteAccount: null,
-    elitePosition: null,
-    liquidations: null,
-    markPrice: null,
-    premium: null,
-    basis: null,
-    contractElements: null,
+    oiCurrent: oiPayload?.data?.[0]?.tick?.length ? { status: "ok", data: [oiPayload.data[0].tick.at(-1)] } : null,
+    oiHistory: oiPayload,
+    eliteAccount: replayFields.eliteAccount.payload,
+    elitePosition: replayFields.elitePosition.payload,
+    liquidations: replayFields.liquidations.payload,
+    markPrice: replayFields.markPrice.payload,
+    premium: replayFields.premium.payload,
+    basis: replayFields.basis.payload,
+    contractElements: replayFields.contractElements.payload,
+    dataProvenance: {
+      ticker: REPLAY_PROVENANCE.HTX_HISTORICAL,
+      kline15m: REPLAY_PROVENANCE.HTX_HISTORICAL,
+      kline1h: REPLAY_PROVENANCE.HTX_HISTORICAL,
+      kline4h: REPLAY_PROVENANCE.HTX_HISTORICAL,
+      kline1d: REPLAY_PROVENANCE.HTX_HISTORICAL,
+      fundingCurrent: currentFunding ? REPLAY_PROVENANCE.HTX_HISTORICAL : REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE,
+      fundingHistory: fundingVisible.length ? REPLAY_PROVENANCE.HTX_HISTORICAL : REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE,
+      depth: replayFields.depth.provenance,
+      oiCurrent: replayFields.openInterest.provenance,
+      oiHistory: replayFields.openInterest.provenance,
+      eliteAccount: replayFields.eliteAccount.provenance,
+      elitePosition: replayFields.elitePosition.provenance,
+      liquidations: replayFields.liquidations.provenance,
+      markPrice: replayFields.markPrice.provenance,
+      premium: replayFields.premium.provenance,
+      basis: replayFields.basis.provenance,
+      contractElements: replayFields.contractElements.provenance
+    },
     replay: {
+      pointInTime: true,
       visibleAt,
       eventCandle: closed,
       closedCounts: Object.fromEntries(Object.entries(byTimeframe).map(([key, rows]) => [key, rows.length])),
-      unavailableSources: ["historical_order_book", "historical_oi", "historical_elite_positioning", "historical_liquidations", "historical_mark_basis"]
+      unavailableSources,
+      fieldStatus: Object.fromEntries(Object.entries(replayFields).map(([key, value]) => [key, {
+        provenance: value.provenance,
+        ageMs: value.ageMs ?? null,
+        available: Boolean(value.payload),
+        error: value.error ?? null
+      }])),
+      availableSources: Object.entries(replayFields).filter(([, item]) => item.payload).map(([key]) => key),
+      eventTimeNotAfterVisibleAt: Object.values(replayFields).every((item) => !item.eventTime || Number(item.eventTime) <= visibleAt)
     }
   };
 }
