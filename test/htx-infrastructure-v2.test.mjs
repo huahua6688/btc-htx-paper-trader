@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openPaperDatabase } from "../src/db.mjs";
 import { runPublicCommandWithBinary } from "../src/htx-cli.mjs";
-import { updateHtxCli } from "../src/htx-upstream.mjs";
+import { platformAssetName, updateHtxCli } from "../src/htx-upstream.mjs";
 import { MarketArchive } from "../src/market-archive.mjs";
 import { HtxPublicResearchClient, HTX_RESEARCH_ENDPOINTS } from "../src/htx-public-research-client.mjs";
 import { readDataInfrastructureStatusSync } from "../src/data-infrastructure-status.mjs";
@@ -24,14 +24,15 @@ const response = (payload, { ok = true, status = 200, retryAfter = null } = {}) 
 });
 
 function fakeRelease(content) {
+  const assetName = platformAssetName();
   return {
     id: 1, tag: "v9.9.9", publishedAt: "2026-08-24T00:00:00.000Z",
     url: "https://github.com/htx-exchange/htx-skills-hub/releases/tag/v9.9.9",
     commitSha: "a".repeat(40),
     assets: [{
-      name: "htx-cli-windows-x64.exe", size: content.length,
+      name: assetName, size: content.length,
       digest: `sha256:${sha256(content)}`,
-      downloadUrl: "https://github.com/htx-exchange/htx-skills-hub/releases/download/v9.9.9/htx-cli-windows-x64.exe"
+      downloadUrl: `https://github.com/htx-exchange/htx-skills-hub/releases/download/v9.9.9/${assetName}`
     }]
   };
 }
