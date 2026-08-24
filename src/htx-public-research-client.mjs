@@ -10,7 +10,9 @@ export const HTX_RESEARCH_ENDPOINTS = Object.freeze({
   premium: "/index/market/history/linear_swap_premium_index_kline",
   basis: "/index/market/history/linear_swap_basis",
   liquidations: "/linear-swap-api/v3/swap_liquidation_orders",
-  depth: "/linear-swap-ex/market/depth"
+  depth: "/linear-swap-ex/market/depth",
+  settlement: "/linear-swap-api/v1/swap_settlement_records",
+  insuranceFund: "/linear-swap-api/v1/swap_insurance_fund"
 });
 
 const PERIODS = new Set(["1min", "5min", "15min", "30min", "60min", "4hour", "12hour", "1day", "1week", "1mon"]);
@@ -24,7 +26,9 @@ const RULES = Object.freeze({
   [HTX_RESEARCH_ENDPOINTS.premium]: { keys: ["contract_code", "period", "size"], size: 2000 },
   [HTX_RESEARCH_ENDPOINTS.basis]: { keys: ["contract_code", "period", "basis_price_type", "size"], size: 2000 },
   [HTX_RESEARCH_ENDPOINTS.liquidations]: { keys: ["contract", "pair", "trade_type"] },
-  [HTX_RESEARCH_ENDPOINTS.depth]: { keys: ["contract_code", "type"] }
+  [HTX_RESEARCH_ENDPOINTS.depth]: { keys: ["contract_code", "type"] },
+  [HTX_RESEARCH_ENDPOINTS.settlement]: { keys: ["contract_code", "start_time", "end_time", "page_index", "page_size"], pageSize: 50 },
+  [HTX_RESEARCH_ENDPOINTS.insuranceFund]: { keys: ["contract_code"] }
 });
 
 export function assertAllowedResearchRequest(path, params = {}) {
@@ -49,6 +53,9 @@ export function assertAllowedResearchRequest(path, params = {}) {
       throw new Error(`Unsafe HTX research page_index: ${value}`);
     }
     if (["from", "to"].includes(key) && (!Number.isInteger(Number(value)) || Number(value) <= 0)) {
+      throw new Error(`Unsafe HTX research timestamp: ${key}`);
+    }
+    if (["start_time", "end_time"].includes(key) && (!Number.isInteger(Number(value)) || Number(value) <= 0)) {
       throw new Error(`Unsafe HTX research timestamp: ${key}`);
     }
     if (key === "amount_type" && ![1, 2].includes(Number(value))) throw new Error("Unsupported OI amount_type");

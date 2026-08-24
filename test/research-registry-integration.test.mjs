@@ -256,7 +256,7 @@ test("every research command is registered and only pure queries are exempt", ()
   }
   assert.deepEqual(
     [...EXEMPT_RESEARCH_COMMANDS].sort(),
-    ["data:inspect", "research:register-candidate", "research:runs"]
+    ["data:inspect", "multi-venue:inspect", "research:register-candidate", "research:runs"]
   );
 });
 

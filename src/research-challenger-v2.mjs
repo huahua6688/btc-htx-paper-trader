@@ -33,7 +33,7 @@ function rows(payload) {
     .sort((a, b) => a.timestamp - b.timestamp);
 }
 
-function closedMarketView(market) {
+export function closedMarketView(market) {
   const visibleAt = Number(market.ticker?.ts);
   const output = { ...market };
   for (const [key, interval] of Object.entries(PAYLOAD_INTERVALS)) {
@@ -123,7 +123,7 @@ function pivotLevels(candles, side, currentPrice) {
   return levels.sort((a, b) => side === "LONG" ? a - b : b - a);
 }
 
-function entryGeometry(side, context, market, parameters) {
+export function entryGeometry(side, context, market, parameters) {
   const direction = side === "LONG" ? 1 : -1;
   const currentPrice = Number(market.ticker?.tick?.close);
   const c15 = rows(market.kline15m);
@@ -184,7 +184,7 @@ function entryGeometry(side, context, market, parameters) {
   };
 }
 
-function tradableEdge(side, geometry, context, market, config, parameters, similarity = null) {
+export function tradableEdge(side, geometry, context, market, config, parameters, similarity = null) {
   const direction = side === "LONG" ? 1 : -1;
   const currentPrice = geometry.currentPrice;
   const structureSpacePct = geometry.remainingSpace / currentPrice * 100;
@@ -213,7 +213,7 @@ function tradableEdge(side, geometry, context, market, config, parameters, simil
   };
 }
 
-function coreDataQuality(market, context) {
+export function coreDataQuality(market, context) {
   const now = Number(market.ticker?.ts);
   const failures = [];
   for (const [key, interval] of Object.entries({ "15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000 })) {
@@ -253,7 +253,7 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     context = buildMultiScaleContext(visibleMarket, requestedProfile);
     if (options.useCache !== false) {
       contextCache.set(cacheKey, context);
-      if (contextCache.size > 100_000) contextCache.delete(contextCache.keys().next().value);
+      if (contextCache.size > 512) contextCache.delete(contextCache.keys().next().value);
     }
   }
   const dimensions = directionDimensions(context, visibleMarket);

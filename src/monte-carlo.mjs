@@ -84,14 +84,32 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
   const losses = values.filter((value) => value < 0).sort((a, b) => a - b);
   const wins = values.filter((value) => value >= 0);
   const lossStreak = pathMetrics([...losses, ...wins], initialCapital);
-  const common = { strategy, parameters, from, to, collectTrace: false };
+  const common = {
+    strategy,
+    parameters,
+    from,
+    to,
+    collectTrace: false,
+    capitalProfile: baseReplay.capital?.capitalProfile,
+    referenceCapitalCny: baseReplay.capital?.initialCapitalCny
+  };
   const [costWorse, slippageWorse, delay2, delay3] = await Promise.all([
     runHistoricalReplay(dataset, { ...common, paperConfig: { ...PAPER_CONFIG, feeRatePerSide: PAPER_CONFIG.feeRatePerSide * 1.5 }, outputDirectory: outputDirectory ? `${outputDirectory}/cost-150pct` : undefined }),
     runHistoricalReplay(dataset, { ...common, paperConfig: { ...PAPER_CONFIG, slippageRate: PAPER_CONFIG.slippageRate * 2 }, outputDirectory: outputDirectory ? `${outputDirectory}/slippage-200pct` : undefined }),
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 2, outputDirectory: outputDirectory ? `${outputDirectory}/delay-2bars` : undefined }),
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 3, outputDirectory: outputDirectory ? `${outputDirectory}/delay-3bars` : undefined })
   ]);
-  const perturbations = strategy === "research-v2" ? [
+  const perturbations = strategy === "breakout-v4" ? [
+    { label: "lookback-minus-5pct", patch: { breakoutLookback4h: Math.max(10, Math.round(parameters.breakoutLookback4h * 0.95)) } },
+    { label: "lookback-plus-5pct", patch: { breakoutLookback4h: Math.round(parameters.breakoutLookback4h * 1.05) } },
+    { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },
+    { label: "target-rr-plus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 1.05 } }
+  ] : strategy === "multi-venue-v3" ? [
+    { label: "opportunity-score-minus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 0.95 } },
+    { label: "opportunity-score-plus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 1.05 } },
+    { label: "net-edge-plus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 1.05 } },
+    { label: "runner-break-even-plus-5pct", patch: { breakEvenTargetFraction: parameters.breakEvenTargetFraction * 1.05 } }
+  ] : strategy === "research-v2" ? [
     { label: "direction-strength-minus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 0.95 } },
     { label: "direction-strength-plus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 1.05 } },
     { label: "net-edge-minus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 0.95 } },

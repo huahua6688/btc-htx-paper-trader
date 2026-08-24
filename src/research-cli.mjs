@@ -29,10 +29,18 @@ import {
   withResearchRegistry
 } from "./research-registry.mjs";
 import { runResearchV2Pipeline } from "./research-v2-pipeline.mjs";
+import { runResearchV3Pipeline } from "./research-v3-pipeline.mjs";
 import { runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
 import { ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { buildTradeAttribution } from "./attribution-engine.mjs";
+import {
+  defaultMultiVenueCatalogDirectory,
+  loadMultiVenueFundingDataset,
+  updateMultiVenueFundingDataset
+} from "./multi-venue-catalog.mjs";
+import { MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
+import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
 
 export const PREDECLARED_RESEARCH_RANGE = Object.freeze({
   from: "2024-09-01T00:00:00.000Z",
@@ -172,6 +180,31 @@ async function dataUpdate(args, defaults = null) {
 
 async function load(args) { return loadHistoricalDataset(args.catalog ?? defaultCatalogDirectory()); }
 
+async function attachMultiVenue(dataset, args) {
+  if (String(args["multi-venue-catalog"] ?? "").toLowerCase() === "none") return { ...dataset, multiVenueFunding: [] };
+  const directory = args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory();
+  try {
+    const multiVenue = await loadMultiVenueFundingDataset(directory);
+    return { ...dataset, multiVenueFunding: multiVenue.funding, multiVenueManifest: multiVenue.manifest };
+  } catch (error) {
+    if (error?.code === "ENOENT" || /manifest not found|no such file/i.test(error.message)) {
+      return { ...dataset, multiVenueFunding: [], multiVenueManifest: null };
+    }
+    throw error;
+  }
+}
+
+async function multiVenueUpdate(args) {
+  const selected = range(args);
+  const result = await updateMultiVenueFundingDataset({
+    ...selected,
+    directory: args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory(),
+    onProgress: (item) => process.stderr.write(`Funding ${item.exchange}: ${item.pages} pages / ${item.rows} rows\n`)
+  });
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, fetched: result.fetched, manifest: result.manifest }, null, 2)}\n`);
+  return result;
+}
+
 /**
  * 解析研究资金视角。默认 PRODUCTION_FAITHFUL（真实 Paper 资金规模）。
  * --capital=reference 或 --capital=EDGE_REFERENCE_CAPITAL 切到研究参考资金，
@@ -224,6 +257,18 @@ async function researchV2(args) {
   return { dataset, result, directory };
 }
 
+async function researchV3(args) {
+  let dataset = await load(args);
+  dataset = await attachMultiVenue(dataset, args);
+  const directory = resolveOutputPath(runId("research-v3"));
+  const result = await runResearchV3Pipeline(dataset, {
+    outputDirectory: directory,
+    robustnessIterations: Number(args.iterations ?? 1_000)
+  });
+  process.stdout.write(`${JSON.stringify({ directory, report: result.report }, null, 2)}\n`);
+  return { dataset, result, directory };
+}
+
 /**
  * 解析 --strategy / --baseline-strategy / --candidate-strategy。
  * 只接受 replay-engine 已登记的策略 id，未知值直接报错而不是悄悄回退到 challenger。
@@ -242,6 +287,8 @@ function defaultParametersFor(strategy) {
   if (strategy === "data-tiered") return DATA_TIERED_PARAMETERS;
   if (strategy === "historical-compatible") return HISTORICAL_COMPATIBLE_PARAMETERS;
   if (strategy === "anti-chase") return ANTI_CHASE_PARAMETERS;
+  if (strategy === "multi-venue-v3") return MULTI_VENUE_CHALLENGER_PARAMETERS;
+  if (strategy === "breakout-v4") return BREAKOUT_V4_PARAMETERS;
   return CHALLENGER_BASE_PARAMETERS;
 }
 
@@ -254,7 +301,8 @@ async function replay(args) {
   // 先校验参数再加载数据集：未知策略是用法/逻辑错误（FAILED），
   // 不能因为数据集恰好也不存在而被误判成外部前置条件缺失（BLOCKED）。
   const strategy = strategyOption(args, "strategy", "challenger");
-  const dataset = await load(args);
+  let dataset = await load(args);
+  if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId(`replay-${strategy}`));
   await mkdir(directory, { recursive: true });
@@ -274,7 +322,8 @@ async function replay(args) {
 async function validation(args) {
   const baselineStrategy = strategyOption(args, "baseline-strategy", "challenger");
   const candidateStrategy = strategyOption(args, "candidate-strategy", "challenger");
-  const dataset = await load(args);
+  let dataset = await load(args);
+  if ([baselineStrategy, candidateStrategy].includes("multi-venue-v3")) dataset = await attachMultiVenue(dataset, args);
   const directory = resolveOutputPath(runId("validation"));
   const report = await runValidationEngine(dataset, {
     outputDirectory: directory,
@@ -303,11 +352,19 @@ async function similarity(args) {
 }
 
 async function robustness(args) {
-  const dataset = await load(args);
+  const strategy = strategyOption(args, "strategy", "challenger");
+  let dataset = await load(args);
+  if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId("robustness"));
-  const replay = await runHistoricalReplay(dataset, { strategy: "challenger", parameters: CHALLENGER_BASE_PARAMETERS, ...selected, outputDirectory: join(directory, "base") });
-  const report = await runMonteCarloRobustness(dataset, replay, { parameters: CHALLENGER_BASE_PARAMETERS, ...selected, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios") });
+  const parameters = defaultParametersFor(strategy);
+  const capital = capitalOptions(args);
+  const replay = await runHistoricalReplay(dataset, {
+    strategy, parameters, ...selected, ...capital, outputDirectory: join(directory, "base")
+  });
+  const report = await runMonteCarloRobustness(dataset, replay, {
+    strategy, parameters, ...selected, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios")
+  });
   const path = await save(join(directory, "robustness-report.json"), report);
   process.stdout.write(`${JSON.stringify({ path, report }, null, 2)}\n`);
   return { dataset, replay, report, directory };
@@ -612,6 +669,22 @@ export function researchV2RunRecord(result) {
 const dataManifestHashOf = (result) => result?.dataset?.manifest?.manifestHash ?? null;
 
 const COMMANDS = {
+  "multi-venue:update": {
+    handler: (args) => multiVenueUpdate(args),
+    runType: "MULTI_VENUE_FUNDING_CATALOG_UPDATE",
+    record: (result) => ({
+      status: result?.manifest?.status === "COMPLETE" ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: { fetched: result?.fetched ?? 0, directory: result?.directory ?? null, errors: result?.manifest?.errors ?? {} }
+    })
+  },
+  "multi-venue:inspect": {
+    exempt: true,
+    handler: async (args) => {
+      const dataset = await loadMultiVenueFundingDataset(args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory());
+      process.stdout.write(`${JSON.stringify({ directory: dataset.directory, manifest: dataset.manifest }, null, 2)}\n`);
+    }
+  },
   "data:update": {
     handler: (args) => dataUpdate(args),
     runType: "DATA_CATALOG_UPDATE",
@@ -809,6 +882,22 @@ const COMMANDS = {
     handler: (args) => researchV2(args),
     runType: "RESEARCH_V2_PIPELINE",
     record: (result) => researchV2RunRecord(result)
+  },
+  "research:v3": {
+    handler: (args) => researchV3(args),
+    runType: "RESEARCH_V3_MULTI_VENUE_PIPELINE",
+    record: (result) => ({
+      status: result?.result?.report?.promotion?.allowed ? "PASSED" : "PARTIAL",
+      artifactPath: join(result?.directory ?? ".", "research-v3-pipeline.json"),
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      strategyVersion: result?.result?.report?.strategyVersion ?? null,
+      summary: {
+        promotion: result?.result?.report?.promotion ?? null,
+        candidate: result?.result?.report?.candidate ?? null,
+        crossVenueAblation: result?.result?.report?.crossVenueAblation ?? null,
+        touchedFinalOos: false
+      }
+    })
   },
   full: {
     handler: (args) => full(args),

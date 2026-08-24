@@ -1078,8 +1078,12 @@ export class PaperDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       report.generatedAt, report.symbol, report.currentPrice, report.decision, report.candidateDecision,
-      report.signalQualityScore ?? report.confidencePct, report.finalScore, report.derivatives?.fundingRatePct,
-      report.derivatives?.oiUsd, report.derivatives?.pressureScore, json(report.riskGates), json(report)
+      report.signalQualityScore ?? report.confidencePct ?? null,
+      report.finalScore ?? null,
+      report.derivatives?.fundingRatePct ?? null,
+      report.derivatives?.oiUsd ?? null,
+      report.derivatives?.pressureScore ?? null,
+      json(report.riskGates), json(report)
     );
     return Number(result.lastInsertRowid);
   }

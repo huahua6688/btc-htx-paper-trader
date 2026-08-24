@@ -2,7 +2,7 @@
 
 基于 HTX 公开行情的 BTC/USDT 本地合约模拟交易系统。程序启动后立即分析一次，之后每 5 分钟重新读取行情，独立比较 `LONG / SHORT / WAIT`，动态选择入场方式，并持续管理已有模拟净仓位。
 
-本项目没有真实交易能力：不读取 HTX API Key、不调用私有接口、不包含交易所下单模块。所有模拟仓位、手续费、Funding 和绩效只写入本地 SQLite。
+本项目没有真实交易能力：不读取 HTX API Key、不调用私有接口；未来账户/下单端口目前只有默认报错的禁用接口，没有可用交易适配器。所有模拟仓位、手续费、Funding 和绩效只写入本地 SQLite。
 
 ## V1.2 的核心变化
 
@@ -112,7 +112,7 @@ margin / notional / totalRisk 同样直接进入 `buildPaperCandidate`。
 **一条顶层 run**（成功 PASSED/PARTIAL，失败 BLOCKED/FAILED），子阶段作为 `summary.stages`
 evidence 放进这条 run，管线不再自行重复登记。覆盖 `backtest / replay / validate / similarity /
 robustness / counterfactual / external:audit / optimize / diagnose / ablation / edge:pipeline /
-tradable-edge / anti-chase / full / research:v2 / data:update`；
+tradable-edge / anti-chase / full / research:v2 / research:v3 / data:update / multi-venue:update`；
 `data:inspect / research:runs / research:register-candidate` 是纯查询/登记命令，明确豁免。
 
 **登记簿位置**：默认与生产 Paper 库同级的持久化目录（例如
@@ -136,7 +136,19 @@ Research Results 全部从研究登记簿**只读**读取，因此 CLI 一旦成
 ```bash
 npm run research:runs                 # 查看真实的持久化运行数与策略版本数
 npm run research:v2                   # 之前无法从 CLI 触发的 V2 管线
+npm run research:v3                   # 多交易所独立双向评分、消融、OOS 与压力测试
 npm run research:register-candidate   # 登记 V1.3-DATA-TIERED 候选（不等于晋级）
+```
+
+V3 的数据语义、HTX 全技能覆盖边界、独立双向评分与 runner 持仓契约见
+[RESEARCH_V3_MULTI_VENUE.md](./RESEARCH_V3_MULTI_VENUE.md)。
+真实目录上的 V2/V3/V4 同口径结果、压力测试与“不晋级”决定见
+[SIMULATION_RESULTS_2026_08_24.md](./SIMULATION_RESULTS_2026_08_24.md)。
+
+```bash
+# 4h 低频突破候选（Paper/研究专用）
+npm run replay -- --strategy=breakout-v4 --capital=reference --reference-capital=20000
+npm run robustness -- --strategy=breakout-v4 --capital=reference --reference-capital=20000 --iterations=1000
 ```
 
 ### 其它修复

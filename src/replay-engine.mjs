@@ -24,6 +24,8 @@ import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
 import { analyzeDataTiered, DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
+import { analyzeMultiVenueChallenger, MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
+import { analyzeBreakoutChallenger, BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
 
 /**
  * 研究资金视角。两者必须分开报告，绝不能混为一谈：
@@ -99,7 +101,7 @@ function summarizeEntryRejections(rejectionCounts) {
  */
 export const REPLAY_STRATEGIES = Object.freeze([
   "champion", "challenger", "historical-compatible",
-  "tradable-edge", "anti-chase", "research-v2", "data-tiered"
+  "tradable-edge", "anti-chase", "research-v2", "data-tiered", "multi-venue-v3", "breakout-v4"
 ]);
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
@@ -129,6 +131,14 @@ function executionReport(signal, candle, delayBars) {
   };
   if (report.plan && Number.isFinite(Number(report.plan.stopLoss))) {
     report.plan.entryPrice = newEntry;
+    if (report.strategy?.positionManagementProfile === "HARD_BRACKET_HOLD_V1") {
+      const direction = signal.decision === "LONG" ? 1 : -1;
+      const riskDistance = Number(signal.plan.initialRiskDistance ?? Math.abs(oldEntry - Number(signal.plan.stopLoss)));
+      const targetR = Number(signal.plan.riskReward?.[0]);
+      report.plan.stopLoss = round(newEntry - direction * riskDistance, 2);
+      report.plan.takeProfit = [round(newEntry + direction * riskDistance * targetR, 2)];
+      report.plan.executionReanchored = true;
+    }
   }
   report.latest15mBar = {
     timestamp: candle.timestamp - 1,
@@ -213,8 +223,12 @@ function buildReport(strategy, market, parameters, config) {
         ? analyzeTradableEdge(market, parameters, config)
       : strategy === "anti-chase"
           ? analyzeAntiChaseChallenger(market, parameters, config)
-        : strategy === "research-v2"
-          ? analyzeResearchChallengerV2(market, parameters, config)
+      : strategy === "research-v2"
+          ? analyzeResearchChallengerV2(market, parameters, config, { useCache: false })
+        : strategy === "multi-venue-v3"
+          ? analyzeMultiVenueChallenger(market, parameters, config)
+        : strategy === "breakout-v4"
+          ? analyzeBreakoutChallenger(market, parameters, config)
       : analyzeChallenger(market, parameters, config);
   const candle = market.replay.eventCandle;
   report.latest15mBar = {
@@ -381,9 +395,15 @@ export async function runHistoricalReplay(dataset, {
   if (strategy === "anti-chase" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = ANTI_CHASE_PARAMETERS;
   if (strategy === "research-v2" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = RESEARCH_CHALLENGER_V2_PARAMETERS;
   if (strategy === "data-tiered" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = DATA_TIERED_PARAMETERS;
+  if (strategy === "multi-venue-v3" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = MULTI_VENUE_CHALLENGER_PARAMETERS;
+  if (strategy === "breakout-v4" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = BREAKOUT_V4_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
-  const warmupIndex = firstReplayableIndex(dataset.candles);
+  // Multi-scale research profiles need more than the frozen engine's 60 daily
+  // bars (STANDARD_SWING uses EMA60 plus initialization history).  Give those
+  // strategies an explicit warm-up instead of letting their first event crash.
+  const requiredDailyWarmup = ["research-v2", "multi-venue-v3"].includes(strategy) ? 70 : 60;
+  const warmupIndex = firstReplayableIndex(dataset.candles, requiredDailyWarmup);
   if (warmupIndex < 0) throw new Error("Dataset has fewer than 60 completed daily candles");
   const firstIndex = Math.max(warmupIndex, dataset.candles.findIndex((item) => item.timestamp >= rangeStart));
   let lastIndex = dataset.candles.findLastIndex((item) => item.timestamp <= rangeEnd);
@@ -428,7 +448,8 @@ export async function runHistoricalReplay(dataset, {
       const market = buildPointInTimeMarket(dataset.candles, dataset.funding, index, {
         maximumBars: compactCachedFrame ? 12 : 260,
         historicalSeries: dataset.series ?? {},
-        archive
+        archive,
+        multiVenueFunding: dataset.multiVenueFunding ?? dataset.multiVenue?.funding ?? []
       });
       if (pending?.remaining === 1) {
         executePending(db, pending.report, candle, market, actions, config, executionDelayBars, rejectionCounts);
@@ -448,6 +469,7 @@ export async function runHistoricalReplay(dataset, {
         timestamp: report.generatedAt,
         visibleAt: report.replay.visibleAt,
         replayFields: market.replay.fieldStatus,
+        multiVenueFunding: market.multiVenue?.funding ?? null,
         price: report.currentPrice,
         decision: report.decision,
         candidateDecision: report.candidateDecision,
@@ -546,6 +568,16 @@ export async function runHistoricalReplay(dataset, {
         "Research V2 uses only point-in-time closed OHLCV and timestamp-visible Funding in historical replay.",
         "Its independent-dimension scoring, price-extension gate, structure target and Tradable Edge calculation are shared with live Shadow; it does not modify the frozen V1.2 Champion.",
         "Historical Order Book/OI/liquidations/elite positioning are absent and never synthesized; the derivatives dimension degrades to actually visible Funding only."
+      ] : strategy === "multi-venue-v3" ? [
+        "V3 scores LONG and SHORT as separate evidence sets; they are not complements and are not probabilities.",
+        "Only timestamp-visible realized Funding observations are used across venues; missing venues remain missing and no present value is copied backward.",
+        "Cross-venue Funding is a research candidate feature. It has no production weight until purged OOS and Shadow gates pass.",
+        "The SWING_RUNNER_V1 management profile keeps hard SL/TP but delays break-even and trailing so a 2R+ entry contract has room to resolve."
+      ] : strategy === "breakout-v4" ? [
+        "V4 is a research-only 4h Donchian breakout candidate selected in development exploration; it is not promoted production evidence.",
+        "Signals use completed 4h candles only, enter at the next 15m open, and re-anchor the 2.5 ATR stop and fixed 4R target to that simulated fill.",
+        "HARD_BRACKET_HOLD_V1 preserves the original hard SL/TP and disables break-even, trailing, target extension, and short-horizon signal exits.",
+        "Funding is included as timestamp-visible carrying cost only; derivatives and cross-venue observations are not directional triggers."
       ] : [
         "Challenger uses only timestamp-valid candle and Funding fields; it is a research strategy and does not replace Champion."
       ]

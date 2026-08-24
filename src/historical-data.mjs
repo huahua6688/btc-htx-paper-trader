@@ -25,7 +25,7 @@ const DAY_MS = 24 * HOUR_MS;
 
 export const HISTORICAL_DATA_TYPES = Object.freeze([
   "kline", "funding", "openInterest", "eliteAccount", "elitePosition",
-  "markPrice", "premium", "basis", "liquidations", "depth"
+  "markPrice", "premium", "basis", "liquidations", "settlement", "depth"
 ]);
 
 export const HTX_HISTORICAL_CAPABILITIES = Object.freeze({
@@ -38,6 +38,12 @@ export const HTX_HISTORICAL_CAPABILITIES = Object.freeze({
   premium: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 2000 },
   basis: { mode: "BOUNDED_LATEST_WINDOW", pagination: "none", interval: "60m", maximumRows: 2000 },
   liquidations: { mode: "LATEST_50_ONLY", pagination: "v3 endpoint has no historical page cursor", interval: "irregular", maximumRows: 50 },
+  settlement: {
+    mode: "PAGED_BOUNDED_RETENTION",
+    pagination: "start_time/end_time plus page_index/page_size up to 50",
+    interval: "8h settlement",
+    retentionNote: "HTX returns only its currently retained recent window; requested start/end do not imply arbitrary historical coverage"
+  },
   depth: { mode: "HISTORICAL_UNAVAILABLE", pagination: "none", interval: "snapshot only" }
 });
 
@@ -179,6 +185,63 @@ async function fetchFundingRange(startMs, endMs, options = {}) {
   return [...new Map(rows.map((row) => [row.timestamp, row])).values()].sort((a, b) => a.timestamp - b.timestamp);
 }
 
+async function fetchSettlementRange(startMs, endMs, options = {}) {
+  const client = options.researchClient ?? new HtxPublicResearchClient({
+    fetchImpl: options.fetchImpl,
+    delay: options.delay,
+    attempts: options.attempts
+  });
+  const records = [];
+  const payloadHashes = [];
+  let fetchedAt = null;
+  let sourceUrl = null;
+  let totalPages = 1;
+  for (let page = 1; page <= Math.min(20_000, totalPages); page += 1) {
+    const result = await client.get(HTX_RESEARCH_ENDPOINTS.settlement, {
+      contract_code: "BTC-USDT",
+      start_time: startMs,
+      end_time: endMs,
+      page_index: page,
+      page_size: 50
+    });
+    fetchedAt = result.fetchedAt;
+    sourceUrl = result.url;
+    payloadHashes.push(hashObject(result.payload));
+    totalPages = Math.max(1, Number(result.payload?.data?.total_page ?? 1));
+    const rows = result.payload?.data?.settlement_record ?? [];
+    for (const row of rows) {
+      const eventTime = Number(row.settlement_time);
+      if (eventTime < startMs || eventTime > endMs || !Number.isFinite(eventTime)) continue;
+      records.push({
+        eventTime,
+        visibleAt: eventTime,
+        observedAt: result.fetchedAt,
+        fetchedAt: result.fetchedAt,
+        source: "HTX_PUBLIC",
+        provenance: "HTX_HISTORICAL",
+        schemaVersion: 2,
+        rawPayloadHash: payloadHashes.at(-1),
+        normalized: row
+      });
+    }
+    options.onProgress?.({ type: "settlement", completed: page, total: totalPages, rows: records.length });
+    if (!rows.length || page >= totalPages) break;
+  }
+  const sorted = mergeTimedRecords([], records);
+  return {
+    records: sorted,
+    rawPayloadHash: hashObject(payloadHashes),
+    sourceUrl,
+    fetchedAt,
+    endpointCoverage: {
+      earliest: sorted.length ? new Date(sorted[0].eventTime).toISOString() : null,
+      latest: sorted.length ? new Date(sorted.at(-1).eventTime).toISOString() : null,
+      records: sorted.length
+    },
+    intervalMs: 8 * HOUR_MS
+  };
+}
+
 const BOUNDED_REQUESTS = Object.freeze({
   openInterest: { path: HTX_RESEARCH_ENDPOINTS.openInterest, params: { contract_code: "BTC-USDT", period: "60min", amount_type: 2, size: 200 }, intervalMs: HOUR_MS },
   eliteAccount: { path: HTX_RESEARCH_ENDPOINTS.eliteAccount, params: { contract_code: "BTC-USDT", period: "60min" }, intervalMs: HOUR_MS },
@@ -300,7 +363,9 @@ function sourceManifest(type, records, {
     type,
     availability: fetchError ? "LIVE_FAILURE" : historicalUnavailable ? "HISTORICAL_UNAVAILABLE" : records.length ? "HTX_HISTORICAL" : "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE",
     capability,
-    source: type === "depth" ? `${HTX_HOST}${HTX_RESEARCH_ENDPOINTS.depth}` : BOUNDED_REQUESTS[type] ? `${HTX_HOST}${BOUNDED_REQUESTS[type].path}` : null,
+    source: type === "depth" ? `${HTX_HOST}${HTX_RESEARCH_ENDPOINTS.depth}`
+      : type === "settlement" ? `${HTX_HOST}${HTX_RESEARCH_ENDPOINTS.settlement}`
+        : BOUNDED_REQUESTS[type] ? `${HTX_HOST}${BOUNDED_REQUESTS[type].path}` : null,
     provenance: records.length ? "HTX_HISTORICAL" : "HISTORICAL_UNAVAILABLE",
     schemaVersion: 2,
     records: records.length,
@@ -462,7 +527,9 @@ export async function updateHistoricalDataset({
     if (!checkpoint.completed[type]) {
       checkpoint.attempts[type] = Number(checkpoint.attempts[type] ?? 0) + 1;
       try {
-        result = await fetchBoundedResearchSeries(type, requestedStart, requestedEnd, options);
+        result = type === "settlement"
+          ? await fetchSettlementRange(requestedStart, requestedEnd, options)
+          : await fetchBoundedResearchSeries(type, requestedStart, requestedEnd, options);
         fetched[type] = result.records.length;
         records = mergeTimedRecords(records, result.records);
         await writeJsonAtomic(path, records);
@@ -541,6 +608,7 @@ export async function updateHistoricalDataset({
     historyLimitations: [
       "Depth has no HTX historical endpoint and is never reconstructed from candles.",
       "OI, elite ratios, mark, premium and basis are bounded latest-window endpoints without arbitrary historical pagination.",
+      "Settlement history is an HTX-retention-bounded recent window, is retained for venue-risk diagnostics, and is not treated as an independent directional alpha factor.",
       "The legacy 90-day liquidation endpoint is offline; v3 exposes only the latest 50 observations, so deeper history must accumulate in the self archive.",
       "A missing historical field remains null with explicit provenance; current values are never copied backwards."
     ]

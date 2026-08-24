@@ -11,10 +11,13 @@ import { analyzeAntiChaseChallenger } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2 } from "./research-challenger-v2.mjs";
 import { openMarketArchive } from "./market-archive.mjs";
 import { resolveHtxArchiveIdentity } from "./htx-upstream.mjs";
+import { analyzeMultiVenueChallenger } from "./multi-venue-challenger.mjs";
+import { collectCurrentMultiVenueFunding } from "./multi-venue-catalog.mjs";
+import { analyzeBreakoutChallenger } from "./breakout-challenger.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
-if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2"].includes(activeShadow.strategyType))) {
+if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2", "multi-venue-v3", "breakout-v4"].includes(activeShadow.strategyType))) {
   throw new Error("Active Shadow strategy is not an approved Paper-only research configuration");
 }
 const activeEdgeModel = activeShadow?.strategyType === "tradable-edge"
@@ -31,6 +34,12 @@ const shadowAnalyze = activeShadow
     ? (market) => analyzeResearchChallengerV2(market, activeShadow.parameters, undefined, {
         indicatorProfile: shadowDb?.getRuntimeSettings()?.indicatorProfile ?? activeShadow.parameters?.indicatorProfile
       })
+    : activeShadow.strategyType === "multi-venue-v3"
+    ? (market) => analyzeMultiVenueChallenger(market, activeShadow.parameters, undefined, {
+        indicatorProfile: shadowDb?.getRuntimeSettings()?.indicatorProfile ?? activeShadow.parameters?.indicatorProfile
+      })
+    : activeShadow.strategyType === "breakout-v4"
+    ? (market) => analyzeBreakoutChallenger(market, activeShadow.parameters)
     : activeShadow.strategyType === "anti-chase"
     ? (market) => analyzeAntiChaseChallenger(market, activeShadow.parameters)
     : activeShadow.strategyType === "tradable-edge"
@@ -86,7 +95,11 @@ async function cycle() {
     if (shadowDb) {
       try {
         const shadow = await runMonitorCycle(shadowDb, {
-          collect: async () => result.marketSnapshot,
+          collect: async () => {
+            if (activeShadow?.strategyType !== "multi-venue-v3") return result.marketSnapshot;
+            const funding = await collectCurrentMultiVenueFunding();
+            return { ...result.marketSnapshot, multiVenue: { funding } };
+          },
           analyze: shadowAnalyze
         });
         const types = shadow.actions.map((item) => item.type).join(", ") || "NO_ACTION";
