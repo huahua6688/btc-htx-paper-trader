@@ -28,23 +28,54 @@ function timestampMs(value) {
   return millis >= Date.UTC(2009, 0, 1) && millis <= Date.now() + 24 * 60 * 60 * 1000 ? millis : null;
 }
 
-function collectProviderTimestamps(value, output = []) {
-  if (Array.isArray(value)) {
-    for (const item of value) collectProviderTimestamps(item, output);
-    return output;
+// 每个 HTX 公开响应里真正代表时间的字段。以前的实现递归地把任何叫 `id` 的数字
+// 都当成时间戳，于是请求号/订单号也会被算进覆盖范围。这里改成按 schema 显式声明：
+// 只有在这些路径下的字段才可能是时间戳。
+const TIMESTAMP_SCHEMA = Object.freeze({
+  ticker: [["ts"], ["tick", "ts"], ["tick", "id"]],
+  kline15m: [["ts"], ["data", "*", "id"]],
+  kline1h: [["ts"], ["data", "*", "id"]],
+  kline4h: [["ts"], ["data", "*", "id"]],
+  kline1d: [["ts"], ["data", "*", "id"]],
+  depth: [["ts"], ["tick", "ts"]],
+  fundingCurrent: [["ts"], ["data", "funding_time"], ["data", "next_funding_time"]],
+  fundingHistory: [["ts"], ["data", "data", "*", "funding_time"]],
+  oiCurrent: [["ts"], ["data", "*", "ts"]],
+  oiHistory: [["ts"], ["data", "tick", "*", "ts"]],
+  eliteAccount: [["ts"], ["data", "list", "*", "ts"]],
+  elitePosition: [["ts"], ["data", "list", "*", "ts"]],
+  liquidations: [["ts"], ["data", "*", "created_at"], ["data", "data", "*", "created_at"]],
+  markPrice: [["ts"], ["data", "*", "id"]],
+  premium: [["ts"], ["data", "*", "id"]],
+  basis: [["ts"], ["data", "*", "id"]],
+  contractElements: [["ts"]]
+});
+
+function readSchemaPath(value, path, output) {
+  if (value === null || value === undefined) return;
+  if (!path.length) {
+    const millis = timestampMs(value);
+    if (millis !== null) output.push(millis);
+    return;
   }
-  if (!value || typeof value !== "object") return output;
-  for (const [key, item] of Object.entries(value)) {
-    if (["id", "ts", "created_at", "createdAt", "time"].includes(key)) {
-      const millis = timestampMs(item);
-      if (millis !== null) output.push(millis);
-    } else if (typeof item === "object") collectProviderTimestamps(item, output);
+  const [head, ...rest] = path;
+  if (head === "*") {
+    if (!Array.isArray(value)) return;
+    for (const item of value) readSchemaPath(item, rest, output);
+    return;
   }
+  if (typeof value !== "object" || Array.isArray(value)) return;
+  readSchemaPath(value[head], rest, output);
+}
+
+export function collectProviderTimestamps(payload, sourceKey) {
+  const output = [];
+  for (const path of TIMESTAMP_SCHEMA[sourceKey] ?? [["ts"]]) readSchemaPath(payload, path, output);
   return output;
 }
 
-function coverage(payload) {
-  const timestamps = collectProviderTimestamps(payload).sort((a, b) => a - b);
+function coverage(payload, sourceKey) {
+  const timestamps = collectProviderTimestamps(payload, sourceKey).sort((a, b) => a - b);
   if (!timestamps.length) return { start: null, end: null, providerUpdatedAt: null };
   return {
     start: new Date(timestamps[0]).toISOString(),
@@ -64,7 +95,9 @@ export function buildDataSourceObservations(db, market, collectedAt) {
     const [provider, layer] = TASK_CONTEXT[sourceKey];
     const missing = !hasPayload(market[sourceKey]);
     const prior = db.getDataSourceStats(sourceKey);
-    const currentCoverage = missing ? { start: null, end: null, providerUpdatedAt: null } : coverage(market[sourceKey]);
+    const currentCoverage = missing
+      ? { start: null, end: null, providerUpdatedAt: null }
+      : coverage(market[sourceKey], sourceKey);
     return {
       sourceKey,
       provider,
@@ -159,6 +192,9 @@ export function attachMultiLayerMarketContext(db, report, market) {
   return {
     report: {
       ...report,
+      // `confidencePct` 是一个未经概率校准的分数，叫“置信度”会被误读成胜率。
+      // 对外统一使用 signalQualityScore；confidencePct 作为 SQLite/旧 API 的兼容别名保留。
+      signalQualityScore: report.confidencePct,
       multiLayerContext: {
         architecture: "MULTI_LAYER_MARKET_CONTEXT_V1",
         scoringImpact: "V1.2_FROZEN_CORE_ONLY",

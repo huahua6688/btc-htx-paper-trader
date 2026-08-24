@@ -22,8 +22,37 @@ export const MARKET_TASKS = Object.freeze([
 
 export const CORE_MARKET_TASK_KEYS = Object.freeze(new Set(["ticker", "kline15m", "kline1h", "kline4h", "kline1d"]));
 
-export async function collectMarketSnapshot({ concurrency = 3, runner = runPublicCommand } = {}) {
+// 核心行情失败会让整轮 monitor 变成 ERROR，因此对核心任务做有限次退避重试。
+// 次要任务不重试：它们失败只降级，不值得为此拖长整轮采集时间。
+export const CORE_RETRY = Object.freeze({ attempts: 3, baseDelayMs: 750, maxDelayMs: 4_000 });
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runWithCoreRetry(runner, key, skill, subcommand, params, { retry, delay, warnings }) {
+  const attempts = CORE_MARKET_TASK_KEYS.has(key) ? Math.max(1, retry.attempts) : 1;
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await runner(skill, subcommand, params);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      warnings.push(`${key}: 第 ${attempt} 次采集失败，退避后重试（${error.message}）`);
+      await delay(Math.min(retry.baseDelayMs * 2 ** (attempt - 1), retry.maxDelayMs));
+    }
+  }
+  throw lastError;
+}
+
+export async function collectMarketSnapshot({
+  concurrency = 3,
+  runner = runPublicCommand,
+  retry = CORE_RETRY,
+  delay = sleep
+} = {}) {
   const output = {};
+  const warnings = [];
+  const retryNotices = [];
   let cursor = 0;
   const workers = Array.from({ length: concurrency }, async () => {
     while (cursor < MARKET_TASKS.length) {
@@ -31,15 +60,16 @@ export async function collectMarketSnapshot({ concurrency = 3, runner = runPubli
       cursor += 1;
       const [key, skill, subcommand, params] = task;
       try {
-        output[key] = await runner(skill, subcommand, params);
+        output[key] = await runWithCoreRetry(runner, key, skill, subcommand, params, { retry, delay, warnings: retryNotices });
       } catch (error) {
         if (CORE_MARKET_TASK_KEYS.has(key)) throw error;
         output[key] = null;
-        output.collectionWarnings ??= [];
-        output.collectionWarnings.push(`${key}: ${error.message}`);
+        warnings.push(`${key}: ${error.message}`);
       }
     }
   });
   await Promise.all(workers);
+  if (warnings.length) output.collectionWarnings = warnings;
+  if (retryNotices.length) output.collectionRetries = retryNotices;
   return output;
 }

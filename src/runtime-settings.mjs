@@ -26,8 +26,11 @@ export const RUNTIME_SETTING_KEYS = Object.freeze([
   "allowPyramiding",
   "newEntriesPaused",
   "indicatorProfile",
-  "monitorIntervalMinutes"
+  "monitorIntervalMinutes",
+  "dataPolicyMode"
 ]);
+
+export const DATA_POLICY_MODES = Object.freeze(["FROZEN_V12_STRICT", "TIERED_DEGRADED"]);
 
 const finite = (value) => Number.isFinite(Number(value));
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
@@ -49,12 +52,20 @@ function autoFraction(profile) {
   return 0.5;
 }
 
+// AUTO 的“有效值”只是用户区间的硬天花板，写入 SQLite 并被 openPosition 的原子复核使用。
+// 每一轮真正采用的 AUTO 值由 resolveDynamicLimits 在下单时按当时市场与账户状态计算，
+// 并且永远不会高于这里的天花板，因此原子复核始终成立。
+const CEILING_DEFINITIONS = Object.freeze([
+  RANGE_DEFINITIONS.risk,
+  RANGE_DEFINITIONS.margin,
+  RANGE_DEFINITIONS.leverage,
+  RANGE_DEFINITIONS.notional
+]);
+
 function autoValue(definition, settings) {
   const minimum = Number(settings[definition.minimum]);
   const maximum = Number(settings[definition.maximum]);
-  if ([RANGE_DEFINITIONS.risk, RANGE_DEFINITIONS.margin, RANGE_DEFINITIONS.leverage, RANGE_DEFINITIONS.notional].includes(definition)) {
-    return maximum;
-  }
+  if (CEILING_DEFINITIONS.includes(definition)) return maximum;
   const value = minimum + (maximum - minimum) * autoFraction(settings.riskProfile);
   return definition.integer ? Math.round(value) : Number(value.toFixed(12));
 }
@@ -101,6 +112,10 @@ export function validateRuntimePatch(patch) {
     } else if (key === "indicatorProfile") {
       const value = String(rawValue).toUpperCase();
       if (!INDICATOR_PROFILE_KEYS.includes(value)) throw new Error(`indicatorProfile 必须是 ${INDICATOR_PROFILE_KEYS.join("/")}`);
+      output[key] = value;
+    } else if (key === "dataPolicyMode") {
+      const value = String(rawValue).toUpperCase();
+      if (!DATA_POLICY_MODES.includes(value)) throw new Error(`dataPolicyMode 必须是 ${DATA_POLICY_MODES.join("/")}`);
       output[key] = value;
     } else if (key === "monitorIntervalMinutes") {
       const value = Number(rawValue);
@@ -149,6 +164,202 @@ export function riskProfileFactor(profile) {
   if (profile === "CONSERVATIVE") return 0.7;
   if (profile === "AGGRESSIVE") return 1;
   return 0.85;
+}
+
+const DYNAMIC_DEFINITIONS = Object.freeze({
+  risk: RANGE_DEFINITIONS.risk,
+  margin: RANGE_DEFINITIONS.margin,
+  leverage: RANGE_DEFINITIONS.leverage,
+  notional: RANGE_DEFINITIONS.notional,
+  totalRisk: RANGE_DEFINITIONS.totalRisk
+});
+
+export const DYNAMIC_LIMIT_KEYS = Object.freeze(Object.keys(DYNAMIC_DEFINITIONS));
+
+function blend(minimum, maximum, factor) {
+  return minimum + (maximum - minimum) * clamp(factor, 0, 1);
+}
+
+/**
+ * 把账户与市场状态压缩成一组 0~1 的收缩因子。1 表示没有任何理由收紧，
+ * 越小表示越应该收紧。每个因子都带一句中文解释，供 Telegram 展示“为什么是这个值”。
+ */
+export function describeExposureContext(settings, context = {}) {
+  const number = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const opportunityScore = number(context.opportunityScore, 60);
+  const volatilityPct = Math.max(number(context.volatilityPct, 0.02), 0.0005);
+  const stopDistancePct = Math.max(number(context.stopDistancePct, volatilityPct), 0.0005);
+  const equityCny = Math.max(number(context.equityCny, 0), 0);
+  const marginUsedCny = Math.max(number(context.marginUsedCny, 0), 0);
+  const totalRiskCny = Math.max(number(context.totalRiskCny, 0), 0);
+  const grossNotionalCny = Math.max(number(context.grossNotionalCny, 0), 0);
+  const sameSideNotionalCny = Math.max(number(context.sameSideNotionalCny, 0), 0);
+  const drawdownPct = clamp(number(context.drawdownPct, 0), 0, 1);
+  const dailyLossPct = clamp(number(context.dailyLossPct, 0), 0, 1);
+  const lossStreak = Math.max(Math.trunc(number(context.lossStreak, 0)), 0);
+  const positionCount = Math.max(Math.trunc(number(context.positionCount, 0)), 0);
+  const maxOpenPositions = Math.max(Math.trunc(number(settings.maxOpenPositions, 1)), 1);
+  const marginCeiling = Math.max(number(settings.maxMarginUsagePct, 0.8), 1e-6);
+  const totalRiskCeiling = Math.max(number(settings.maxTotalRiskPct, 0.1), 1e-6);
+  const dailyLossCeiling = Math.max(number(settings.maxDailyLossPct, 0.1), 1e-6);
+  const lossStreakCeiling = Math.max(Math.trunc(number(settings.maxConsecutiveLosses, 3)), 1);
+
+  const marginUsagePct = equityCny > 0 ? marginUsedCny / equityCny : 0;
+  const totalRiskPct = equityCny > 0 ? totalRiskCny / equityCny : 0;
+  const notionalMultiple = equityCny > 0 ? grossNotionalCny / equityCny : 0;
+  const sameSideMultiple = equityCny > 0 ? sameSideNotionalCny / equityCny : 0;
+
+  const factors = {
+    quality: {
+      value: clamp((opportunityScore - 60) / 30, 0, 1),
+      reason: `机会质量 ${round2(opportunityScore)} 分（60→0、90→1）`
+    },
+    volatility: {
+      value: clamp(0.02 / volatilityPct, 0.3, 1),
+      reason: `波动 ${round2(volatilityPct * 100)}%（越高越收紧）`
+    },
+    stopDistance: {
+      value: clamp(0.015 / stopDistancePct, 0.3, 1),
+      reason: `止损距离 ${round2(stopDistancePct * 100)}%（越宽越收紧）`
+    },
+    marginHeadroom: {
+      value: clamp(1 - marginUsagePct / marginCeiling, 0, 1),
+      reason: `已用保证金 ${round2(marginUsagePct * 100)}% / 上限 ${round2(marginCeiling * 100)}%`
+    },
+    riskHeadroom: {
+      value: clamp(1 - totalRiskPct / totalRiskCeiling, 0, 1),
+      reason: `已占用总风险 ${round2(totalRiskPct * 100)}% / 上限 ${round2(totalRiskCeiling * 100)}%`
+    },
+    drawdown: {
+      value: clamp(1 - drawdownPct / 0.2, 0.25, 1),
+      reason: `账户回撤 ${round2(drawdownPct * 100)}%`
+    },
+    dailyLoss: {
+      value: clamp(1 - dailyLossPct / dailyLossCeiling, 0.25, 1),
+      reason: `当日已亏 ${round2(dailyLossPct * 100)}% / 暂停线 ${round2(dailyLossCeiling * 100)}%`
+    },
+    lossStreak: {
+      value: lossStreak > 0 ? clamp(1 - lossStreak / lossStreakCeiling, 0.2, 1) : 1,
+      reason: `当日连亏 ${lossStreak} 笔 / 暂停线 ${lossStreakCeiling} 笔`
+    },
+    crowding: {
+      value: positionCount > 0 ? clamp(1 - positionCount / maxOpenPositions * 0.5, 0.4, 1) : 1,
+      reason: `已有 ${positionCount} / ${maxOpenPositions} 个仓位`
+    },
+    sameSide: {
+      value: sameSideMultiple > 0 ? clamp(1 - sameSideMultiple / 4, 0.4, 1) : 1,
+      reason: `同方向名义敞口 ${round2(sameSideMultiple)}x 权益`
+    },
+    profile: {
+      value: riskProfileFactor(settings.riskProfile),
+      reason: `风险偏好 ${riskProfileChinese(settings.riskProfile)}`
+    }
+  };
+  return {
+    factors,
+    observed: {
+      opportunityScore,
+      volatilityPct,
+      stopDistancePct,
+      equityCny,
+      marginUsagePct,
+      totalRiskPct,
+      notionalMultiple,
+      sameSideMultiple,
+      drawdownPct,
+      dailyLossPct,
+      lossStreak,
+      positionCount
+    }
+  };
+}
+
+function round2(value) {
+  return Number(Number(value).toFixed(2));
+}
+
+const DYNAMIC_RECIPES = Object.freeze({
+  // 单笔风险：机会质量主导，波动/回撤/连亏/拥挤度收紧。
+  risk: ["quality", "volatility", "profile", "drawdown", "dailyLoss", "lossStreak", "crowding"],
+  // 保证金占用上限：质量与波动主导，账户健康度收紧；不看当前占用以免自我循环。
+  margin: ["quality", "volatility", "profile", "drawdown", "dailyLoss", "lossStreak"],
+  // 杠杆上限：止损距离与波动主导，越宽的止损越不需要高杠杆。
+  leverage: ["quality", "volatility", "stopDistance", "profile", "drawdown", "lossStreak"],
+  // 名义仓位上限：质量、波动、同方向敞口与拥挤度共同决定。
+  notional: ["quality", "volatility", "profile", "drawdown", "dailyLoss", "lossStreak", "crowding", "sameSide"],
+  // 组合总风险上限：账户健康度主导。
+  totalRisk: ["profile", "drawdown", "dailyLoss", "lossStreak", "riskHeadroom"]
+});
+
+/**
+ * 计算本轮真正采用的 AUTO 值。MANUAL 直接使用用户值；AUTO 在 [min, max] 内按
+ * 权益、机会质量、波动、止损距离、已有敞口、保证金占用、总风险、回撤、日内亏损、
+ * 连亏和仓位数动态插值。返回值永远被夹在用户区间内，且不超过已存储的天花板。
+ */
+export function resolveDynamicLimits(settings, context = {}) {
+  const exposure = describeExposureContext(settings, context);
+  const limits = {};
+  for (const [name, definition] of Object.entries(DYNAMIC_DEFINITIONS)) {
+    const minimum = Number(settings[definition.minimum]);
+    const maximum = Number(settings[definition.maximum]);
+    const ceiling = Number(settings[definition.effective]);
+    const manual = settings[definition.mode] === "MANUAL";
+    if (manual) {
+      const manualValue = clamp(Number(settings[definition.manual]), minimum, maximum);
+      limits[name] = {
+        key: definition.effective,
+        mode: "MANUAL",
+        minimum,
+        maximum,
+        value: definition.integer ? Math.round(manualValue) : manualValue,
+        factor: null,
+        reasons: ["手动模式：直接使用用户设定值"]
+      };
+      continue;
+    }
+    const used = DYNAMIC_RECIPES[name];
+    let factor = 1;
+    const reasons = [];
+    for (const factorName of used) {
+      const item = exposure.factors[factorName];
+      factor *= item.value;
+      reasons.push(`${item.reason} → ×${round2(item.value)}`);
+    }
+    const raw = blend(minimum, maximum, factor);
+    const bounded = Math.min(clamp(raw, minimum, maximum), Number.isFinite(ceiling) ? ceiling : maximum);
+    limits[name] = {
+      key: definition.effective,
+      mode: "AUTO",
+      minimum,
+      maximum,
+      ceiling: Number.isFinite(ceiling) ? ceiling : maximum,
+      value: definition.integer ? Math.round(bounded) : Number(bounded.toFixed(12)),
+      factor: Number(factor.toFixed(6)),
+      reasons
+    };
+  }
+  return { limits, exposure };
+}
+
+/**
+ * 把动态限额投影回 runtime settings 的形状，方便直接交给现有的仓位计算函数。
+ * 其余字段保持不变，因此 NET/HEDGE、加仓开关和暂停逻辑完全不受影响。
+ */
+export function applyDynamicLimits(settings, context = {}) {
+  const resolved = resolveDynamicLimits(settings, context);
+  const applied = { ...settings };
+  for (const item of Object.values(resolved.limits)) applied[item.key] = item.value;
+  // 单笔风险不得高于当前动态总风险上限。收紧之后必须把 limits 一起改写，
+  // 否则 Telegram 显示的「本轮实际值」会和 buildPaperCandidate 真正使用的值不一致。
+  if (applied.riskPerTradePct > applied.maxTotalRiskPct) {
+    applied.riskPerTradePct = applied.maxTotalRiskPct;
+    resolved.limits.risk = {
+      ...resolved.limits.risk,
+      value: applied.maxTotalRiskPct,
+      reasons: [...resolved.limits.risk.reasons, `被当前总风险上限 ${round2(applied.maxTotalRiskPct * 100)}% 压低`]
+    };
+  }
+  return { settings: applied, ...resolved };
 }
 
 export function riskProfileChinese(profile) {

@@ -8,6 +8,16 @@ import {
   sendTelegramMessage,
   telegramEnabled
 } from "./telegram-client.mjs";
+// 只读访问研究登记簿。Telegram 绝不 import 研究 CLI 入口，
+// 也绝不因为查看页面而写入研究数据库。
+import { RESEARCH_REGISTRY, researchRegistrySnapshot, researchRunsByType } from "./research-registry.mjs";
+
+// Champion 的身份以冻结源码为准，即使登记簿还没建立也必须显示得出来。
+const FROZEN_CHAMPION = Object.freeze({
+  version: "V1.2-FROZEN",
+  lifecycleStatus: "FROZEN",
+  sha256: "9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6"
+});
 
 const n = (value, digits = 2) => value !== null && value !== undefined && Number.isFinite(Number(value))
   ? Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })
@@ -35,10 +45,35 @@ function mainButtons(settings = { newEntriesPaused: false }) {
 
 const MAIN_BUTTONS = Object.freeze(mainButtons());
 
+/**
+ * AUTO 现在是真的按当时状态算出来的，因此必须能回答三件事：
+ * 自动范围是多少、本轮实际采用了多少、为什么是这个值。
+ */
+export function dynamicLimitLines(db) {
+  const snapshot = db.getLatestSnapshot();
+  const limits = snapshot?.report?.dynamicLimits;
+  if (!limits) return ["自动限额：本轮尚未计算（没有可入场的方向判断时不会计算）"];
+  const format = (name, item, render) => {
+    if (item.mode === "MANUAL") return `${name}：手动 ${render(item.value)}`;
+    const why = (item.reasons ?? []).slice(0, 3).join("；");
+    return `${name}：自动范围 ${render(item.minimum)}～${render(item.maximum)}；本轮 ${render(item.value)}（系数 ${item.factor}）\n  └ ${why}`;
+  };
+  const asPct = (value) => `${(Number(value) * 100).toFixed(2)}%`;
+  const asX = (value) => `${Number(value).toFixed(2)}x`;
+  return [
+    format("单笔风险", limits.risk, asPct),
+    format("保证金占用上限", limits.margin, asPct),
+    format("杠杆上限", limits.leverage, asX),
+    format("名义仓位上限", limits.notional, (value) => `${Number(value).toFixed(2)}倍权益`),
+    format("组合总风险上限", limits.totalRisk, asPct)
+  ];
+}
+
 function settingsText(settings) {
   return [
     "⚙️ Paper Trading 控制面板",
     `配置版本：${settings.revision}`,
+    `数据门禁政策：${settings.dataPolicyMode === "TIERED_DEGRADED" ? "分级降级（V1.3 候选）" : "冻结 V1.2 严格门禁"}`,
     `手动新开仓开关：${settings.newEntriesPaused ? "已暂停" : "允许评估（仍须通过自动风控）"}`,
     `持仓模式：${settings.positionMode === "HEDGE" ? "双向 HEDGE" : "单向 NET"}`,
     `风险偏好：${riskProfileChinese(settings.riskProfile)}`,
@@ -103,6 +138,27 @@ function positionModePanel(settings) {
   };
 }
 
+/**
+ * 数据质量必须能被一眼看到：DATA_OK / DATA_DEGRADED / DATA_BLOCKED 加上到底缺了什么。
+ * 以前一个次要接口挂掉只会表现为一串安静的 WAIT，根本看不出系统已经不可能开仓。
+ */
+export function dataQualityLines(report) {
+  const gate = report?.dataQualityGate;
+  if (!gate) return ["数据质量：未记录"];
+  const tierName = (tier) => tier === "CRITICAL" ? "核心" : tier === "IMPORTANT" ? "重要" : "辅助";
+  const missing = gate.missing?.length
+    ? gate.missing.map((item) => `${item.label}[${tierName(item.tier)}/${item.provenance === "HISTORICAL_UNAVAILABLE" ? "历史无档案" : "实时失败"}]`).join("、")
+    : "无";
+  return [
+    `数据质量：${gate.status}（政策 ${gate.policy}）`,
+    `missing：${missing}`,
+    ...(gate.status === "DATA_DEGRADED"
+      ? [`降级：权重 ${gate.degradationScore}，风险系数 ×${gate.riskMultiplier}，入场分门槛 +${gate.entryScoreBonus}`]
+      : []),
+    ...(gate.status === "DATA_BLOCKED" ? gate.hardBlockReasons.slice(0, 3).map((item) => `阻断：${item}`) : [])
+  ];
+}
+
 function decisionText(db) {
   const snapshot = db.getLatestSnapshot();
   if (!snapshot) return "🧠 当前判断\n尚无行情快照。";
@@ -113,6 +169,8 @@ function decisionText(db) {
     `做多评分：${report.opportunities?.LONG?.score ?? "—"}`,
     `做空评分：${report.opportunities?.SHORT?.score ?? "—"}`,
     `最终判断：${snapshot.decision}`,
+    `信号质量分：${report.signalQualityScore ?? report.confidencePct ?? "—"}/100（排序指标，不是胜率）`,
+    ...dataQualityLines(report),
     `是否值得现在入场：${report.entryAssessment?.enterNow ? "是" : "否"}`,
     "主要原因：",
     ...((report.entryAssessment?.reasons ?? []).slice(0, 5).map((item) => `- ${item}`))
@@ -200,53 +258,78 @@ function marginPanel(settings) {
   };
 }
 
-function championText(db) {
-  const champion = db.getStrategyVersions().find((item) => item.role === "CHAMPION");
+// Champion 的实时状态以生产 Paper 库和冻结源码为准；
+// Challenger / 研究运行 / 相似行情 / 研究结果一律从独立的研究登记簿只读读取。
+function championText(db, registryPath) {
   const snapshot = db.getLatestSnapshot();
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
+  const champion = registry.strategyVersions.find((item) => item.role === "CHAMPION") ?? null;
   return [
     "👑 Paper Champion",
-    `版本：${champion?.version ?? "未登记"}`,
-    `状态：${champion?.lifecycle_status ?? "—"}`,
-    `SHA-256：${champion?.strategy_hash ?? "—"}`,
+    `版本：${champion?.version ?? FROZEN_CHAMPION.version}`,
+    `状态：${champion?.lifecycle_status ?? FROZEN_CHAMPION.lifecycleStatus}`,
+    `SHA-256：${champion?.strategy_hash ?? FROZEN_CHAMPION.sha256}`,
     `最近判断：${snapshot?.decision ?? "尚无"}`,
+    `数据门禁政策：${db.getRuntimeSettings()?.dataPolicyMode ?? "FROZEN_V12_STRICT"}`,
     "冻结 Champion 不允许原地改参数；新版本只能从 Challenger 完整验证后晋级，并保留回滚点。"
   ].join("\n");
 }
 
-function shadowText(db) {
-  const challengers = db.getStrategyVersions().filter((item) => item.role === "CHALLENGER");
+function registryFooter(registry) {
+  return registry.available
+    ? `登记簿：${registry.path}（只读读取，不写入）`
+    : `登记簿尚未创建：${registry.path}`;
+}
+
+function shadowText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
+  const challengers = registry.strategyVersions.filter((item) => item.role === "CHALLENGER");
   return [
     "👥 Challenger / Shadow",
-    ...(challengers.length ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${item.strategy_hash.slice(0, 16)}…`) : ["尚无已登记且通过前置验证的 Challenger。"]),
-    "Shadow 使用独立 SQLite，不能影响 Champion 账户。未证明净 edge 的候选不会晋级。"
+    ...(challengers.length
+      ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${String(item.strategy_hash ?? "").slice(0, 16)}…`)
+      : ["尚无研究记录：还没有登记任何 Challenger。"]),
+    "Shadow 使用独立 SQLite，不能影响 Champion 账户。未证明净 edge 的候选不会晋级。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function learningText(db) {
-  const versions = db.getStrategyVersions();
-  const runs = db.getResearchRuns({ limit: 8 });
+function learningText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 8, path: registryPath });
+  const runs = registry.researchRuns;
   return [
     "🧠 Strategy Learning",
     "闭环：Candidate → Replay → Walk-forward/Purged OOS → untouched Final OOS → Monte Carlo → Shadow → Promotion Gate。",
-    `已登记策略版本：${versions.length}；已持久化研究运行：${runs.length}`,
-    ...(runs.slice(0, 5).map((item) => `- ${item.run_type}：${item.status}（${item.finished_at}）`)),
-    "自动学习不会按单笔输赢即时调参，也不会用已使用 Final OOS 继续选策略。"
+    `已登记策略版本：${registry.strategyVersionCount}；已持久化研究运行：${registry.researchRunCount}`,
+    ...(runs.length
+      ? runs.slice(0, 5).map((item) => `- ${item.run_type}：${item.status}（${item.finished_at}）`)
+      : ["尚无研究记录。"]),
+    "自动学习不会按单笔输赢即时调参，也不会用已使用 Final OOS 继续选策略。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function similarityText(db) {
-  const run = db.getResearchRuns({ limit: 1, runType: "HISTORICAL_SIMILARITY" })[0];
+function similarityText(registryPath) {
+  const run = researchRunsByType("HISTORICAL_SIMILARITY", { limit: 1, path: registryPath })[0] ?? null;
+  const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
   return [
     "📊 Historical Similarity",
-    run ? `最近运行：${run.finished_at}\n状态：${run.status}\n${JSON.stringify(run.summary)}` : "数据库内尚无新的相似行情运行摘要；不会伪造概率。样本不足时必须显示 insufficient evidence。"
+    run
+      ? `最近运行：${run.finished_at}\n状态：${run.status}\n${JSON.stringify(run.summary)}`
+      : "尚无研究记录：登记簿里还没有相似行情运行摘要；不会伪造概率。样本不足时必须显示 insufficient evidence。",
+    registryFooter(registry)
   ].join("\n");
 }
 
-function researchResultsText(db) {
-  const runs = db.getResearchRuns({ limit: 10 });
+function researchResultsText(registryPath) {
+  const registry = researchRegistrySnapshot({ runLimit: 10, path: registryPath });
+  const runs = registry.researchRuns;
   return [
     "📚 Research Results",
-    ...(runs.length ? runs.map((item) => `- ${item.run_type} / ${item.status} / ${item.finished_at}`) : ["尚无写入生产 SQLite 的研究摘要；research-output 原始产物不会被假装成数据库结果。"])
+    ...(runs.length
+      ? runs.map((item) => `- ${item.run_type} / ${item.status} / ${item.finished_at}`)
+      : ["尚无研究记录；research-output 原始产物不会被假装成数据库结果。"]),
+    registryFooter(registry)
   ].join("\n");
 }
 
@@ -278,7 +361,7 @@ function todayText(db) {
   ].join("\n");
 }
 
-function riskPanel(settings) {
+function riskPanel(settings, db = null) {
   return {
     text: [
       "⚙️ 风险设置",
@@ -287,12 +370,17 @@ function riskPanel(settings) {
       `账户总风险：${controlModeChinese(settings.totalRiskMode)} ${pct(settings.totalRiskMinPct)}～${pct(settings.totalRiskMaxPct)}`,
       `每日损失：${controlModeChinese(settings.dailyLossMode)} ${pct(settings.dailyLossMinPct)}～${pct(settings.dailyLossMaxPct)}`,
       `连亏暂停：${controlModeChinese(settings.lossStreakMode)} ${settings.lossStreakMin}～${settings.lossStreakMax} 笔`,
+      "",
+      "本轮实际采用的自动值：",
+      ...(db ? dynamicLimitLines(db) : []),
+      "",
       "选择一项后再调最低、最高和手动值；每次点击只刷新当前消息。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "保守", callback_data: "paper:set:riskProfile:CONSERVATIVE" }, { text: "均衡", callback_data: "paper:set:riskProfile:BALANCED" }, { text: "积极", callback_data: "paper:set:riskProfile:AGGRESSIVE" }],
       [{ text: "单笔风险", callback_data: "paper:view:range-risk" }, { text: "总风险", callback_data: "paper:view:range-totalRisk" }],
       [{ text: "每日损失", callback_data: "paper:view:range-dailyLoss" }, { text: "连亏暂停", callback_data: "paper:view:range-lossStreak" }],
+      [{ text: "🤖 本轮自动限额", callback_data: "paper:view:auto" }],
       [{ text: "返回", callback_data: "paper:view:main" }]
     ] }
   };
@@ -419,8 +507,11 @@ export class TelegramControlPanel {
     getUpdates = getTelegramUpdates,
     send = sendTelegramMessage,
     edit = editTelegramMessage,
-    answer = answerTelegramCallback
+    answer = answerTelegramCallback,
+    // 研究登记簿路径可注入，便于测试与自定义部署；默认走 research-registry 的解析结果。
+    researchRegistryPath = RESEARCH_REGISTRY.path
   } = {}) {
+    this.researchRegistryPath = researchRegistryPath;
     this.db = db;
     this.config = config;
     this.fetchImpl = fetchImpl;
@@ -434,7 +525,46 @@ export class TelegramControlPanel {
   }
 
   get enabled() { return telegramEnabled(this.config); }
-  isAdmin(chatId) { return String(chatId) === String(this.config.chatId); }
+
+  /**
+   * 授权判定必须同时区分 CHAT ID 与 SENDER(USER) ID。
+   *
+   *   - chat 必须精确等于 TELEGRAM_CHAT_ID，否则一律拒绝。
+   *   - 配置了 TELEGRAM_ADMIN_USER_ID 时，发送者必须精确等于它。
+   *     这是群组场景下唯一安全的模式：群里其他人即使看到按钮也无法操作。
+   *   - 未配置 TELEGRAM_ADMIN_USER_ID 时，只兼容私聊：私聊的 chat.id 等于用户自己的
+   *     user id，因此要求 sender === chat 才放行。群组/超级群/频道在没有显式管理员
+   *     user id 的情况下一律拒绝，绝不因为“在群里”就把风控开关交出去。
+   */
+  authorize({ chatId, senderId, chatType } = {}) {
+    if (chatId === null || chatId === undefined || String(chatId) === "") {
+      return { allowed: false, reason: "无法识别来源会话" };
+    }
+    if (String(chatId) !== String(this.config.chatId)) {
+      return { allowed: false, reason: "无权限" };
+    }
+    const adminUserId = String(this.config.adminUserId ?? "").trim();
+    if (adminUserId) {
+      if (senderId === null || senderId === undefined || String(senderId) === "") {
+        return { allowed: false, reason: "无法识别发送者" };
+      }
+      return String(senderId) === adminUserId
+        ? { allowed: true, mode: "ADMIN_USER_ID" }
+        : { allowed: false, reason: "只有管理员本人可以操作 Paper 设置" };
+    }
+    const isPrivate = chatType === undefined || chatType === null || chatType === "private";
+    if (!isPrivate) {
+      return { allowed: false, reason: "群组模式必须配置 TELEGRAM_ADMIN_USER_ID 才能操作" };
+    }
+    if (senderId !== null && senderId !== undefined && String(senderId) !== String(chatId)) {
+      return { allowed: false, reason: "发送者与私聊会话不一致" };
+    }
+    return { allowed: true, mode: "PRIVATE_CHAT" };
+  }
+
+  isAdmin(chatId, senderId, chatType) {
+    return this.authorize({ chatId, senderId, chatType }).allowed;
+  }
 
   async sendView(text, replyMarkup = MAIN_BUTTONS) {
     return this.send(text, { config: this.config, fetchImpl: this.fetchImpl, replyMarkup });
@@ -459,18 +589,19 @@ export class TelegramControlPanel {
     if (name === "research") return { text: researchText(this.db), markup: main };
     if (name === "account") return { text: accountText(this.db), markup: main };
     if (name === "today") return { text: todayText(this.db), markup: main };
-    if (name === "risk") return riskPanel(settings);
+    if (name === "risk") return riskPanel(settings, this.db);
+    if (name === "auto") return { text: ["🤖 本轮自动限额", ...dynamicLimitLines(this.db)].join("\n"), markup: main };
     if (name === "leverage") return leveragePanel(settings);
     if (name === "margin") return marginPanel(settings);
     if (name === "pyramiding") return pyramidingPanel(settings);
     if (name === "position-mode") return positionModePanel(settings);
     if (name === "profile") return indicatorProfilePanel(settings);
     if (name === "cycle") return cyclePanel(settings);
-    if (name === "champion") return { text: championText(this.db), markup: main };
-    if (name === "shadow") return { text: shadowText(this.db), markup: main };
-    if (name === "learning") return { text: learningText(this.db), markup: main };
-    if (name === "similarity") return { text: similarityText(this.db), markup: main };
-    if (name === "results") return { text: researchResultsText(this.db), markup: main };
+    if (name === "champion") return { text: championText(this.db, this.researchRegistryPath), markup: main };
+    if (name === "shadow") return { text: shadowText(this.researchRegistryPath), markup: main };
+    if (name === "learning") return { text: learningText(this.researchRegistryPath), markup: main };
+    if (name === "similarity") return { text: similarityText(this.researchRegistryPath), markup: main };
+    if (name === "results") return { text: researchResultsText(this.researchRegistryPath), markup: main };
     if (name.startsWith("range-")) return rangeControlPanel(settings, name.slice("range-".length));
     if (name === "recent") return { text: recentText(this.db), markup: main };
     return { text: settingsText(settings), markup: main };
@@ -521,9 +652,13 @@ export class TelegramControlPanel {
   async handleAdminUpdate(update) {
     const callback = update.callback_query;
     const message = update.message;
-    const chatId = callback?.message?.chat?.id ?? message?.chat?.id;
-    if (!this.isAdmin(chatId)) {
-      if (callback?.id) await this.answer(callback.id, "无权限", { config: this.config, fetchImpl: this.fetchImpl });
+    const chat = callback?.message?.chat ?? message?.chat;
+    const chatId = chat?.id;
+    const senderId = callback?.from?.id ?? message?.from?.id;
+    const decision = this.authorize({ chatId, senderId, chatType: chat?.type });
+    if (!decision.allowed) {
+      this.logger(`Telegram control rejected an unauthorized update: chat=${chatId ?? "?"} sender=${senderId ?? "?"} reason=${decision.reason}`);
+      if (callback?.id) await this.answer(callback.id, decision.reason, { config: this.config, fetchImpl: this.fetchImpl });
       this.db.markTelegramUpdateProcessed(update.update_id);
       return;
     }

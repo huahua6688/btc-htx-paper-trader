@@ -112,7 +112,11 @@ async function main() {
       return;
     }
     const elapsed = Date.now() - cycleStartedAt;
-    const configuredInterval = Number(db.getRuntimeSettings().monitorIntervalMinutes) * 60_000;
+    // 读坏的设置绝不能变成 setTimeout(loop, NaN) —— 那会退化成一个不停敲打 HTX 的忙循环。
+    const configuredMinutes = Number(db.getRuntimeSettings()?.monitorIntervalMinutes);
+    const configuredInterval = Number.isFinite(configuredMinutes) && configuredMinutes >= 1
+      ? configuredMinutes * 60_000
+      : PAPER_CONFIG.monitorIntervalMs;
     const delay = Math.max(0, configuredInterval - elapsed);
     process.stdout.write(`下一次运行：约 ${Math.ceil(delay / 60_000)} 分钟后。按 Ctrl+C 安全停止。\n`);
     timer = setTimeout(loop, delay);

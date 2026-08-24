@@ -23,6 +23,84 @@ import { BAR_MS, hashObject, mean, round, standardDeviation } from "./research-u
 import { analyzeTradableEdge } from "./tradable-edge.mjs";
 import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
+import { analyzeDataTiered, DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
+
+/**
+ * 研究资金视角。两者必须分开报告，绝不能混为一谈：
+ *
+ *   PRODUCTION_FAITHFUL   使用真实 Paper 资金规模与真实合约步进，回答
+ *                         「当前这个账户实际能执行出什么结果」。
+ *   EDGE_REFERENCE_CAPITAL 使用足够大的参考资金，让仓位不再被最小合约步进量化主导，
+ *                         回答「策略本身到底有没有 edge」。仅供研究，
+ *                         绝不写入、也绝不改变生产 Paper 账户。
+ */
+export const CAPITAL_PROFILES = Object.freeze({
+  PRODUCTION_FAITHFUL: "PRODUCTION_FAITHFUL",
+  EDGE_REFERENCE_CAPITAL: "EDGE_REFERENCE_CAPITAL"
+});
+
+export const DEFAULT_REFERENCE_CAPITAL_CNY = 20_000;
+
+export function resolveCapitalProfile(paperConfig, {
+  capitalProfile = CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
+  referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY
+} = {}) {
+  if (!Object.values(CAPITAL_PROFILES).includes(capitalProfile)) {
+    throw new Error(`Unknown capital profile: ${capitalProfile}`);
+  }
+  if (capitalProfile === CAPITAL_PROFILES.PRODUCTION_FAITHFUL) {
+    return {
+      capitalProfile,
+      researchOnly: false,
+      initialCapitalCny: Number(paperConfig.initialCapitalCny),
+      note: "使用真实 Paper 资金规模，结果代表当前账户实际可执行的收益"
+    };
+  }
+  const capital = Number(referenceCapitalCny);
+  if (!Number.isFinite(capital) || capital <= 0) throw new Error("referenceCapitalCny must be a positive number");
+  return {
+    capitalProfile,
+    researchOnly: true,
+    initialCapitalCny: capital,
+    note: "RESEARCH_ONLY：参考资金只用于判断策略 edge 是否存在，不代表当前账户收益，也不会影响生产 Paper 账户"
+  };
+}
+
+const CONTRACT_STEP_CODES = new Set(["BELOW_MIN_CONTRACT_STEP"]);
+const RISK_CODES = new Set(["RISK_BUDGET_ZERO", "RISK_BUDGET_EXCEEDED", "PORTFOLIO_RISK_BUDGET_EXHAUSTED"]);
+const MARGIN_CODES = new Set([
+  "MARGIN_CAP_BINDING",
+  "LEVERAGE_CAP_BINDING",
+  "PORTFOLIO_MARGIN_BUDGET_EXHAUSTED",
+  "PORTFOLIO_NOTIONAL_BUDGET_EXHAUSTED"
+]);
+
+function summarizeEntryRejections(rejectionCounts) {
+  const total = Object.values(rejectionCounts).reduce((sum, value) => sum + value, 0);
+  const bucket = (codes) => Object.entries(rejectionCounts)
+    .filter(([code]) => codes.has(code))
+    .reduce((sum, [, value]) => sum + value, 0);
+  return {
+    total,
+    byCode: { ...rejectionCounts },
+    contractStepRejections: bucket(CONTRACT_STEP_CODES),
+    riskRejections: bucket(RISK_CODES),
+    marginRejections: bucket(MARGIN_CODES),
+    netRrRejections: (rejectionCounts.NO_TARGET_MEETS_NET_RR ?? 0) + (rejectionCounts.NET_RR_BELOW_MINIMUM ?? 0),
+    liquidationBufferRejections: (rejectionCounts.STOP_BEYOND_LIQUIDATION_BUFFER ?? 0)
+      + (rejectionCounts.PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER ?? 0)
+  };
+}
+
+/**
+ * 回放支持的策略 id。`data-tiered` 就是实时 monitor 在 dataPolicyMode=TIERED_DEGRADED
+ * 时使用的同一个 V1.3 候选：两边都走 analyzeDataTiered → applyTieredDataPolicy，
+ * 没有第二份行为实现。
+ */
+export const REPLAY_STRATEGIES = Object.freeze([
+  "champion", "challenger", "historical-compatible",
+  "tradable-edge", "anti-chase", "research-v2", "data-tiered"
+]);
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
   signalClock: "decision at completed 15m candle close",
@@ -76,7 +154,7 @@ function managePositions(db, report, actions, config) {
       closePosition(db, position, hardExit, actions);
       continue;
     }
-    const management = manageOpenPosition(position, report);
+    const management = manageOpenPosition(position, report, config);
     if (management.action === "EXIT") {
       const exit = evaluatePaperExit(position, report, config, {
         checkStop: false,
@@ -96,12 +174,21 @@ function managePositions(db, report, actions, config) {
   }
 }
 
-function executePending(db, signal, candle, market, actions, config, delayBars) {
+function executePending(db, signal, candle, market, actions, config, delayBars, rejectionCounts) {
   if (!signal || !["LONG", "SHORT"].includes(signal.decision)) return null;
   const report = executionReport(signal, candle, delayBars);
   const gate = evaluatePaperEntry(db, report, config, market);
   if (!gate.allowed) {
-    actions.push({ type: "DELAYED_ENTRY_REJECTED", reasons: gate.reasons, signalAt: signal.generatedAt });
+    // 每一种拒绝都单独计数，研究报告才能把「最小合约步进不够」和
+    // 「风险/保证金上限」分开回答，而不是混成一句无法归因的话。
+    for (const code of gate.reasonCodes) rejectionCounts[code] = (rejectionCounts[code] ?? 0) + 1;
+    actions.push({
+      type: "DELAYED_ENTRY_REJECTED",
+      reasons: gate.reasons,
+      reasonCodes: gate.reasonCodes,
+      sizingRejection: gate.sizingRejection,
+      signalAt: signal.generatedAt
+    });
     return null;
   }
   const snapshotId = db.insertSnapshot(report);
@@ -118,6 +205,8 @@ function executePending(db, signal, candle, market, actions, config, delayBars) 
 function buildReport(strategy, market, parameters, config) {
   const report = strategy === "champion"
     ? analyzeSnapshot(market, config)
+    : strategy === "data-tiered"
+      ? analyzeDataTiered(market, parameters, config)
     : strategy === "historical-compatible"
       ? analyzeHistoricalCompatible(market, parameters, config)
       : strategy === "tradable-edge"
@@ -282,12 +371,15 @@ export async function runHistoricalReplay(dataset, {
   executionDelayBars = 1,
   paperConfig = PAPER_CONFIG,
   collectTrace = true,
-  forceCloseAtEnd = true
+  forceCloseAtEnd = true,
+  capitalProfile = CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
+  referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY
 } = {}) {
-  if (!["champion", "challenger", "historical-compatible", "tradable-edge", "anti-chase", "research-v2"].includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
+  if (!REPLAY_STRATEGIES.includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
   if (strategy === "historical-compatible" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = HISTORICAL_COMPATIBLE_PARAMETERS;
   if (strategy === "anti-chase" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = ANTI_CHASE_PARAMETERS;
   if (strategy === "research-v2" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = RESEARCH_CHALLENGER_V2_PARAMETERS;
+  if (strategy === "data-tiered" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = DATA_TIERED_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
   const warmupIndex = firstReplayableIndex(dataset.candles);
@@ -300,8 +392,15 @@ export async function runHistoricalReplay(dataset, {
   if (!Number.isInteger(executionDelayBars) || executionDelayBars < 1 || executionDelayBars > 8) throw new Error("executionDelayBars must be between 1 and 8");
   if (outputDirectory) await mkdir(outputDirectory, { recursive: true });
   const resolvedDbPath = dbPath ?? (outputDirectory ? join(outputDirectory, `${strategy}.sqlite`) : ":memory:");
-  const config = { ...paperConfig, databasePath: resolvedDbPath, databasePathSource: "HISTORICAL_REPLAY" };
+  const capital = resolveCapitalProfile(paperConfig, { capitalProfile, referenceCapitalCny });
+  const config = {
+    ...paperConfig,
+    initialCapitalCny: capital.initialCapitalCny,
+    databasePath: resolvedDbPath,
+    databasePathSource: "HISTORICAL_REPLAY"
+  };
   const db = openPaperDatabase(resolvedDbPath, config);
+  const rejectionCounts = {};
   const trace = [];
   const actionCounts = {};
   const actions = {
@@ -327,7 +426,7 @@ export async function runHistoricalReplay(dataset, {
         && hasChallengerFrameCache(candle.timestamp + BAR_MS, candle.close);
       const market = buildPointInTimeMarket(dataset.candles, dataset.funding, index, { maximumBars: compactCachedFrame ? 12 : 260 });
       if (pending?.remaining === 1) {
-        executePending(db, pending.report, candle, market, actions, config, executionDelayBars);
+        executePending(db, pending.report, candle, market, actions, config, executionDelayBars, rejectionCounts);
         pending = null;
       } else if (pending) pending.remaining -= 1;
       const report = buildReport(strategy, market, parameters, config);
@@ -387,6 +486,10 @@ export async function runHistoricalReplay(dataset, {
       effectiveRange: { from: firstEventAt, to: lastEventAt },
       eventCount,
       eventStreamHash: eventHasher.digest("hex"),
+      capital,
+      // 「合约步进拒绝」和「风险/保证金拒绝」必须分开统计：前者是小账户的粒度问题，
+      // 后者才是策略本身的风险约束。混在一起就无法判断 edge 是否存在。
+      entryRejections: summarizeEntryRejections(rejectionCounts),
       assumptions: { ...REPLAY_ASSUMPTIONS, executionDelayBars },
       pointInTimeGuarantees: {
         closedCandlesOnly: true,
@@ -413,6 +516,11 @@ export async function runHistoricalReplay(dataset, {
         "Tradable Edge uses a frozen non-ML empirical model trained only on its declared pre-OOS interval.",
         "Every entry still passes the unchanged Paper risk/execution core after the net-edge gate.",
         "Unavailable historical execution and derivatives fields remain absent and are never synthesized."
+      ] : strategy === "data-tiered" ? [
+        "V1.3-DATA-TIERED is a CANDIDATE. It reuses the frozen V1.2 direction, scoring and regime unchanged and only replaces the all-or-nothing data gate with the tiered CRITICAL/IMPORTANT/AUXILIARY policy.",
+        "Replay calls the same analyzeDataTiered/applyTieredDataPolicy used by live monitor under dataPolicyMode=TIERED_DEGRADED; there is no second behavioural implementation.",
+        "Historically unavailable order book/OI/elite/mark-basis stay absent and are never synthesized; they degrade the risk budget and raise the entry score bar instead of forcing WAIT.",
+        "This replay does not promote anything and must not touch the untouched Final OOS."
       ] : strategy === "research-v2" ? [
         "Research V2 uses only point-in-time closed OHLCV and timestamp-visible Funding in historical replay.",
         "Its independent-dimension scoring, price-extension gate, structure target and Tradable Edge calculation are shared with live Shadow; it does not modify the frozen V1.2 Champion.",

@@ -1,3 +1,5 @@
+import { PAPER_CONFIG } from "./config.mjs";
+
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const round = (value, digits = 8) => Number(Number(value).toFixed(digits));
 
@@ -9,7 +11,7 @@ function targetTouched(side, bar, target) {
   return side === "LONG" ? Number(bar.high) >= target : Number(bar.low) <= target;
 }
 
-export function manageOpenPosition(position, report) {
+export function manageOpenPosition(position, report, config = PAPER_CONFIG) {
   const generatedMs = new Date(report.generatedAt).getTime();
   const latestBarTs = Number(report.latest15mBar?.timestamp);
   const completedBarTs = Number(report.completed15mBar?.timestamp);
@@ -56,7 +58,7 @@ export function manageOpenPosition(position, report) {
   let takeProfit = Number(position.take_profit);
   const changes = [];
   const events = position.management?.events ?? [];
-  const exitCostPerBtc = entry * (PAPER_CONFIG.feeRatePerSide + PAPER_CONFIG.slippageRate) * 2;
+  const exitCostPerBtc = entry * (Number(config.feeRatePerSide) + Number(config.slippageRate)) * 2;
   const breakEven = side === "LONG" ? entry + exitCostPerBtc : entry - exitCostPerBtc;
   if (rMultiple >= 1 && improvesStop(side, breakEven, stopLoss)) {
     stopLoss = breakEven;
@@ -85,6 +87,7 @@ export function manageOpenPosition(position, report) {
     changes.push("原方向继续加强且尚未触及止盈，将止盈适度顺势延伸");
   }
 
+  const stopChanged = round(stopLoss, 2) !== round(Number(position.stop_loss), 2);
   const reason = changes.length
     ? changes.join("；")
     : clearOpposite || originalInvalid
@@ -99,6 +102,9 @@ export function manageOpenPosition(position, report) {
     takeProfit: round(takeProfit, 2),
     oppositeSignalCount: nextOppositeCount,
     lastManagementBarTs: completedBarTs,
+    // 止损一旦移动，新的止损只能作用于「止损生效之后」才开始的 K 线。
+    stopEffectiveBarTs: stopChanged ? latestBarTs : undefined,
+    stopChanged,
     event: {
       type: changes.some((item) => item.includes("止盈")) ? "TP_EXTENDED" : changes.length ? "RISK_ADJUSTED" : "REVIEWED",
       at: report.generatedAt,
@@ -115,4 +121,3 @@ export function manageOpenPosition(position, report) {
     dataSafe: true
   };
 }
-import { PAPER_CONFIG } from "./config.mjs";
