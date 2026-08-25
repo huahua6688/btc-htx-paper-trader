@@ -1,4 +1,5 @@
 import { BAR_MS } from "./research-utils.mjs";
+import { pointInTimeFundingContext } from "./multi-venue-catalog.mjs";
 
 const TIMEFRAMES = Object.freeze({
   "15m": BAR_MS,
@@ -16,7 +17,8 @@ export const REPLAY_PROVENANCE = Object.freeze({
   HISTORICAL_UNAVAILABLE: "HISTORICAL_UNAVAILABLE",
   STALE: "STALE",
   LIVE_FAILURE: "LIVE_FAILURE",
-  REPLAY_ARCHIVE_ERROR: "REPLAY_ARCHIVE_ERROR"
+  REPLAY_ARCHIVE_ERROR: "REPLAY_ARCHIVE_ERROR",
+  MULTI_VENUE_HISTORICAL: "MULTI_VENUE_HISTORICAL"
 });
 
 export const REPLAY_FIELD_TTL_MS = Object.freeze({
@@ -145,6 +147,12 @@ function historicalPayload(type, historicalSeries, visibleAt) {
   if (type === "openInterest") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", tick: rows.slice(-200) } };
   else if (type === "eliteAccount" || type === "elitePosition") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", list: rows.slice(-30) } };
   else if (["markPrice", "premium", "basis"].includes(type)) value = { status: "ok", data: rows.slice(-2000) };
+  else if (type === "depth") {
+    const latest = rows.at(-1);
+    value = latest && Array.isArray(latest.bids) && Array.isArray(latest.asks)
+      ? { status: "ok", ts: Number(latest.ts ?? result.eventTime), tick: { bids: latest.bids, asks: latest.asks } }
+      : null;
+  }
   else if (type === "liquidations") value = { code: 200, msg: "success", data: rows.filter((row) => Number(row.created_at) >= visibleAt - 24 * 60 * 60 * 1000).slice(-50), ts: visibleAt };
   else value = null;
   if (!replayPayloadConsumable(type, value)) {
@@ -204,7 +212,8 @@ function replayField(type, historicalSeries, archive, visibleAt) {
 export function buildPointInTimeMarket(candles, funding, index, {
   maximumBars = 260,
   historicalSeries = {},
-  archive = null
+  archive = null,
+  multiVenueFunding = []
 } = {}) {
   const closed = candles[index];
   if (!closed) throw new Error(`Replay candle index out of bounds: ${index}`);
@@ -229,6 +238,18 @@ export function buildPointInTimeMarket(candles, funding, index, {
   };
   const fundingVisible = funding.filter((item) => item.timestamp <= visibleAt);
   const currentFunding = fundingVisible.at(-1) ?? null;
+  const multiVenue = pointInTimeFundingContext([
+    ...multiVenueFunding,
+    ...fundingVisible.map((item) => ({
+      exchange: "htx",
+      instrument: "BTC-USDT",
+      timestamp: item.timestamp,
+      visibleAt: item.timestamp,
+      fundingRate: item.fundingRate,
+      provenance: "HTX_PUBLIC_HISTORICAL",
+      pointInTime: true
+    }))
+  ], visibleAt);
   const replayFields = {
     depth: replayField("depth", historicalSeries, archive, visibleAt),
     openInterest: replayField("openInterest", historicalSeries, archive, visibleAt),
@@ -267,6 +288,7 @@ export function buildPointInTimeMarket(candles, funding, index, {
     premium: replayFields.premium.payload,
     basis: replayFields.basis.payload,
     contractElements: replayFields.contractElements.payload,
+    multiVenue: { funding: multiVenue },
     dataProvenance: {
       ticker: REPLAY_PROVENANCE.HTX_HISTORICAL,
       kline15m: REPLAY_PROVENANCE.HTX_HISTORICAL,
@@ -284,7 +306,10 @@ export function buildPointInTimeMarket(candles, funding, index, {
       markPrice: replayFields.markPrice.provenance,
       premium: replayFields.premium.provenance,
       basis: replayFields.basis.provenance,
-      contractElements: replayFields.contractElements.provenance
+      contractElements: replayFields.contractElements.provenance,
+      multiVenueFunding: multiVenue.venueCount
+        ? REPLAY_PROVENANCE.MULTI_VENUE_HISTORICAL
+        : REPLAY_PROVENANCE.HISTORICAL_UNAVAILABLE
     },
     replay: {
       pointInTime: true,
@@ -303,6 +328,14 @@ export function buildPointInTimeMarket(candles, funding, index, {
         error: value.error ?? value.archiveError ?? null
       }])),
       availableSources: Object.entries(replayFields).filter(([, item]) => item.payload).map(([key]) => key),
+      multiVenueFunding: {
+        available: multiVenue.venueCount > 0,
+        venueCount: multiVenue.venueCount,
+        pointInTime: true,
+        maximumObservationTimestamp: multiVenue.observations.length
+          ? Math.max(...multiVenue.observations.map((item) => Number(item.timestamp)))
+          : null
+      },
       eventTimeNotAfterVisibleAt: Object.values(replayFields)
         .filter((item) => item.payload)
         .every((item) => timestampMs(item.eventTime) !== null && timestampMs(item.eventTime) <= visibleAt),

@@ -2,6 +2,10 @@ import { CORE_MARKET_TASK_KEYS, MARKET_TASKS } from "./market-data.mjs";
 import { MARKET_CONTEXT_LAYERS } from "./feature-registry.mjs";
 
 const TASK_CONTEXT = Object.freeze({
+  spotTicker: ["HTX_PUBLIC_SPOT", "SHORT_TERM"],
+  spotKline1h: ["HTX_PUBLIC_SPOT", "MEDIUM_TERM"],
+  spotDepth: ["HTX_PUBLIC_SPOT", "EXECUTION"],
+  spotTrades: ["HTX_PUBLIC_SPOT", "EXECUTION"],
   ticker: ["HTX_PUBLIC_FUTURES", "SHORT_TERM"],
   kline15m: ["HTX_PUBLIC_FUTURES", "SHORT_TERM"],
   kline1h: ["HTX_PUBLIC_FUTURES", "SHORT_TERM"],
@@ -32,6 +36,10 @@ function timestampMs(value) {
 // 都当成时间戳，于是请求号/订单号也会被算进覆盖范围。这里改成按 schema 显式声明：
 // 只有在这些路径下的字段才可能是时间戳。
 const TIMESTAMP_SCHEMA = Object.freeze({
+  spotTicker: [["ts"], ["tick", "ts"], ["tick", "id"]],
+  spotKline1h: [["ts"], ["data", "*", "id"]],
+  spotDepth: [["ts"], ["tick", "ts"]],
+  spotTrades: [["ts"], ["data", "*", "ts"], ["data", "*", "data", "*", "ts"]],
   ticker: [["ts"], ["tick", "ts"], ["tick", "id"]],
   kline15m: [["ts"], ["data", "*", "id"]],
   kline1h: [["ts"], ["data", "*", "id"]],
@@ -189,6 +197,18 @@ export function attachMultiLayerMarketContext(db, report, market) {
   }]));
   const observations = buildDataSourceObservations(db, market, report.generatedAt);
   const activeProductionFactors = Object.values(layers).flatMap((layer) => layer.activeFactors);
+  const spotPrice = Number(market.spotTicker?.tick?.close);
+  const perpetualPrice = Number(report.currentPrice);
+  const spotReference = Number.isFinite(spotPrice) && spotPrice > 0 && Number.isFinite(perpetualPrice) && perpetualPrice > 0
+    ? {
+        spotPrice,
+        perpetualPrice,
+        perpetualPremiumPct: Number(((perpetualPrice / spotPrice - 1) * 100).toFixed(6)),
+        source: "HTX_PUBLIC_SPOT_AND_FUTURES",
+        actuallyInfluencesDecision: false,
+        status: "RESEARCH_ONLY_UNTIL_PIT_OOS_VALIDATED"
+      }
+    : null;
   return {
     report: {
       ...report,
@@ -201,6 +221,7 @@ export function attachMultiLayerMarketContext(db, report, market) {
         longTermMayTriggerIntradayTrade: false,
         layers,
         activeProductionFactors,
+        spotReference,
         researchOnlyFeatures: registry.filter((item) => item.status === "research-only").map((item) => ({
           featureKey: item.feature_key,
           name: item.display_name,

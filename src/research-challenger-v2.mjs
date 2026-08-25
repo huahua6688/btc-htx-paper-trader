@@ -1,4 +1,5 @@
 import { PAPER_CONFIG } from "./config.mjs";
+import { observationSourceFor, resolveObservationExecution } from "./execution-timing.mjs";
 import { buildMultiScaleContext } from "./indicator-profiles.mjs";
 import { hashObject, mean, quantile, round } from "./research-utils.mjs";
 
@@ -6,6 +7,26 @@ const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, v
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const PAYLOAD_INTERVALS = Object.freeze({ kline15m: 15 * 60_000, kline1h: 60 * 60_000, kline4h: 4 * 60 * 60_000, kline1d: 24 * 60 * 60_000 });
 const contextCache = new Map();
+const CONTEXT_CACHE_LIMIT = 512;
+
+/**
+ * 缓存键必须能识别「算的是哪一份行情」，而不只是「什么时刻、什么价格」。
+ *
+ * 前视审计会在同一个 visibleAt 上分别分析完整数据集和前缀数据集：两者的 now 与
+ * currentPrice 完全相同，历史却不同。只按时间和价格做键，第二次调用会拿到第一次的
+ * 上下文，做出与真实数据相反的判断，而前视审计恰恰会因此永远「通过」。
+ * 目前所有这类调用都显式传了 useCache:false，但那是每个调用点各自记得，不是结构保证。
+ *
+ * 这里用每个周期已收盘 K 线的条数与最后一根的时间/收盘价做指纹：命中缓存意味着
+ * 输入确实一致，而不是碰巧时间戳一样。
+ */
+function visibleMarketFingerprint(visibleMarket) {
+  return Object.keys(PAYLOAD_INTERVALS).map((key) => {
+    const candles = visibleMarket[key]?.data ?? [];
+    const last = candles.at(-1);
+    return `${key}:${candles.length}:${last?.id ?? ""}:${last?.close ?? ""}`;
+  }).join("|");
+}
 
 export const RESEARCH_CHALLENGER_V2_PARAMETERS = Object.freeze({
   version: "research-challenger-v2.0.0",
@@ -33,7 +54,7 @@ function rows(payload) {
     .sort((a, b) => a.timestamp - b.timestamp);
 }
 
-function closedMarketView(market) {
+export function closedMarketView(market) {
   const visibleAt = Number(market.ticker?.ts);
   const output = { ...market };
   for (const [key, interval] of Object.entries(PAYLOAD_INTERVALS)) {
@@ -123,7 +144,7 @@ function pivotLevels(candles, side, currentPrice) {
   return levels.sort((a, b) => side === "LONG" ? a - b : b - a);
 }
 
-function entryGeometry(side, context, market, parameters) {
+export function entryGeometry(side, context, market, parameters) {
   const direction = side === "LONG" ? 1 : -1;
   const currentPrice = Number(market.ticker?.tick?.close);
   const c15 = rows(market.kline15m);
@@ -184,7 +205,7 @@ function entryGeometry(side, context, market, parameters) {
   };
 }
 
-function tradableEdge(side, geometry, context, market, config, parameters, similarity = null) {
+export function tradableEdge(side, geometry, context, market, config, parameters, similarity = null) {
   const direction = side === "LONG" ? 1 : -1;
   const currentPrice = geometry.currentPrice;
   const structureSpacePct = geometry.remainingSpace / currentPrice * 100;
@@ -213,7 +234,7 @@ function tradableEdge(side, geometry, context, market, config, parameters, simil
   };
 }
 
-function coreDataQuality(market, context) {
+export function coreDataQuality(market, context) {
   const now = Number(market.ticker?.ts);
   const failures = [];
   for (const [key, interval] of Object.entries({ "15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000 })) {
@@ -247,13 +268,13 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
   if (!(now > 0) || !(currentPrice > 0)) throw new Error("V2 Challenger requires point-in-time market time and price");
   const visibleMarket = closedMarketView(market);
   const requestedProfile = options.indicatorProfile ?? parameters.indicatorProfile;
-  const cacheKey = `${now}:${currentPrice}:${requestedProfile}`;
+  const cacheKey = `${now}:${currentPrice}:${requestedProfile}:${visibleMarketFingerprint(visibleMarket)}`;
   let context = options.useCache === false ? null : contextCache.get(cacheKey);
   if (!context) {
     context = buildMultiScaleContext(visibleMarket, requestedProfile);
     if (options.useCache !== false) {
       contextCache.set(cacheKey, context);
-      if (contextCache.size > 100_000) contextCache.delete(contextCache.keys().next().value);
+      if (contextCache.size > CONTEXT_CACHE_LIMIT) contextCache.delete(contextCache.keys().next().value);
     }
   }
   const dimensions = directionDimensions(context, visibleMarket);
@@ -268,6 +289,7 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     ? (leader.side === "LONG" ? "STRONG_LONG" : "STRONG_SHORT")
     : leader.side === "LONG" ? "LEAN_LONG" : "LEAN_SHORT";
   const dataQuality = coreDataQuality(visibleMarket, context);
+  const latest15mBar = context.frames["15m"].candles.at(-1) ?? null;
   const geometry = candidateDecision === "WAIT" ? null : entryGeometry(candidateDecision, context, visibleMarket, parameters);
   const edge = geometry ? tradableEdge(candidateDecision, geometry, context, visibleMarket, config, parameters, options.similarity) : null;
   const riskDistance = geometry?.riskDistance ?? 0;
@@ -312,6 +334,13 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     strategyHash: hashObject(parameters),
     mode: "RESEARCH_CHALLENGER_V2_SHADOW_PAPER_ONLY",
     symbol: "BTC-USDT", generatedAt: new Date(now).toISOString(), currentPrice: round(currentPrice, 2),
+    latest15mBar,
+    completed15mBar: latest15mBar,
+    execution: resolveObservationExecution({
+      observationTimestamp: now,
+      fillReferencePrice: currentPrice,
+      observationSource: observationSourceFor(market)
+    }),
     decision, candidateDecision, directionState: strengthState,
     confidencePct: 0,
     scoreTerminology: "OPPORTUNITY_SCORE_NOT_PROBABILITY",

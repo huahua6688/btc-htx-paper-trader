@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 2,
+  "auditedAt": "2026-08-24T21:41:20.307Z",
+  "onDemandFollowupAt": "2026-08-25T00:00:00.000Z",
+  "officialLandingPage": "https://www.htx.com/futures/data/landing_page",
+  "officialInstitutionPage": "https://www.htx.com/en-us/institutions",
+  "downloadBase": "https://futures.htx.com/data/historical_data/",
+  "authentication": "none",
+  "writeOperations": false,
+  "settlementRestUsedAsDownloadCenter": false,
+  "coverageProbe": {
+    "serviceAdvertisedStart": "2026-02-01",
+    "klineTradesMarkIndexFunding": {
+      "2026-01-31": "HTTP_404_HISTORICAL_UNAVAILABLE",
+      "2026-02-01": "HTTP_200_ARCHIVE_AND_CHECKSUM_FILE_AVAILABLE",
+      "availabilityObservedThrough": "2026-08-23"
+    },
+    "futuresL2Depth150AndSpotL2Depth400": {
+      "2026-05-27": "HTTP_404_HISTORICAL_UNAVAILABLE",
+      "2026-05-28": "HTTP_200_FIRST_ARCHIVE_AND_CHECKSUM_FILE_AVAILABLE",
+      "availabilityObservedThrough": "2026-08-23"
+    }
+  },
+  "verifiedInstruments": {
+    "futures": "BTC-USDT-PERP",
+    "spot": "BTC-USDT"
+  },
+  "archiveCheckDate": "2026-08-23",
+  "archives": {
+    "futuresKline15m": {
+      "bytes": 3306,
+      "sha256": "c6837eb3f826cf457c30f5393b8c8f21f8fab9f4d5d05dae79f3402b31c88d2d",
+      "records": 96,
+      "mode": "INGESTED_PIT"
+    },
+    "futuresTrades": {
+      "bytes": 635202,
+      "officialChecksum": "5e9e2aad06730e0c76a7e4c1c3c2cce2194b5b3ffbf53e8e548f6c8883d51f0a",
+      "localSha256": "5e9e2aad06730e0c76a7e4c1c3c2cce2194b5b3ffbf53e8e548f6c8883d51f0a",
+      "contentChecksumVerified": true,
+      "records": 68947,
+      "mode": "INGESTED_PIT_ON_DEMAND"
+    },
+    "futuresDepthL2_150": {
+      "bytes": 91568808,
+      "officialChecksum": "4f9900b9fc134531c43712e864640bf34a4db4a0a0898181fc09000c067eccca",
+      "localSha256": "4f9900b9fc134531c43712e864640bf34a4db4a0a0898181fc09000c067eccca",
+      "contentChecksumVerified": true,
+      "records": 96,
+      "transformation": "RECONSTRUCT_SNAPSHOT_PLUS_UPDATES_THEN_SAMPLE_FINAL_STATE_PER_15M_UTC_BUCKET",
+      "mode": "INGESTED_PIT_ON_DEMAND"
+    },
+    "futuresMarkPrice15m": {
+      "bytes": 1789,
+      "sha256": "9a7cfd9241c55f6e42270aaf0ef2127cc166ea8e7612622faf4a1871f2fb907a",
+      "records": 96,
+      "mode": "INGESTED_PIT"
+    },
+    "futuresIndexPrice15m": {
+      "bytes": 2563,
+      "sha256": "332eacdf7f83b31f9e9acd7b3e1e33fdacdde55fa8a106edc0e87623fc5d36d9",
+      "records": 96,
+      "mode": "INGESTED_PIT"
+    },
+    "futuresFunding": {
+      "bytes": 314,
+      "sha256": "8497b4bda7800e7a96f77ce863e877e81721b47a98f0439576c2c940f0c1f2a5",
+      "records": 3,
+      "mode": "INGESTED_PIT"
+    },
+    "spotKline15m": {
+      "bytes": 3876,
+      "sha256": "9e0adc1d43426a8ee42e0792abb2bc2cbb5b86961dfd972da07955b73dc9fd97",
+      "records": 96,
+      "mode": "INGESTED_PIT"
+    },
+    "spotTrades": {
+      "bytes": 180014,
+      "officialChecksumAdvertised": "1367d9880aeeaa8543d64a3d953cabb0c3458433ab3e1386cac7d67972a48b66",
+      "contentChecksumVerified": false,
+      "mode": "CATALOGED_ON_DEMAND"
+    },
+    "spotDepthL2_400": {
+      "bytes": 102474965,
+      "officialChecksumAdvertised": "4fa17ff885c26ff3a17d42aa1a302d6263fcee7311bfa7aea1a3f0fdb741e0e6",
+      "contentChecksumVerified": false,
+      "mode": "CATALOGED_ON_DEMAND"
+    }
+  },
+  "pointInTimePolicy": {
+    "klineMarkIndex": "eventTime is candle open; visibleAt is eventTime plus interval",
+    "funding": "eventTime and visibleAt use official fundingTime",
+    "trades": "each trade uses its exchange timestamp for eventTime and visibleAt",
+    "depth": "reconstruct official JSONL snapshot/update events in order, then store the final visible full book per 15m UTC bucket using the last exchange timestamp in that bucket",
+    "futureBackfillUsed": false
+  },
+  "catalogManifestHash": "c6ddcac6ebc31d230d8e9f39445c28a9e4e1017fdabe404ba488521271da11b6",
+  "status": "VERIFIED_COMPLETE_FOR_PROBED_DATE"
+}

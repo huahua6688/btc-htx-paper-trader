@@ -1,6 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { assertAllowedCommand, publicCommandRules, scrubEnvironment } from "../src/htx-cli.mjs";
 
 test("permits a public BTC futures kline", () => {
@@ -9,6 +20,13 @@ test("permits a public BTC futures kline", () => {
     period: "60min",
     size: 200
   }), true);
+});
+
+test("permits only the public btcusdt spot market surface", () => {
+  assert.equal(assertAllowedCommand("spot-market", "kline", { symbol: "btcusdt", period: "60min", size: 200 }), true);
+  assert.equal(assertAllowedCommand("spot-market", "depth", { symbol: "btcusdt", type: "step0", depth: 20 }), true);
+  assert.throws(() => assertAllowedCommand("spot-market", "kline", { symbol: "ethusdt", period: "60min", size: 200 }), /only permits btcusdt/);
+  assert.throws(() => assertAllowedCommand("spot-market", "depth", { symbol: "btcusdt", type: "step0", depth: 150 }), /Blocked spot depth/);
 });
 
 test("blocks every trading skill", () => {
@@ -55,6 +73,37 @@ test("V1.2 runtime has no fixed setup engine and exposes only public HTX skill f
     "futures-market",
     "liquidation-stream",
     "mark-price",
-    "oi-tracker"
+    "oi-tracker",
+    "spot-market"
   ]);
+});
+
+test("check-safety fails closed when a private capability is changed from INTERFACE_ONLY", () => {
+  const directory = mkdtempSync(join(tmpdir(), "btc-safety-fixture-"));
+  try {
+    for (const name of ["scripts", "src", "test", "deploy"]) mkdirSync(join(directory, name));
+    copyFileSync(new URL("../scripts/check-safety.mjs", import.meta.url), join(directory, "scripts/check-safety.mjs"));
+    copyFileSync(new URL("../src/analysis-engine.mjs", import.meta.url), join(directory, "src/analysis-engine.mjs"));
+    writeFileSync(join(directory, "src/htx-skill-capabilities.mjs"), [
+      "export const rows = [",
+      '  { skill: "spot-account", status: "ACTUALLY_INVOKED"',
+      "  },",
+      '  { skill: "spot-trading", status: "INTERFACE_ONLY"',
+      "  },",
+      '  { skill: "futures-account", status: "INTERFACE_ONLY"',
+      "  },",
+      '  { skill: "futures-trading", status: "INTERFACE_ONLY"',
+      "  }",
+      "];",
+      "export const report = { exchangeWriteEnabled: false };"
+    ].join("\n"));
+    for (const name of ["README.md", "ARCHITECTURE_REVIEW.md", ".env.example", "package.json"]) {
+      writeFileSync(join(directory, name), name === "package.json" ? "{}\n" : "");
+    }
+    assert.throws(() => execFileSync(process.execPath, [join(directory, "scripts/check-safety.mjs")], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+    }), (error) => error.status === 1 && String(error.stderr).includes("every private skill must remain interface-only"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

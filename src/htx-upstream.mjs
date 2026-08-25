@@ -278,6 +278,10 @@ function validateCompatibilityPayload(key, payload) {
   const array = (value) => Array.isArray(value);
   const finite = (value) => Number.isFinite(Number(value));
   const checks = {
+    spotTicker: () => payload?.status === "ok" && finite(payload?.tick?.close) && finite(payload?.ts ?? payload?.tick?.ts),
+    spotKline1h: () => array(payload?.data) && payload.data.length > 0 && ["id", "open", "high", "low", "close"].every((field) => payload.data[0]?.[field] !== undefined),
+    spotDepth: () => array(payload?.tick?.bids) && array(payload?.tick?.asks) && finite(payload?.tick?.ts ?? payload?.ts),
+    spotTrades: () => payload?.status === "ok" && array(payload?.data),
     ticker: () => payload?.status === "ok" && finite(payload?.tick?.close) && finite(payload?.ts ?? payload?.tick?.ts),
     kline15m: () => array(payload?.data) && payload.data.length > 0 && ["id", "open", "high", "low", "close"].every((field) => payload.data[0]?.[field] !== undefined),
     kline1h: () => checks.kline15m(), kline4h: () => checks.kline15m(), kline1d: () => checks.kline15m(),
@@ -329,7 +333,6 @@ export function buildHtxCapabilityReport(compatibility = null) {
   return {
     currentSupported: current,
     upstreamPublicNotAdopted: [
-      "spot-market public family",
       "futures-market bbo/trade/history-trade/index/contract-info/risk-info/timestamp/heartbeat",
       "funding-rate batch/estimated-kline",
       "settlement public family"

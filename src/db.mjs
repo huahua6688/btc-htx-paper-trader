@@ -143,6 +143,16 @@ export class PaperDatabase {
       );
       CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON snapshots(captured_at);
 
+      CREATE TABLE IF NOT EXISTS strategy_signal_claims (
+        signal_key TEXT PRIMARY KEY,
+        strategy_version TEXT NOT NULL,
+        signal_bar_ts INTEGER NOT NULL,
+        first_snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+        claimed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS strategy_signal_claims_bar_idx
+        ON strategy_signal_claims(strategy_version, signal_bar_ts);
+
       CREATE TABLE IF NOT EXISTS positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         position_group_id INTEGER,
@@ -1078,8 +1088,12 @@ export class PaperDatabase {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       report.generatedAt, report.symbol, report.currentPrice, report.decision, report.candidateDecision,
-      report.signalQualityScore ?? report.confidencePct, report.finalScore, report.derivatives?.fundingRatePct,
-      report.derivatives?.oiUsd, report.derivatives?.pressureScore, json(report.riskGates), json(report)
+      report.signalQualityScore ?? report.confidencePct ?? null,
+      report.finalScore ?? null,
+      report.derivatives?.fundingRatePct ?? null,
+      report.derivatives?.oiUsd ?? null,
+      report.derivatives?.pressureScore ?? null,
+      json(report.riskGates), json(report)
     );
     return Number(result.lastInsertRowid);
   }
@@ -1108,6 +1122,30 @@ export class PaperDatabase {
       ? this.db.prepare("SELECT * FROM snapshots WHERE captured_at >= ? ORDER BY id").all(since)
       : this.db.prepare("SELECT * FROM snapshots ORDER BY id").all();
     return rows.map((row) => ({ ...row, riskGates: parseJson(row.risk_gates_json, []), report: parseJson(row.report_json, {}) }));
+  }
+
+  /**
+   * Atomically claims one completed strategy signal bar.  The primary key is
+   * durable across monitor restarts, preventing the same 4h signal from being
+   * re-submitted by every 5-minute Shadow cycle.
+   */
+  claimStrategySignal({ signalKey, strategyVersion, signalBarTimestamp, snapshotId, claimedAt }) {
+    if (!signalKey || !strategyVersion || !Number.isFinite(Number(signalBarTimestamp)) || !Number.isInteger(Number(snapshotId))) {
+      throw new Error("Invalid strategy signal claim");
+    }
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        INSERT INTO strategy_signal_claims(signal_key, strategy_version, signal_bar_ts, first_snapshot_id, claimed_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(signal_key) DO NOTHING
+      `).run(signalKey, strategyVersion, Number(signalBarTimestamp), Number(snapshotId), claimedAt);
+      const claim = this.db.prepare("SELECT * FROM strategy_signal_claims WHERE signal_key = ?").get(signalKey);
+      return { claimed: Number(result.changes) === 1, claim };
+    });
+  }
+
+  getStrategySignalClaim(signalKey) {
+    return this.db.prepare("SELECT * FROM strategy_signal_claims WHERE signal_key = ?").get(signalKey) ?? null;
   }
 
   createSetup(proposal, snapshotId) {

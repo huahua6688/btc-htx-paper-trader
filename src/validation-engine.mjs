@@ -6,6 +6,8 @@ import { runHistoricalReplay } from "./replay-engine.mjs";
 import { buildHistoricalFeatureMatrix, SIMILARITY_HORIZONS } from "./similarity-engine.mjs";
 import { BAR_MS, hashObject, mean, round } from "./research-utils.mjs";
 import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
+import { analyzeMultiVenueChallenger } from "./multi-venue-challenger.mjs";
+import { analyzeBreakoutChallenger } from "./breakout-challenger.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PURGE_BARS = SIMILARITY_HORIZONS["7d"];
@@ -29,24 +31,35 @@ export function runLookaheadAudit(dataset, {
   parameters = CHALLENGER_BASE_PARAMETERS,
   samples = 24
 } = {}) {
-  const first = firstReplayableIndex(dataset.candles);
+  const researchProfile = strategies.some((strategy) => ["research-v2", "multi-venue-v3", "breakout-v4"].includes(strategy));
+  const first = firstReplayableIndex(dataset.candles, researchProfile ? 70 : 60);
   const last = dataset.candles.length - SIMILARITY_HORIZONS["7d"] - 1;
   if (first < 0 || last <= first) throw new Error("Dataset is too short for look-ahead audit");
   const step = Math.max(1, Math.floor((last - first) / samples));
   const checks = [];
   for (let index = first; index <= last && checks.length < samples; index += step) {
-    const fullMarket = buildPointInTimeMarket(dataset.candles, dataset.funding, index, { historicalSeries: dataset.series ?? {} });
+    const fullMarket = buildPointInTimeMarket(dataset.candles, dataset.funding, index, {
+      historicalSeries: dataset.series ?? {},
+      multiVenueFunding: dataset.multiVenueFunding ?? []
+    });
     const prefixCandles = dataset.candles.slice(0, index + 1);
     const prefixFunding = dataset.funding.filter((item) => item.timestamp <= fullMarket.replay.visibleAt);
     const prefixSeries = Object.fromEntries(Object.entries(dataset.series ?? {}).map(([key, rows]) => [key,
       rows.filter((row) => Number(row.eventTime) <= fullMarket.replay.visibleAt)
     ]));
-    const prefixMarket = buildPointInTimeMarket(prefixCandles, prefixFunding, prefixCandles.length - 1, { historicalSeries: prefixSeries });
+    const prefixMarket = buildPointInTimeMarket(prefixCandles, prefixFunding, prefixCandles.length - 1, {
+      historicalSeries: prefixSeries,
+      multiVenueFunding: (dataset.multiVenueFunding ?? []).filter((row) => Number(row.visibleAt ?? row.timestamp) <= fullMarket.replay.visibleAt)
+    });
     for (const strategy of strategies) {
       const analyze = strategy === "champion"
         ? (market) => analyzeSnapshot(market)
         : strategy === "research-v2"
           ? (market) => analyzeResearchChallengerV2(market, parameters, undefined, { useCache: false })
+          : strategy === "multi-venue-v3"
+            ? (market) => analyzeMultiVenueChallenger(market, parameters)
+          : strategy === "breakout-v4"
+            ? (market) => analyzeBreakoutChallenger(market, parameters)
           : (market) => analyzeChallenger(market, parameters, undefined, { useCache: false });
       const full = analyze(fullMarket);
       const prefix = analyze(prefixMarket);
@@ -122,7 +135,12 @@ export async function runValidationEngine(dataset, {
   walkForwardWindows = 4,
   outputDirectory,
   baselineStrategy = "challenger",
-  candidateStrategy = "challenger"
+  candidateStrategy = "challenger",
+  // 留空即沿用 runHistoricalReplay 的默认资金视角，既有调用者行为不变。
+  // 一旦调用方指定了资金视角，OOS 必须与开发段用同一套口径，
+  // 否则「开发段用参考资金、OOS 用生产资金」会做出无法比较的结论。
+  capitalProfile,
+  referenceCapitalCny
 } = {}) {
   const windows = buildWalkForwardWindows(dataset, walkForwardWindows);
   const matrix = buildHistoricalFeatureMatrix(dataset);
@@ -135,6 +153,8 @@ export async function runValidationEngine(dataset, {
       from: window.testStart,
       to: window.testEnd,
       collectTrace: false,
+      capitalProfile,
+      referenceCapitalCny,
       outputDirectory: outputDirectory ? `${outputDirectory}/window-${window.index}/baseline` : undefined
     });
     const candidate = await runHistoricalReplay(dataset, {
@@ -143,6 +163,8 @@ export async function runValidationEngine(dataset, {
       from: window.testStart,
       to: window.testEnd,
       collectTrace: false,
+      capitalProfile,
+      referenceCapitalCny,
       outputDirectory: outputDirectory ? `${outputDirectory}/window-${window.index}/candidate` : undefined
     });
     results.push({
@@ -158,9 +180,15 @@ export async function runValidationEngine(dataset, {
       }
     });
   }
-  const missingMarket = buildPointInTimeMarket(dataset.candles, [], Math.max(firstReplayableIndex(dataset.candles), dataset.candles.length - 1000));
+  const missingMarket = buildPointInTimeMarket(dataset.candles, [], Math.max(firstReplayableIndex(dataset.candles), dataset.candles.length - 1000), {
+    multiVenueFunding: []
+  });
   const missingReport = candidateStrategy === "research-v2"
     ? analyzeResearchChallengerV2(missingMarket, candidateParameters)
+    : candidateStrategy === "multi-venue-v3"
+      ? analyzeMultiVenueChallenger(missingMarket, candidateParameters)
+    : candidateStrategy === "breakout-v4"
+      ? analyzeBreakoutChallenger(missingMarket, candidateParameters)
     : analyzeChallenger(missingMarket, candidateParameters);
   const missingDataPolicy = {
     passed: missingReport.derivatives.fundingRatePct === null,

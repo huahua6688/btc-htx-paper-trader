@@ -29,6 +29,7 @@ import {
   trainTradableEdgeModel
 } from "../src/tradable-edge.mjs";
 import { updateCollectingHoldout } from "../src/holdout-manager.mjs";
+import { analyzeResearchChallengerV2 } from "../src/research-challenger-v2.mjs";
 
 const BAR_MS = 15 * 60 * 1000;
 
@@ -71,6 +72,14 @@ function syntheticDataset(days = 120) {
 }
 
 function response(payload) { return { ok: true, json: async () => payload }; }
+
+test("Research V2 live-style reports expose the completed 15m bar required by the Paper freshness gate", () => {
+  const dataset = syntheticDataset(75);
+  const market = buildPointInTimeMarket(dataset.candles, dataset.funding, dataset.candles.length - 1);
+  const report = analyzeResearchChallengerV2(market, undefined, undefined, { useCache: false });
+  assert.ok(report.latest15mBar?.timestamp);
+  assert.equal(report.completed15mBar?.timestamp, report.latest15mBar.timestamp);
+});
 
 test("historical Dataset Manager downloads fixed public ranges, audits gaps, caches, and verifies hashes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "btc-history-"));

@@ -2,7 +2,7 @@
 
 基于 HTX 公开行情的 BTC/USDT 本地合约模拟交易系统。程序启动后立即分析一次，之后每 5 分钟重新读取行情，独立比较 `LONG / SHORT / WAIT`，动态选择入场方式，并持续管理已有模拟净仓位。
 
-本项目没有真实交易能力：不读取 HTX API Key、不调用私有接口、不包含交易所下单模块。所有模拟仓位、手续费、Funding 和绩效只写入本地 SQLite。
+本项目没有真实交易能力：不读取 HTX API Key、不调用私有接口；未来账户/下单端口目前只有默认报错的禁用接口，没有可用交易适配器。所有模拟仓位、手续费、Funding 和绩效只写入本地 SQLite。
 
 ## V1.2 的核心变化
 
@@ -112,7 +112,7 @@ margin / notional / totalRisk 同样直接进入 `buildPaperCandidate`。
 **一条顶层 run**（成功 PASSED/PARTIAL，失败 BLOCKED/FAILED），子阶段作为 `summary.stages`
 evidence 放进这条 run，管线不再自行重复登记。覆盖 `backtest / replay / validate / similarity /
 robustness / counterfactual / external:audit / optimize / diagnose / ablation / edge:pipeline /
-tradable-edge / anti-chase / full / research:v2 / data:update`；
+tradable-edge / anti-chase / full / research:v2 / research:v3 / data:update / multi-venue:update`；
 `data:inspect / research:runs / research:register-candidate` 是纯查询/登记命令，明确豁免。
 
 **登记簿位置**：默认与生产 Paper 库同级的持久化目录（例如
@@ -136,7 +136,19 @@ Research Results 全部从研究登记簿**只读**读取，因此 CLI 一旦成
 ```bash
 npm run research:runs                 # 查看真实的持久化运行数与策略版本数
 npm run research:v2                   # 之前无法从 CLI 触发的 V2 管线
+npm run research:v3                   # 多交易所独立双向评分、消融、OOS 与压力测试
 npm run research:register-candidate   # 登记 V1.3-DATA-TIERED 候选（不等于晋级）
+```
+
+V3 的数据语义、HTX 全技能覆盖边界、独立双向评分与 runner 持仓契约见
+[RESEARCH_V3_MULTI_VENUE.md](./RESEARCH_V3_MULTI_VENUE.md)。
+真实目录上的 V2/V3/V4 同口径结果、压力测试与“不晋级”决定见
+[SIMULATION_RESULTS_2026_08_24.md](./SIMULATION_RESULTS_2026_08_24.md)。
+
+```bash
+# 4h 低频突破候选（Paper/研究专用）
+npm run replay -- --strategy=breakout-v4 --capital=reference --reference-capital=20000
+npm run robustness -- --strategy=breakout-v4 --capital=reference --reference-capital=20000 --iterations=1000
 ```
 
 ### 其它修复
@@ -194,14 +206,25 @@ Feature Registry 记录每项特征的数据源、时间层、当前权重、适
 
 研究模块现在是可运行实现，不是验证字段或 README 占位。冻结的 V1.2 Champion 源码哈希保持为 `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`。研究运行不会修改 Champion，也不会改变实时 Risk Gate。
 
-Historical Catalog V2 从 HTX 固定公开端点下载 BTC-USDT 永续 Kline、Funding，以及官方端点在请求时仍能提供的 OI、精英账户/仓位比、Mark Price、Premium、Basis 和最近清算。Kline 与 Funding 可分页；其余端点只有有限的最新窗口，Depth 只有实时快照。`manifest.json` 对每类数据记录来源、抓取时间、事件时间、实际端点覆盖、缺口、重复、原始 payload SHA-256、schema 和 provenance。超出官方真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md)。
+Historical Catalog V2 同时区分两类官方来源：REST 的 Kline/Funding 分页与有限最新窗口；以及独立的 HTX Historical Data Download Center。Download Center 已实测 BTC-USDT 现货和 `BTC-USDT-PERP` 永续的 Kline、逐笔成交、期货 150 档/现货 400 档深度、Mark/Index Kline 和 Funding。普通类型从 `2026-02-01` 起有真实档案，Depth 首个实测日期为 `2026-05-28`。小档案必须实际下载并让本地 SHA-256 与官方 `.CHECKSUM` 一致后，才转成带 `eventTime/visibleAt` 的 PIT 记录。大体量 trades/depth 默认只登记官方声明的 checksum、ETag 和大小，此时 `contentChecksumVerified=false`，不能称内容已校验。只有显式按需命令才下载、落盘并校验；depth 还必须额外确认大文件开关。Settlement REST 仍是有限保留窗口，绝不冒充 Download Center。超出真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md) 与 [HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json](./HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json)。
+
+HTX Skills Hub 的 17 个包只声明为“已审计”，不再声称 17/17 实际调用。`src/htx-skill-capabilities.mjs` 逐项标记 `AUDITED_ONLY / ACTUALLY_INVOKED / LOCAL_EQUIVALENT / RESEARCH_ONLY / INTERFACE_ONLY` 并给出代码证据。公开 `spot-market` 的 ticker、1h Kline、depth 和历史成交已进入每轮采集；现货/永续 premium 只作为研究展示，未改变 Champion。Private Account/Trading 仍为禁用接口，CLI 子进程不接收交易所凭据。
 
 实时 monitor 每轮把已成功取得的 HTX 原始响应和 normalized 研究字段 best-effort 写入独立 `market-archive.sqlite`。归档失败只产生警告，不影响 Paper 仓位管理；原始 payload 不会因 parser 升级被重写，normalized 字段可从原始数据重新生成。Replay V2 只读取 `eventTime <= visibleAt`，Archive 还必须满足 `observedAt <= visibleAt`，并逐字段标记 `HTX_HISTORICAL / SELF_ARCHIVED / HISTORICAL_UNAVAILABLE / STALE / REPLAY_ARCHIVE_ERROR`。
 
 ```bash
 # 必须显式给出连续区间；不会自动挑选收益最好看的时期
 npm run data:update -- --from=2024-09-01T00:00:00.000Z --to=2026-07-31T23:45:00.000Z
+npm run data:download-center -- --from=2026-08-23 --to=2026-08-23
+# trades：显式下载并校验；加 --parse=true 才转为 PIT 研究数据
+npm run data:download-center:fetch -- --type=futuresTrades --date=2026-08-23 --parse=true
+# depth：大文件必须再显式允许；默认目录扫描绝不会自动下载
+npm run data:download-center:fetch -- --type=futuresDepth --date=2026-08-23 --allow-large-depth=true --parse=true
 npm run data:inspect
+
+# V4 参数选择和前视审计只使用固定 development cutoff，不读取未成熟 holdout
+npm run research:v4-select
+npm run research:v4-lookahead
 
 # 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
 npm run htx:status
@@ -282,6 +305,12 @@ Edge pipeline 会先把新的 Final OOS 写入 `data/research/holdout-registry.j
 SHADOW_PAPER_ENABLED=true
 SHADOW_DB_PATH=/var/lib/btc-htx-paper/shadow-challenger.sqlite
 ```
+
+当 active Shadow 是 Breakout V4 时，monitor 会在每个 4h 收盘边界增加一次墙钟唤醒；5/15/60/240 分钟的常规轮询设置仍保留，但不会再让较长周期静默跳过固定 5 分钟 signal-age 窗口。相同 4h signal bar 由持久化 signal key 幂等去重。
+
+这次额外唤醒只运行 Shadow，不运行 V1.2 生产周期：启用一个研究 Shadow 不会改变冻结 Champion 的评估节奏。生产仍然严格按管理员选定的间隔执行。
+
+所有策略的入场 K 线格统一由 `src/execution-timing.mjs` 按「执行观察时刻所在的 15 分钟格」解析。研究策略使用已收盘视图，其 `latest15mBar` 比入场那一格更早，因此不能直接当作 `entry_bar_ts`，否则 `paper-engine` 的回溯保护会放行入场之前的价格走势去触发 SL/TP。
 
 Shadow 不会自动晋级。少于 30 个自然日或 100 个实际信号时，Promotion Gate 必须保持阻塞。ML 目前没有进入 Challenger：只有在简单统计/相似行情 baseline 之上通过严格 OOS 增量检验后，才允许研究 ML 候选。
 

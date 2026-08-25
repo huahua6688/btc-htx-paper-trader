@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "runType": "BREAKOUT_V4_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+  "generatedAt": "2026-08-24T21:40:31.782Z",
+  "program": "src/breakout-v4-selection.mjs",
+  "command": "npm run research:v4-select",
+  "datasetManifestHash": "06a47fa5044db51cc519f421f15494fab9d2640bc56206f48344d939d167ab03",
+  "specHash": "5d17d78b5107835cfcd29cf3e082a85de3501fd250a1597a2ce1c1c61c6b7584",
+  "candidateGridHash": "070e2e2b8dc76dfe27f4b50088186e95127f5f573348b6e1d01017922ceeba18",
+  "selectionHash": "916c4dfbe1d76ca0793682bae5c8be2492a27ee2850b2486b85f0119a7eaf917",
+  "developmentRange": {
+    "from": "2024-09-01T00:00:00.000Z",
+    "to": "2026-01-17T06:30:00.000Z"
+  },
+  "isolation": {
+    "holdoutOpened": false,
+    "postCutoffOutcomeFieldsRead": false,
+    "maximumCandleOpenRead": "2026-01-17T06:15:00.000Z",
+    "maximumCandleVisibleAtRead": "2026-01-17T06:30:00.000Z"
+  },
+  "search": {
+    "candidateCount": 128,
+    "eligibleCandidateCount": 128,
+    "space": {
+      "breakoutLookback4h": [20, 40, 60, 80],
+      "stopAtrMultiple": [1.5, 2, 2.5, 3],
+      "targetRiskMultiple": [2, 3, 4, 5],
+      "trendFilter": ["EMA50_DIRECTION_SLOPE", "EMA50_PRICE_ALIGNMENT"]
+    },
+    "metricScale": "UNIT_NOTIONAL_UNLEVERED_PRICE_RETURN_NOT_PAPER_ACCOUNT_PNL",
+    "rankingPolicy": [
+      "eligible candidates before ineligible candidates",
+      "more positive chronological development segments",
+      "higher worst-segment net return",
+      "higher full-development profit factor",
+      "higher full-development net return",
+      "lexicographically smaller parameter hash as deterministic tie-break"
+    ]
+  },
+  "winner": {
+    "parameters": {
+      "breakoutLookback4h": 40,
+      "trendEma4h": 50,
+      "trendSlopeBars4h": 6,
+      "trendFilter": "EMA50_DIRECTION_SLOPE",
+      "atrPeriod4h": 14,
+      "stopAtrMultiple": 2.5,
+      "targetRiskMultiple": 4,
+      "positionManagementProfile": "HARD_BRACKET_HOLD_V1",
+      "researchOnly": true
+    },
+    "parameterHash": "e9d7949efe6de1780d608f477303ff4435eab41e4af7e9d259e178e7950a0921",
+    "selectionMetric": {
+      "tradeCount": 18,
+      "positiveSegments": 4,
+      "worstSegmentNetReturnPct": 6.29460447,
+      "profitFactor": 2.04671322,
+      "netReturnPct": 48.46118475
+    },
+    "matchesCommittedBreakoutV4": true
+  },
+  "confirmationPolicy": "Selection metrics are fixed unit-notional proxy metrics, not Paper-account performance. The winner is rerun separately through the exact Paper replay core.",
+  "postSelectionRole": "RESEARCH_SHADOW_CANDIDATE",
+  "championChanged": false
+}

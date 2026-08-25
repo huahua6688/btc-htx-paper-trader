@@ -29,10 +29,28 @@ import {
   withResearchRegistry
 } from "./research-registry.mjs";
 import { runResearchV2Pipeline } from "./research-v2-pipeline.mjs";
-import { runValidationEngine } from "./validation-engine.mjs";
+import { runResearchV3Pipeline } from "./research-v3-pipeline.mjs";
+import { runLookaheadAudit, runValidationEngine } from "./validation-engine.mjs";
 import { runTradableEdgePipeline } from "./tradable-edge-pipeline.mjs";
 import { ANTI_CHASE_PARAMETERS } from "./anti-chase-challenger.mjs";
 import { buildTradeAttribution } from "./attribution-engine.mjs";
+import {
+  defaultMultiVenueCatalogDirectory,
+  loadMultiVenueFundingDataset,
+  updateMultiVenueFundingDataset
+} from "./multi-venue-catalog.mjs";
+import { MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
+import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
+import {
+  defaultHtxDownloadCenterDirectory,
+  fetchHtxDownloadCenterOnDemand,
+  HTX_DOWNLOAD_CENTER_TYPES,
+  updateHtxDownloadCenterCatalog
+} from "./htx-download-center.mjs";
+import {
+  BREAKOUT_V4_DEVELOPMENT_SPEC,
+  runBreakoutV4DevelopmentSelection
+} from "./breakout-v4-selection.mjs";
 
 export const PREDECLARED_RESEARCH_RANGE = Object.freeze({
   from: "2024-09-01T00:00:00.000Z",
@@ -170,7 +188,103 @@ async function dataUpdate(args, defaults = null) {
   return result;
 }
 
+async function downloadCenterUpdate(args) {
+  const selected = range(args);
+  const dataTypes = args.types
+    ? String(args.types).split(",").map((item) => item.trim()).filter(Boolean)
+    : HTX_DOWNLOAD_CENTER_TYPES;
+  const result = await updateHtxDownloadCenterCatalog({
+    ...selected,
+    directory: args.catalog ?? defaultHtxDownloadCenterDirectory(),
+    dataTypes,
+    onProgress: (item) => process.stderr.write(`Download Center ${item.type} ${item.date}\n`)
+  });
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, manifest: result.manifest }, null, 2)}\n`);
+  return result;
+}
+
+function booleanOption(value) {
+  if (value === true) return true;
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
+}
+
+async function downloadCenterFetch(args) {
+  const type = args.type === true ? null : args.type;
+  const date = args.date === true ? null : args.date;
+  if (!type || !date) throw new Error("On-demand fetch requires --type=<trades/depth type> and --date=YYYY-MM-DD");
+  const result = await fetchHtxDownloadCenterOnDemand({
+    type: String(type),
+    date: String(date),
+    parse: booleanOption(args.parse),
+    allowLargeDepth: booleanOption(args["allow-large-depth"]),
+    directory: args.catalog ?? defaultHtxDownloadCenterDirectory(),
+    onProgress: (item) => process.stderr.write(`Download Center on-demand ${item.type} ${item.date}\n`)
+  });
+  const archive = result.manifest.archives.find((item) => item.type === type && item.date === date) ?? null;
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, archive, series: result.manifest.series?.[type] ?? null, manifestHash: result.manifest.manifestHash }, null, 2)}\n`);
+  return { ...result, archive };
+}
+
+async function breakoutV4Select(args) {
+  const dataset = await load(args);
+  const report = runBreakoutV4DevelopmentSelection(dataset);
+  const directory = resolveOutputPath(runId("breakout-v4-development-selection"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "selection.json"), report);
+  process.stdout.write(`${JSON.stringify({ directory, reportPath, winner: report.winner, isolation: report.isolation, search: report.search, selectionHash: report.selectionHash }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
+async function breakoutV4Lookahead(args) {
+  const dataset = await load(args);
+  const cutoff = new Date(BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+  const barMs = 15 * 60 * 1000;
+  const development = {
+    ...dataset,
+    candles: dataset.candles.filter((item) => Number(item.timestamp) + barMs <= cutoff),
+    funding: dataset.funding.filter((item) => Number(item.timestamp) <= cutoff),
+    series: Object.fromEntries(Object.entries(dataset.series ?? {}).map(([key, rows]) => [key,
+      rows.filter((item) => Number(item.visibleAt ?? item.eventTime) <= cutoff)
+    ])),
+    multiVenueFunding: (dataset.multiVenueFunding ?? []).filter((item) => Number(item.visibleAt ?? item.timestamp) <= cutoff)
+  };
+  const report = runLookaheadAudit(development, { strategies: ["breakout-v4"], parameters: BREAKOUT_V4_PARAMETERS });
+  report.developmentOnly = true;
+  report.developmentCutoff = BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to;
+  report.holdoutOpened = false;
+  const directory = resolveOutputPath(runId("breakout-v4-lookahead"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "lookahead.json"), report);
+  process.stdout.write(`${JSON.stringify({ directory, reportPath, passed: report.passed, checksRun: report.checksRun, developmentCutoff: report.developmentCutoff, holdoutOpened: false }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
 async function load(args) { return loadHistoricalDataset(args.catalog ?? defaultCatalogDirectory()); }
+
+async function attachMultiVenue(dataset, args) {
+  if (String(args["multi-venue-catalog"] ?? "").toLowerCase() === "none") return { ...dataset, multiVenueFunding: [] };
+  const directory = args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory();
+  try {
+    const multiVenue = await loadMultiVenueFundingDataset(directory);
+    return { ...dataset, multiVenueFunding: multiVenue.funding, multiVenueManifest: multiVenue.manifest };
+  } catch (error) {
+    if (error?.code === "ENOENT" || /manifest not found|no such file/i.test(error.message)) {
+      return { ...dataset, multiVenueFunding: [], multiVenueManifest: null };
+    }
+    throw error;
+  }
+}
+
+async function multiVenueUpdate(args) {
+  const selected = range(args);
+  const result = await updateMultiVenueFundingDataset({
+    ...selected,
+    directory: args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory(),
+    onProgress: (item) => process.stderr.write(`Funding ${item.exchange}: ${item.pages} pages / ${item.rows} rows\n`)
+  });
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, fetched: result.fetched, manifest: result.manifest }, null, 2)}\n`);
+  return result;
+}
 
 /**
  * 解析研究资金视角。默认 PRODUCTION_FAITHFUL（真实 Paper 资金规模）。
@@ -224,6 +338,21 @@ async function researchV2(args) {
   return { dataset, result, directory };
 }
 
+async function researchV3(args) {
+  let dataset = await load(args);
+  dataset = await attachMultiVenue(dataset, args);
+  const directory = resolveOutputPath(runId("research-v3"));
+  const result = await runResearchV3Pipeline(dataset, {
+    outputDirectory: directory,
+    robustnessIterations: Number(args.iterations ?? 1_000),
+    // research:v3 必须接受与 replay/robustness 相同的资金视角，
+    // 否则文档里的复现命令跑出来的数字和管线内部的不是同一套。
+    ...capitalOptions(args)
+  });
+  process.stdout.write(`${JSON.stringify({ directory, report: result.report }, null, 2)}\n`);
+  return { dataset, result, directory };
+}
+
 /**
  * 解析 --strategy / --baseline-strategy / --candidate-strategy。
  * 只接受 replay-engine 已登记的策略 id，未知值直接报错而不是悄悄回退到 challenger。
@@ -242,6 +371,8 @@ function defaultParametersFor(strategy) {
   if (strategy === "data-tiered") return DATA_TIERED_PARAMETERS;
   if (strategy === "historical-compatible") return HISTORICAL_COMPATIBLE_PARAMETERS;
   if (strategy === "anti-chase") return ANTI_CHASE_PARAMETERS;
+  if (strategy === "multi-venue-v3") return MULTI_VENUE_CHALLENGER_PARAMETERS;
+  if (strategy === "breakout-v4") return BREAKOUT_V4_PARAMETERS;
   return CHALLENGER_BASE_PARAMETERS;
 }
 
@@ -254,7 +385,8 @@ async function replay(args) {
   // 先校验参数再加载数据集：未知策略是用法/逻辑错误（FAILED），
   // 不能因为数据集恰好也不存在而被误判成外部前置条件缺失（BLOCKED）。
   const strategy = strategyOption(args, "strategy", "challenger");
-  const dataset = await load(args);
+  let dataset = await load(args);
+  if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId(`replay-${strategy}`));
   await mkdir(directory, { recursive: true });
@@ -274,7 +406,8 @@ async function replay(args) {
 async function validation(args) {
   const baselineStrategy = strategyOption(args, "baseline-strategy", "challenger");
   const candidateStrategy = strategyOption(args, "candidate-strategy", "challenger");
-  const dataset = await load(args);
+  let dataset = await load(args);
+  if ([baselineStrategy, candidateStrategy].includes("multi-venue-v3")) dataset = await attachMultiVenue(dataset, args);
   const directory = resolveOutputPath(runId("validation"));
   const report = await runValidationEngine(dataset, {
     outputDirectory: directory,
@@ -303,11 +436,19 @@ async function similarity(args) {
 }
 
 async function robustness(args) {
-  const dataset = await load(args);
+  const strategy = strategyOption(args, "strategy", "challenger");
+  let dataset = await load(args);
+  if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
   const selected = range(args, dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId("robustness"));
-  const replay = await runHistoricalReplay(dataset, { strategy: "challenger", parameters: CHALLENGER_BASE_PARAMETERS, ...selected, outputDirectory: join(directory, "base") });
-  const report = await runMonteCarloRobustness(dataset, replay, { parameters: CHALLENGER_BASE_PARAMETERS, ...selected, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios") });
+  const parameters = defaultParametersFor(strategy);
+  const capital = capitalOptions(args);
+  const replay = await runHistoricalReplay(dataset, {
+    strategy, parameters, ...selected, ...capital, outputDirectory: join(directory, "base")
+  });
+  const report = await runMonteCarloRobustness(dataset, replay, {
+    strategy, parameters, ...selected, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios")
+  });
   const path = await save(join(directory, "robustness-report.json"), report);
   process.stdout.write(`${JSON.stringify({ path, report }, null, 2)}\n`);
   return { dataset, replay, report, directory };
@@ -609,9 +750,103 @@ export function researchV2RunRecord(result) {
   };
 }
 
+export function robustnessRunRecord(result) {
+  return {
+    status: result?.report?.status === "ok" ? "PASSED" : "PARTIAL",
+    artifactPath: result?.directory ?? null,
+    dataManifestHash: dataManifestHashOf(result),
+    summary: {
+      status: result?.report?.status ?? null,
+      reason: result?.report?.reason ?? null,
+      delayedExecutionEvidence: result?.report?.delayedExecutionEvidence ?? null,
+      stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
+    }
+  };
+}
+
 const dataManifestHashOf = (result) => result?.dataset?.manifest?.manifestHash ?? null;
 
 const COMMANDS = {
+  "research:v4-lookahead": {
+    handler: (args) => breakoutV4Lookahead(args),
+    runType: "BREAKOUT_V4_DEVELOPMENT_ONLY_LOOKAHEAD_AUDIT",
+    record: (result) => ({
+      status: result?.report?.passed ? "PASSED" : "FAILED",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      strategyVersion: BREAKOUT_V4_PARAMETERS.version,
+      summary: {
+        passed: result?.report?.passed ?? false,
+        checksRun: result?.report?.checksRun ?? 0,
+        developmentCutoff: result?.report?.developmentCutoff ?? null,
+        holdoutOpened: false
+      }
+    })
+  },
+  "research:v4-select": {
+    handler: (args) => breakoutV4Select(args),
+    runType: "BREAKOUT_V4_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+    record: (result) => ({
+      status: result?.report?.winner?.matchesCommittedBreakoutV4 ? "PASSED" : "PARTIAL",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.report?.datasetManifestHash ?? null,
+      strategyVersion: result?.report?.winner?.parameters?.version ?? null,
+      summary: {
+        candidateCount: result?.report?.search?.candidateCount ?? null,
+        winner: result?.report?.winner ?? null,
+        isolation: result?.report?.isolation ?? null,
+        championChanged: false
+      }
+    })
+  },
+  "data:download-center": {
+    handler: (args) => downloadCenterUpdate(args),
+    runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_CATALOG_UPDATE",
+    record: (result) => ({
+      status: result?.manifest?.status === "COMPLETE" ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: {
+        directory: result?.directory ?? null,
+        requestedCoverage: result?.manifest?.requestedCoverage ?? null,
+        errors: result?.manifest?.errors ?? [],
+        settlementRestUsedAsDownloadCenter: false
+      }
+    })
+  },
+  "data:download-center:fetch": {
+    handler: (args) => downloadCenterFetch(args),
+    runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_ON_DEMAND_FETCH",
+    record: (result) => ({
+      status: result?.archive?.contentChecksumVerified && !result?.archive?.parseError ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: {
+        directory: result?.directory ?? null,
+        type: result?.archive?.type ?? null,
+        date: result?.archive?.date ?? null,
+        availability: result?.archive?.availability ?? null,
+        contentChecksumVerified: result?.archive?.contentChecksumVerified ?? false,
+        parsedRecords: result?.archive?.records ?? 0,
+        parseError: result?.archive?.parseError ?? null,
+        settlementRestUsedAsDownloadCenter: false
+      }
+    })
+  },
+  "multi-venue:update": {
+    handler: (args) => multiVenueUpdate(args),
+    runType: "MULTI_VENUE_FUNDING_CATALOG_UPDATE",
+    record: (result) => ({
+      status: result?.manifest?.status === "COMPLETE" ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: { fetched: result?.fetched ?? 0, directory: result?.directory ?? null, errors: result?.manifest?.errors ?? {} }
+    })
+  },
+  "multi-venue:inspect": {
+    exempt: true,
+    handler: async (args) => {
+      const dataset = await loadMultiVenueFundingDataset(args["multi-venue-catalog"] ?? defaultMultiVenueCatalogDirectory());
+      process.stdout.write(`${JSON.stringify({ directory: dataset.directory, manifest: dataset.manifest }, null, 2)}\n`);
+    }
+  },
   "data:update": {
     handler: (args) => dataUpdate(args),
     runType: "DATA_CATALOG_UPDATE",
@@ -713,14 +948,7 @@ const COMMANDS = {
   robustness: {
     handler: (args) => robustness(args),
     runType: "MONTE_CARLO_ROBUSTNESS",
-    record: (result) => ({
-      artifactPath: result?.directory ?? null,
-      dataManifestHash: dataManifestHashOf(result),
-      summary: {
-        status: result?.report?.status ?? null,
-        stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
-      }
-    })
+    record: (result) => robustnessRunRecord(result)
   },
   counterfactual: {
     handler: (args) => counterfactual(args),
@@ -809,6 +1037,22 @@ const COMMANDS = {
     handler: (args) => researchV2(args),
     runType: "RESEARCH_V2_PIPELINE",
     record: (result) => researchV2RunRecord(result)
+  },
+  "research:v3": {
+    handler: (args) => researchV3(args),
+    runType: "RESEARCH_V3_MULTI_VENUE_PIPELINE",
+    record: (result) => ({
+      status: result?.result?.report?.promotion?.allowed ? "PASSED" : "PARTIAL",
+      artifactPath: join(result?.directory ?? ".", "research-v3-pipeline.json"),
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      strategyVersion: result?.result?.report?.strategyVersion ?? null,
+      summary: {
+        promotion: result?.result?.report?.promotion ?? null,
+        candidate: result?.result?.report?.candidate ?? null,
+        crossVenueAblation: result?.result?.report?.crossVenueAblation ?? null,
+        touchedFinalOos: false
+      }
+    })
   },
   full: {
     handler: (args) => full(args),

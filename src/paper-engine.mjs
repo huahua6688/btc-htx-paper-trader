@@ -222,7 +222,7 @@ export function buildPaperCandidateResult(
       stopLoss: report.plan?.stopLoss ?? null
     });
   }
-  const signalEntry = Number(report.currentPrice);
+  const signalEntry = Number(report.execution?.fillReferencePrice ?? report.currentPrice);
   const stopLoss = Number(report.plan.stopLoss);
   const stopIsValid = side === "LONG" ? stopLoss < signalEntry : stopLoss > signalEntry;
   if (!stopIsValid) return reject("STOP_ON_WRONG_SIDE", { side, signalEntry, stopLoss });
@@ -502,8 +502,10 @@ export function buildPaperCandidateResult(
   const candidate = {
     symbol: report.symbol,
     side,
-    openedAt: report.generatedAt,
-    entryBarTs: Number(report.latest15mBar?.timestamp ?? new Date(report.generatedAt).getTime()),
+    openedAt: Number.isFinite(Number(report.execution?.executionTimestamp))
+      ? new Date(Number(report.execution.executionTimestamp)).toISOString()
+      : report.generatedAt,
+    entryBarTs: Number(report.execution?.entryBarTimestamp ?? report.latest15mBar?.timestamp ?? new Date(report.generatedAt).getTime()),
     signalEntryPrice: round(signalEntry, 2),
     entry: round(perBtc.entryFill, 2),
     stopLoss: round(stopLoss, 2),

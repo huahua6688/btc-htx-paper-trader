@@ -23,7 +23,19 @@ const files = (await readdir(sourceRoot)).filter((name) => name.endsWith(".mjs")
 const violations = [];
 for (const file of files) {
   const text = await readFile(new URL(file, sourceRoot), "utf8");
-  for (const pattern of forbidden) if (pattern.test(text)) violations.push(`${file}: ${pattern}`);
+  // The audited capability matrix must name the official private skill families
+  // so it can prove they are INTERFACE_ONLY.  The executable source whitelist
+  // remains strict everywhere else.
+  let executableText = text;
+  if (file === "htx-skill-capabilities.mjs") {
+    executableText = text.replace(/skill:\s*"(?:spot-account|spot-trading|futures-account|futures-trading)"/gi, "skill: \"AUDITED_PRIVATE_SKILL\"");
+    const privateRows = text.match(/\{\s*skill:\s*"(?:spot-account|spot-trading|futures-account|futures-trading)"[\s\S]*?\n\s{2}\}/gi) ?? [];
+    if (privateRows.length !== 4 || privateRows.some((row) => !/status:\s*"INTERFACE_ONLY"/.test(row))
+      || !/exchangeWriteEnabled:\s*false/.test(text)) {
+      violations.push(`${file}: every private skill must remain interface-only with exchange writes disabled`);
+    }
+  }
+  for (const pattern of forbidden) if (pattern.test(executableText)) violations.push(`${file}: ${pattern}`);
   if (file !== "htx-cli.mjs" && exchangeCredentialPattern.test(text)) violations.push(`${file}: exchange credential variable is forbidden`);
 }
 
