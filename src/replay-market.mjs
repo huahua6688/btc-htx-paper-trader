@@ -147,6 +147,12 @@ function historicalPayload(type, historicalSeries, visibleAt) {
   if (type === "openInterest") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", tick: rows.slice(-200) } };
   else if (type === "eliteAccount" || type === "elitePosition") value = { status: "ok", data: { symbol: "BTC", contract_code: "BTC-USDT", list: rows.slice(-30) } };
   else if (["markPrice", "premium", "basis"].includes(type)) value = { status: "ok", data: rows.slice(-2000) };
+  else if (type === "depth") {
+    const latest = rows.at(-1);
+    value = latest && Array.isArray(latest.bids) && Array.isArray(latest.asks)
+      ? { status: "ok", ts: Number(latest.ts ?? result.eventTime), tick: { bids: latest.bids, asks: latest.asks } }
+      : null;
+  }
   else if (type === "liquidations") value = { code: 200, msg: "success", data: rows.filter((row) => Number(row.created_at) >= visibleAt - 24 * 60 * 60 * 1000).slice(-50), ts: visibleAt };
   else value = null;
   if (!replayPayloadConsumable(type, value)) {

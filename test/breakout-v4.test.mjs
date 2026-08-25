@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzeBreakoutChallenger } from "../src/breakout-challenger.mjs";
+import {
+  analyzeBreakoutChallenger,
+  BREAKOUT_V4_ENTRY_TIMING_CONTRACT
+} from "../src/breakout-challenger.mjs";
 import { PaperDatabase } from "../src/db.mjs";
 import { manageOpenPosition } from "../src/position-manager.mjs";
 import { buildPointInTimeMarket } from "../src/replay-market.mjs";
@@ -32,12 +35,14 @@ function frame({ interval, now, count, side }) {
 function breakoutMarket(side, { offsetMs = 0 } = {}) {
   const boundary = Date.UTC(2026, 0, 2, 0, 0, 0);
   const now = boundary + offsetMs;
+  const latestClosed15m = Math.floor(now / (15 * 60_000)) * 15 * 60_000;
+  const h15 = frame({ interval: 15 * 60_000, now: latestClosed15m, count: 100, side });
   const h4 = frame({ interval: FOUR_HOURS_MS, now: boundary, count: 70, side });
   const h1 = frame({ interval: HOUR_MS, now: boundary, count: 100, side });
   const currentPrice = h4.at(-1).close;
   return {
     ticker: { ts: now, tick: { close: currentPrice } },
-    kline15m: { data: [] },
+    kline15m: { data: h15 },
     kline1h: { data: h1 },
     kline4h: { data: h4 },
     kline1d: { data: [] },
@@ -65,6 +70,37 @@ test("Breakout V4 binds LONG and SHORT signals to the latest completed 4h signal
     assert.equal(liveStyle.breakout.isExactWallClockBoundary, false);
     assert.equal(liveStyle.entryAssessment.signalKey, long.entryAssessment.signalKey);
     assert.equal(liveStyle.entryAssessment.signalBarTimestamp, long.entryAssessment.signalBarTimestamp);
+    assert.equal(liveStyle.entryAssessment.executionTimestamp, Date.UTC(2026, 0, 2) + offsetMs);
+    assert.equal(liveStyle.execution.fillReferencePrice, liveStyle.currentPrice);
+    assert.equal(liveStyle.execution.signalAgeMs, offsetMs);
+  }
+
+  const stale = analyzeBreakoutChallenger(breakoutMarket("LONG", {
+    offsetMs: BREAKOUT_V4_ENTRY_TIMING_CONTRACT.maximumSignalAgeMs + 1
+  }));
+  assert.equal(stale.decision, "WAIT");
+  assert.equal(stale.breakout.staleBreakout, true);
+  assert.equal(stale.breakout.signalFresh, false);
+  assert.equal(stale.entryAssessment.signalKey, null);
+  assert.match(stale.entryAssessment.missingConditions.join(" "), /超过 5 分钟/);
+});
+
+test("Shadow service recovery never opens an hours-old completed 4h breakout", async () => {
+  const market = breakoutMarket("LONG", { offsetMs: 2 * HOUR_MS });
+  const db = new PaperDatabase(":memory:");
+  try {
+    const result = await runMonitorCycle(db, {
+      collect: async () => market,
+      analyze: (value) => analyzeBreakoutChallenger(value),
+      now: () => new Date(market.ticker.ts).toISOString()
+    });
+    assert.equal(result.report.decision, "WAIT");
+    assert.equal(result.report.breakout.staleBreakout, true);
+    assert.equal(result.report.breakout.signalAgeMs, 2 * HOUR_MS);
+    assert.equal(db.getOpenPosition(), null);
+    assert.equal(result.actions.some((item) => item.type === "OPEN"), false);
+  } finally {
+    db.close();
   }
 });
 
@@ -109,6 +145,26 @@ test("real Replay orchestration and live Shadow monitor keep decision parity aft
   });
   const replayDecision = replay.trace.find((item) => item.eventTimestamp === boundaryCandle.timestamp);
   assert.ok(replayDecision?.signalKey, "synthetic 4h boundary must produce a real Replay signal");
+  assert.equal(replay.trades.length, 1, "synthetic replay must execute one V4 entry");
+
+  const exactShadowMarket = buildPointInTimeMarket(candles, [], boundaryIndex, { historicalSeries: {} });
+  const exactDb = new PaperDatabase(":memory:");
+  try {
+    const exactShadow = await runMonitorCycle(exactDb, {
+      collect: async () => exactShadowMarket,
+      analyze: (market) => analyzeBreakoutChallenger(market),
+      now: () => new Date(exactShadowMarket.ticker.ts).toISOString()
+    });
+    const exactPosition = exactDb.getOpenPosition();
+    assert.ok(exactPosition, `exact-boundary Shadow must execute the signal: ${JSON.stringify(exactShadow.actions)}`);
+    assert.equal(exactPosition.opened_at, replay.trades[0].opened_at);
+    assert.equal(exactPosition.entry_bar_ts, replay.trades[0].entry_bar_ts);
+    assert.equal(exactPosition.signal_entry_price, replay.trades[0].signal_entry_price);
+    assert.equal(exactShadow.report.execution.executionTimestamp, new Date(replay.trades[0].opened_at).getTime());
+    assert.equal(exactShadow.report.execution.fillReferencePrice, replay.trades[0].signal_entry_price);
+  } finally {
+    exactDb.close();
+  }
 
   const shadowMarket = buildPointInTimeMarket(candles, [], boundaryIndex, { historicalSeries: {} });
   shadowMarket.ticker.ts += 3 * 60_000;
@@ -124,6 +180,11 @@ test("real Replay orchestration and live Shadow monitor keep decision parity aft
       { decision: replayDecision.decision, signalKey: replayDecision.signalKey, signalBarTimestamp: replayDecision.signalBarTimestamp }
     );
     assert.equal(shadow.report.breakout.isExactWallClockBoundary, false);
+    const delayedPosition = db.getOpenPosition();
+    assert.ok(delayedPosition);
+    assert.equal(delayedPosition.opened_at, new Date(shadowMarket.ticker.ts).toISOString());
+    assert.equal(delayedPosition.signal_entry_price, shadow.report.execution.fillReferencePrice);
+    assert.equal(shadow.report.execution.signalAgeMs, 3 * 60_000);
   } finally {
     db.close();
   }

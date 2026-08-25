@@ -206,7 +206,7 @@ Feature Registry 记录每项特征的数据源、时间层、当前权重、适
 
 研究模块现在是可运行实现，不是验证字段或 README 占位。冻结的 V1.2 Champion 源码哈希保持为 `9B7D3C533B9C1D971E3695348D22F1D3F2FEACB8F22519D619A4A63AA7990FA6`。研究运行不会修改 Champion，也不会改变实时 Risk Gate。
 
-Historical Catalog V2 同时区分两类官方来源：REST 的 Kline/Funding 分页与有限最新窗口；以及独立的 HTX Historical Data Download Center。Download Center 已实测 BTC-USDT 现货和 `BTC-USDT-PERP` 永续的 Kline、逐笔成交、期货 150 档/现货 400 档深度、Mark/Index Kline 和 Funding。普通类型从 `2026-02-01` 起有真实档案，Depth 首个实测日期为 `2026-05-28`。小档案必须通过官方 `.CHECKSUM` 后才转成带 `eventTime/visibleAt` 的 PIT 记录；大体量 trades/depth 默认只登记 checksum、ETag 和大小，按需下载。Settlement REST 仍是有限保留窗口，绝不冒充 Download Center。超出真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md) 与 [HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json](./HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json)。
+Historical Catalog V2 同时区分两类官方来源：REST 的 Kline/Funding 分页与有限最新窗口；以及独立的 HTX Historical Data Download Center。Download Center 已实测 BTC-USDT 现货和 `BTC-USDT-PERP` 永续的 Kline、逐笔成交、期货 150 档/现货 400 档深度、Mark/Index Kline 和 Funding。普通类型从 `2026-02-01` 起有真实档案，Depth 首个实测日期为 `2026-05-28`。小档案必须实际下载并让本地 SHA-256 与官方 `.CHECKSUM` 一致后，才转成带 `eventTime/visibleAt` 的 PIT 记录。大体量 trades/depth 默认只登记官方声明的 checksum、ETag 和大小，此时 `contentChecksumVerified=false`，不能称内容已校验。只有显式按需命令才下载、落盘并校验；depth 还必须额外确认大文件开关。Settlement REST 仍是有限保留窗口，绝不冒充 Download Center。超出真实覆盖的字段保持 `HISTORICAL_UNAVAILABLE`，不会用当前值倒填过去。完整能力矩阵和实测覆盖见 [HTX_INTEGRATION_V2.md](./HTX_INTEGRATION_V2.md) 与 [HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json](./HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json)。
 
 HTX Skills Hub 的 17 个包只声明为“已审计”，不再声称 17/17 实际调用。`src/htx-skill-capabilities.mjs` 逐项标记 `AUDITED_ONLY / ACTUALLY_INVOKED / LOCAL_EQUIVALENT / RESEARCH_ONLY / INTERFACE_ONLY` 并给出代码证据。公开 `spot-market` 的 ticker、1h Kline、depth 和历史成交已进入每轮采集；现货/永续 premium 只作为研究展示，未改变 Champion。Private Account/Trading 仍为禁用接口，CLI 子进程不接收交易所凭据。
 
@@ -216,6 +216,10 @@ HTX Skills Hub 的 17 个包只声明为“已审计”，不再声称 17/17 实
 # 必须显式给出连续区间；不会自动挑选收益最好看的时期
 npm run data:update -- --from=2024-09-01T00:00:00.000Z --to=2026-07-31T23:45:00.000Z
 npm run data:download-center -- --from=2026-08-23 --to=2026-08-23
+# trades：显式下载并校验；加 --parse=true 才转为 PIT 研究数据
+npm run data:download-center:fetch -- --type=futuresTrades --date=2026-08-23 --parse=true
+# depth：大文件必须再显式允许；默认目录扫描绝不会自动下载
+npm run data:download-center:fetch -- --type=futuresDepth --date=2026-08-23 --allow-large-depth=true --parse=true
 npm run data:inspect
 
 # V4 参数选择和前视审计只使用固定 development cutoff，不读取未成熟 holdout

@@ -11,9 +11,9 @@
   `2026-05-27` 至 `2026-07-31`，因此能力声明为 `PAGED_BOUNDED_RETENTION`，不能声称任意历史可下载。
 - 另行审计了官方 2026 Historical Data Download Center；它不是 Settlement REST。BTC-USDT 现货与 `BTC-USDT-PERP`
   永续 Kline/trades/mark/index/funding 从 `2026-02-01` 起有真实档案，期货 150 档和现货 400 档 depth
-  首个实测档案为 `2026-05-28`。`2026-08-23` 单日 9 类档案校验全部成功，清单哈希为
+  首个实测档案为 `2026-05-28`。`2026-08-23` 单日 9 类路径和 `.CHECKSUM` 文件均可发现；初始清单哈希为
   `c6ddcac6ebc31d230d8e9f39445c28a9e4e1017fdabe404ba488521271da11b6`。
-- 小型 Download Center 档案通过官方 `.CHECKSUM` 后转成 PIT 记录；逐笔与 depth 默认只登记 checksum、ETag、大小并按需下载。
+- 小型 Download Center 档案实际下载并匹配官方 `.CHECKSUM` 后转成 PIT 记录；逐笔与 depth 默认只登记官方声明的 checksum、ETag、大小，不能称内容已校验。后续真实按需运行已下载并验证 635,202 字节 futures trades（68,947 条 PIT）及 91,568,808 字节 futures depth；depth 从真实 JSONL snapshot/update 重建后得到 96 个15分钟 PIT 快照。Spot trades/depth 尚未按需下载，继续保持 catalog-only。
   回放区间中仍未实际载入的盘口、OI、精英多空比和清算保持缺失，未用现值或 Kline 伪造。
 - 外部 Funding：Binance 2,097 条；当前执行网络下 Bybit/OKX 返回站点不可用，目录状态为 `PARTIAL`。
   V3 的跨场所消融因此实际比较 HTX + Binance；失败场所没有伪造记录。
@@ -39,6 +39,8 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
 - 决策不再要求 ticker 时间戳精确满足 `now % 4h == 0`，而是绑定最近一根已经完整关闭的 4h signal bar。
 - signal key 由策略哈希、品种、周期和 4h bar 开盘时间组成。Shadow SQLite 用主键原子 claim，同一 signal bar 跨 5 分钟轮询和进程重启都只处理一次；Replay 使用同一 key 做事件级去重。
 - `4h close +37 秒`、`+3 分钟` 均与 Replay 整点得到相同方向、signal key 和 signal bar；第二次 Shadow cycle 返回 `DUPLICATE_SIGNAL_BAR`，不重复开仓。
+- Shadow 与 Replay 共享 `BREAKOUT_V4_FIRST_OBSERVATION_V1` 入场时序：记录实际 execution timestamp，以该观察时点可见价格作为 fill reference；Replay 的观察点是下一根15分钟开盘。Signal 最长只允许 5 分钟，服务恢复时更老的4小时突破直接 WAIT，禁止补开旧仓。
+- 新测试不仅比较方向，还比较实际 Paper 仓位的 `opened_at`、`entry_bar_ts`、`signal_entry_price` 与 Replay 成交引用；延迟3分钟的 Shadow 记录真实延迟时间，不回填成整点成交。
 - 修复后全区间精确 Paper 结果仍为 28 笔、+5.1867%、PF 1.1532，说明只修 live 可达性/幂等，没有借机改变研究成绩。
 
 ## V4 development-only 参数选择记录

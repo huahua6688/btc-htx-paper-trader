@@ -32,7 +32,7 @@ The table records observed endpoint behavior, not capability inferred from a com
 | Premium | Latest bounded Kline window | No arbitrary range; max 2,000 rows | At 60m: `2026-06-02 07:00` through `2026-08-24 14:00 UTC` | Download intersection only |
 | Basis | Latest bounded series | No arbitrary range; max 2,000 rows | At 60m: `2026-06-02 07:00` through `2026-08-24 14:00 UTC` | Download intersection only |
 | Liquidations | Current v3 returns the latest 50 events | No historical page cursor | Audit response covered only about 31 minutes | Download real intersection only; accumulate forward in archive |
-| Order Book / Depth | REST current snapshot plus official Download Center L2 archives | Futures 150 levels; spot 400 levels; daily archives | First verified archive `2026-05-28`, verified through `2026-08-23` | Checksum-catalog on demand; earlier dates stay `HISTORICAL_UNAVAILABLE` |
+| Order Book / Depth | REST current snapshot plus official Download Center L2 archives | Futures 150 levels; spot 400 levels; daily archives | First available archive observed `2026-05-28`, through probed `2026-08-23` | Advertised checksum/ETag/size catalog by default; explicit large-file opt-in is required to download and verify content |
 
 The legacy liquidation endpoint described as 90-day history returned an HTX error during this audit and is not represented as usable history. Endpoint windows move forward over time. The Dataset manifest records the exact `fetchedAt`, endpoint coverage, requested-range intersection and raw payload hash for every run.
 
@@ -42,12 +42,19 @@ This is a separate source from Settlement REST pagination. The official landing 
 
 | Market | Type | Instrument/path identity | Verified coverage | Catalog policy |
 |---|---|---|---|---|
-| Futures | 15m Kline, trades, mark Kline, index Kline, funding | `BTC-USDT-PERP` | `2026-02-01` through probed `2026-08-23` | Kline/mark/index/funding are checksum-verified and PIT-normalized; trades on demand |
-| Futures | L2 order book, 150 levels | `BTC-USDT-PERP` | `2026-05-28` through probed `2026-08-23` | checksum/ETag/size catalog only by default |
+| Futures | 15m Kline, trades, mark Kline, index Kline, funding | `BTC-USDT-PERP` | `2026-02-01` through probed `2026-08-23` | Kline/mark/index/funding are downloaded, checksum-verified and PIT-normalized; trades are explicit on demand |
+| Futures | L2 order book, 150 levels | `BTC-USDT-PERP` | `2026-05-28` through probed `2026-08-23` | advertised checksum/ETag/size catalog only by default; explicit download + large-file opt-in required |
 | Spot | 15m Kline, trades | `BTC-USDT` | `2026-02-01` through probed `2026-08-23` | Kline PIT-normalized; trades on demand |
-| Spot | L2 order book, 400 levels | `BTC-USDT` | `2026-05-28` through probed `2026-08-23` | checksum/ETag/size catalog only by default |
+| Spot | L2 order book, 400 levels | `BTC-USDT` | `2026-05-28` through probed `2026-08-23` | advertised checksum/ETag/size catalog only by default; explicit download + large-file opt-in required |
 
-The real `2026-08-23` integration run ingested 96 rows each for futures Kline/mark/index and spot Kline, plus 3 funding rows. It cataloged but did not download the 91,568,808-byte futures depth and 102,474,965-byte spot depth archives. Every normalized Kline uses candle open as `eventTime` and close as `visibleAt`; Funding uses the official `fundingTime`. The reproducible evidence is tracked in `HTX_DOWNLOAD_CENTER_AUDIT_2026_08_24.json`; executable routing, checksum verification and PIT parsing live in `src/htx-download-center.mjs`.
+The original `2026-08-23` catalog run ingested 96 rows each for futures Kline/mark/index and spot Kline, plus 3 funding rows. Catalog-only trades/depth entries recorded an advertised checksum but did not claim content verification. A follow-up real on-demand run downloaded and verified the 635,202-byte futures trades archive and the 91,568,808-byte futures depth archive. Trades produced 68,947 PIT rows. Depth's real format is TAR.GZ containing JSONL snapshot/update events; the parser reconstructs the order book and emitted 96 final-visible 15m PIT snapshots. Spot trades/depth remain catalog-only until explicitly fetched. Every normalized Kline uses candle open as `eventTime` and close as `visibleAt`; Funding uses the official `fundingTime`.
+
+```bash
+npm run data:download-center:fetch -- --type=futuresTrades --date=2026-08-23 --parse=true
+npm run data:download-center:fetch -- --type=futuresDepth --date=2026-08-23 --allow-large-depth=true --parse=true
+```
+
+The first command downloads and verifies a trade archive. The second is deliberately guarded because a daily depth archive can exceed 100 MB. Omitting `--parse=true` stores only the verified raw archive; parsing is opt-in and produces PIT series that `loadHistoricalDataset` can expose to research/Replay.
 
 Dates before the verified start or an official 404 remain `HISTORICAL_UNAVAILABLE`. The implementation never derives order book, trades, index or mark history from OHLCV.
 

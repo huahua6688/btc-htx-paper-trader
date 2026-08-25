@@ -5,8 +5,23 @@ import { hashObject, round } from "./research-utils.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const FOUR_HOURS_MS = 4 * HOUR_MS;
+const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+
+// Execution safety is deliberately outside BREAKOUT_V4_PARAMETERS so the
+// frozen research parameter hash and selection record do not change.  Shadow
+// and Replay both use the first observation at/after the completed 4h close,
+// reference the price visible at that observation, and reject delayed recovery
+// signals instead of pretending they were filled hours earlier.
+export const BREAKOUT_V4_ENTRY_TIMING_CONTRACT = Object.freeze({
+  version: "BREAKOUT_V4_FIRST_OBSERVATION_V1",
+  signalClock: "COMPLETED_4H_CANDLE_CLOSE",
+  executionClock: "FIRST_ELIGIBLE_OBSERVATION_AT_OR_AFTER_SIGNAL_CLOSE",
+  fillReference: "PRICE_VISIBLE_AT_EXECUTION_OBSERVATION",
+  replayObservation: "NEXT_15M_OPEN",
+  maximumSignalAgeMs: 5 * 60 * 1000
+});
 
 export const BREAKOUT_V4_PARAMETERS = Object.freeze({
   version: "breakout-challenger-v4.0.0",
@@ -21,6 +36,34 @@ export const BREAKOUT_V4_PARAMETERS = Object.freeze({
   positionManagementProfile: "HARD_BRACKET_HOLD_V1",
   researchOnly: true
 });
+
+export function resolveBreakoutV4Execution({
+  signalBarClosedAt,
+  observationTimestamp,
+  fillReferencePrice,
+  observationSource
+}) {
+  const signalClosedAt = Number(signalBarClosedAt);
+  const executionTimestamp = Number(observationTimestamp);
+  const price = Number(fillReferencePrice);
+  if (![signalClosedAt, executionTimestamp, price].every(Number.isFinite) || signalClosedAt <= 0 || executionTimestamp <= 0 || price <= 0) {
+    throw new Error("Breakout V4 execution requires valid signal close, observation time and fill-reference price");
+  }
+  const signalAgeMs = executionTimestamp - signalClosedAt;
+  const signalFresh = signalAgeMs >= 0 && signalAgeMs <= BREAKOUT_V4_ENTRY_TIMING_CONTRACT.maximumSignalAgeMs;
+  return {
+    contractVersion: BREAKOUT_V4_ENTRY_TIMING_CONTRACT.version,
+    signalBarClosedAt: signalClosedAt,
+    executionTimestamp,
+    entryBarTimestamp: Math.floor(executionTimestamp / FIFTEEN_MINUTES_MS) * FIFTEEN_MINUTES_MS,
+    fillReferencePrice: price,
+    fillReferenceSource: observationSource,
+    signalAgeMs,
+    maximumSignalAgeMs: BREAKOUT_V4_ENTRY_TIMING_CONTRACT.maximumSignalAgeMs,
+    signalFresh,
+    eligible: signalFresh
+  };
+}
 
 function rows(payload) {
   return (payload?.data ?? []).map((item) => ({
@@ -54,6 +97,7 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const currentPrice = Number(market.ticker?.tick?.close);
   if (!(now > 0) || !(currentPrice > 0)) throw new Error("Breakout V4 requires point-in-time market time and price");
   const visibleMarket = closedMarketView(market);
+  const h15 = rows(visibleMarket.kline15m);
   const h4 = rows(visibleMarket.kline4h);
   const h1 = rows(visibleMarket.kline1h);
   const minimum = Math.max(parameters.breakoutLookback4h + 1, parameters.trendEma4h + parameters.trendSlopeBars4h + 1, parameters.atrPeriod4h + 2);
@@ -81,13 +125,21 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const signalBarAvailable = signalBarClosedAt <= now;
   const isExactWallClockBoundary = now % FOUR_HOURS_MS === 0 && signalBarClosedAt === now;
   const signalKey = `${base.strategyHash}:BTC-USDT:4h:${signalBarTimestamp}`;
+  const execution = resolveBreakoutV4Execution({
+    signalBarClosedAt,
+    observationTimestamp: now,
+    fillReferencePrice: currentPrice,
+    observationSource: market.replay?.pointInTime ? "REPLAY_OBSERVATION_PRICE" : "SHADOW_TICKER_PRICE"
+  });
   const longBreakoutDistanceAtr = atr4h > 0 ? (latest.close - priorHigh) / atr4h : 0;
   const shortBreakoutDistanceAtr = atr4h > 0 ? (priorLow - latest.close) / atr4h : 0;
   const requireSlope = parameters.trendFilter !== "EMA50_PRICE_ALIGNMENT";
   const longTrend = latest.close > trendNow && (!requireSlope || trendNow > trendPrior);
   const shortTrend = latest.close < trendNow && (!requireSlope || trendNow < trendPrior);
-  const longSignal = signalBarAvailable && latest.close > priorHigh && longTrend && longBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
-  const shortSignal = signalBarAvailable && latest.close < priorLow && shortTrend && shortBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
+  const longBreakout = signalBarAvailable && latest.close > priorHigh && longTrend && longBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
+  const shortBreakout = signalBarAvailable && latest.close < priorLow && shortTrend && shortBreakoutDistanceAtr >= parameters.minimumBreakoutAtr;
+  const longSignal = longBreakout && execution.eligible;
+  const shortSignal = shortBreakout && execution.eligible;
   const candidateDecision = longSignal ? "LONG" : shortSignal ? "SHORT" : "WAIT";
   const direction = candidateDecision === "LONG" ? 1 : candidateDecision === "SHORT" ? -1 : 0;
   const riskDistance = atr4h * parameters.stopAtrMultiple;
@@ -98,13 +150,20 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const longScore = clamp(20 + longSupport - (shortTrend ? 20 : 0), 0, 100);
   const shortScore = clamp(20 + shortSupport - (longTrend ? 20 : 0), 0, 100);
   const riskPct = direction ? config.reducedRiskPerTradePct : 0;
-  const reason = candidateDecision === "WAIT"
+  const staleBreakout = (longBreakout || shortBreakout) && !execution.signalFresh;
+  const reason = staleBreakout
+    ? "完整 4h 突破信号已超过 5 分钟执行窗口，禁止服务恢复后补开旧信号"
+    : candidateDecision === "WAIT"
     ? "最近完整 4h signal bar 尚未突破前高/前低并满足 EMA50 斜率"
     : `${parameters.breakoutLookback4h} 根4h区间突破，EMA${parameters.trendEma4h}方向一致`;
   return {
     ...base,
     decision: candidateDecision,
     candidateDecision,
+    execution,
+    entryTimingContract: BREAKOUT_V4_ENTRY_TIMING_CONTRACT,
+    latest15mBar: h15.length ? h15.at(-1) : null,
+    completed15mBar: h15.length ? h15.at(-1) : null,
     directionState: candidateDecision === "WAIT" ? "NEUTRAL" : `BREAKOUT_${candidateDecision}`,
     finalScore: round(longScore - shortScore, 2),
     plan: direction ? {
@@ -119,7 +178,13 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       methodLabel: reason, reasons: [reason], missingConditions: direction ? [] : [reason], riskPct,
       signalKey: direction ? signalKey : null,
       signalBarTimestamp,
-      signalBarClosedAt
+      signalBarClosedAt,
+      executionTimestamp: direction ? execution.executionTimestamp : null,
+      entryBarTimestamp: direction ? execution.entryBarTimestamp : null,
+      fillReferencePrice: direction ? execution.fillReferencePrice : null,
+      fillReferenceSource: direction ? execution.fillReferenceSource : null,
+      signalAgeMs: execution.signalAgeMs,
+      maximumSignalAgeMs: execution.maximumSignalAgeMs
     },
     opportunities: {
       LONG: { side: "LONG", score: round(longScore, 2), opportunityScore: round(longScore, 2), directionalScore: round(longScore, 2), timingScore: longSignal ? 85 : 20, supportingReasons: longTrend ? ["4h EMA50 向上且价格在其上"] : [], opposingReasons: shortTrend ? ["4h 趋势向下"] : [] },
@@ -149,7 +214,10 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       signalBarTimestamp,
       signalBarClosedAt,
       signalBarAvailable,
-      signalAgeMs: now - signalBarClosedAt,
+      signalAgeMs: execution.signalAgeMs,
+      maximumSignalAgeMs: execution.maximumSignalAgeMs,
+      signalFresh: execution.signalFresh,
+      staleBreakout,
       isDecisionBoundary: signalBarAvailable,
       isExactWallClockBoundary,
       lookback4h: parameters.breakoutLookback4h, priorHigh: round(priorHigh, 2), priorLow: round(priorLow, 2),

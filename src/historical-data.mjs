@@ -50,7 +50,7 @@ export const HTX_HISTORICAL_CAPABILITIES = Object.freeze({
     pagination: "daily futures L2 150 and spot L2 400 archives",
     interval: "exchange timestamped updates/snapshots",
     verifiedEarliest: "2026-05-28T00:00:00.000Z",
-    note: "Large archives are checksum-cataloged and are not downloaded into replay by default; dates before verified coverage remain HISTORICAL_UNAVAILABLE"
+    note: "Large archives catalog the advertised checksum and are not downloaded into replay by default; content is verified only by the explicit on-demand fetch, and earlier dates remain HISTORICAL_UNAVAILABLE"
   }
 });
 
@@ -531,13 +531,23 @@ export async function updateHistoricalDataset({
       }
       records = [];
       const catalogedDepth = (downloadCenter?.archives ?? []).filter((item) =>
-        ["futuresDepth", "spotDepth"].includes(item.type) && item.availability === "CATALOGED_ON_DEMAND"
+        ["futuresDepth", "spotDepth"].includes(item.type) && item.availability !== "HISTORICAL_UNAVAILABLE"
       );
+      const parsedFuturesDepth = Number(downloadCenter?.series?.futuresDepth?.records ?? 0);
       sources.depth = {
         ...sourceManifest("depth", records, { file: relativeFile, fileSha256: sha256(`${JSON.stringify(records, null, 2)}\n`) }),
-        availability: catalogedDepth.length ? "CATALOGED_ON_DEMAND_NOT_INGESTED_TO_REPLAY" : "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE",
+        availability: parsedFuturesDepth > 0 ? "PIT_INGESTED_ON_DEMAND"
+          : catalogedDepth.length ? "CATALOGED_ON_DEMAND_NOT_INGESTED_TO_REPLAY" : "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE",
         provenance: catalogedDepth.length ? "HTX_OFFICIAL_DOWNLOAD_CENTER_2026" : "HISTORICAL_UNAVAILABLE",
-        downloadCenterArchives: catalogedDepth.map((item) => ({ type: item.type, date: item.date, officialChecksum: item.officialChecksum }))
+        parsedFuturesDepthRecords: parsedFuturesDepth,
+        downloadCenterArchives: catalogedDepth.map((item) => ({
+          type: item.type,
+          date: item.date,
+          officialChecksumAdvertised: item.officialChecksumAdvertised,
+          contentChecksumVerified: item.contentChecksumVerified === true,
+          availability: item.availability,
+          records: item.records ?? 0
+        }))
       };
       series.depth = records;
       continue;
@@ -641,7 +651,7 @@ export async function updateHistoricalDataset({
     fetchErrors,
     historyLimitations: [
       "Official Download Center daily BTC-USDT perpetual/spot Kline, trades, mark/index price and funding archives were verified from 2026-02-01; futures L2 150 and spot L2 400 depth were verified from 2026-05-28. Earlier missing dates remain HISTORICAL_UNAVAILABLE.",
-      "Large trades/depth archives are checksum-cataloged on demand and are never reconstructed from candles or silently loaded into replay.",
+      "Large trades/depth archives catalog the advertised checksum by default; only an explicit on-demand download may verify content and optionally parse PIT records for replay.",
       "OI, elite ratios, premium and basis remain bounded latest-window REST endpoints without arbitrary historical pagination.",
       "Settlement REST is an HTX-retention-bounded paginated window and is explicitly not represented as the Historical Data Download Center.",
       "The legacy 90-day liquidation endpoint is offline; v3 exposes only the latest 50 observations, so deeper history must accumulate in the self archive.",
@@ -686,6 +696,10 @@ export async function loadHistoricalDataset(directory = defaultCatalogDirectory(
     series.indexPrice = downloadCenter.series.futuresIndexPrice ?? [];
     series.spotKline = downloadCenter.series.spotKline ?? [];
     series.downloadFuturesKline = downloadCenter.series.futuresKline ?? [];
+    series.futuresTrades = downloadCenter.series.futuresTrades ?? [];
+    series.spotTrades = downloadCenter.series.spotTrades ?? [];
+    series.depth = mergeTimedRecords(series.depth ?? [], downloadCenter.series.futuresDepth ?? []);
+    series.spotDepth = downloadCenter.series.spotDepth ?? [];
   }
   const downloadFunding = (downloadCenter?.series.futuresFunding ?? []).map((item) => ({
     timestamp: item.eventTime,

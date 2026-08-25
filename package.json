@@ -19,6 +19,7 @@
     "gate:report": "node src/gate-report.mjs",
     "data:update": "node src/research-cli.mjs data:update",
     "data:download-center": "node src/research-cli.mjs data:download-center",
+    "data:download-center:fetch": "node src/research-cli.mjs data:download-center:fetch",
     "data:inspect": "node src/research-cli.mjs data:inspect",
     "multi-venue:update": "node src/research-cli.mjs multi-venue:update",
     "multi-venue:inspect": "node src/research-cli.mjs multi-venue:inspect",

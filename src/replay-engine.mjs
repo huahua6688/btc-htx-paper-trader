@@ -25,7 +25,11 @@ import { analyzeAntiChaseChallenger, ANTI_CHASE_PARAMETERS } from "./anti-chase-
 import { analyzeResearchChallengerV2, RESEARCH_CHALLENGER_V2_PARAMETERS } from "./research-challenger-v2.mjs";
 import { analyzeDataTiered, DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 import { analyzeMultiVenueChallenger, MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
-import { analyzeBreakoutChallenger, BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
+import {
+  analyzeBreakoutChallenger,
+  BREAKOUT_V4_PARAMETERS,
+  resolveBreakoutV4Execution
+} from "./breakout-challenger.mjs";
 
 /**
  * 研究资金视角。两者必须分开报告，绝不能混为一谈：
@@ -120,6 +124,7 @@ function executionReport(signal, candle, delayBars) {
   const report = clone(signal);
   const oldEntry = Number(signal.currentPrice);
   const newEntry = Number(candle.open);
+  const signalGeneratedAtMs = new Date(signal.generatedAt).getTime();
   report.generatedAt = new Date(candle.timestamp).toISOString();
   report.currentPrice = newEntry;
   report.execution = {
@@ -127,8 +132,28 @@ function executionReport(signal, candle, delayBars) {
     signalPrice: oldEntry,
     fillReferencePrice: newEntry,
     delayBars,
-    delayMs: BAR_MS * delayBars
+    delayMs: Number.isFinite(signalGeneratedAtMs) ? candle.timestamp - signalGeneratedAtMs : null
   };
+  if (signal.version === BREAKOUT_V4_PARAMETERS.version) {
+    report.execution = {
+      ...report.execution,
+      ...resolveBreakoutV4Execution({
+        signalBarClosedAt: signal.entryAssessment?.signalBarClosedAt,
+        observationTimestamp: candle.timestamp,
+        fillReferencePrice: newEntry,
+        observationSource: "REPLAY_NEXT_15M_OPEN"
+      })
+    };
+    report.entryAssessment = {
+      ...report.entryAssessment,
+      executionTimestamp: report.execution.executionTimestamp,
+      entryBarTimestamp: report.execution.entryBarTimestamp,
+      fillReferencePrice: report.execution.fillReferencePrice,
+      fillReferenceSource: report.execution.fillReferenceSource,
+      signalAgeMs: report.execution.signalAgeMs,
+      maximumSignalAgeMs: report.execution.maximumSignalAgeMs
+    };
+  }
   if (report.plan && Number.isFinite(Number(report.plan.stopLoss))) {
     report.plan.entryPrice = newEntry;
     if (report.strategy?.positionManagementProfile === "HARD_BRACKET_HOLD_V1") {
@@ -187,6 +212,19 @@ function managePositions(db, report, actions, config) {
 function executePending(db, signal, candle, market, actions, config, delayBars, rejectionCounts) {
   if (!signal || !["LONG", "SHORT"].includes(signal.decision)) return null;
   const report = executionReport(signal, candle, delayBars);
+  if (signal.version === BREAKOUT_V4_PARAMETERS.version && !report.execution.signalFresh) {
+    rejectionCounts.SIGNAL_TOO_OLD = (rejectionCounts.SIGNAL_TOO_OLD ?? 0) + 1;
+    actions.push({
+      type: "DELAYED_ENTRY_REJECTED",
+      reasons: ["Breakout V4 signal exceeded its maximum execution age"],
+      reasonCodes: ["SIGNAL_TOO_OLD"],
+      signalAt: signal.generatedAt,
+      executionTimestamp: report.execution.executionTimestamp,
+      signalAgeMs: report.execution.signalAgeMs,
+      maximumSignalAgeMs: report.execution.maximumSignalAgeMs
+    });
+    return null;
+  }
   const gate = evaluatePaperEntry(db, report, config, market);
   if (!gate.allowed) {
     // 每一种拒绝都单独计数，研究报告才能把「最小合约步进不够」和
@@ -202,8 +240,8 @@ function executePending(db, signal, candle, market, actions, config, delayBars, 
     return null;
   }
   const snapshotId = db.insertSnapshot(report);
-  gate.candidate.entryBarTs = candle.timestamp - 1;
-  gate.candidate.openedAt = report.generatedAt;
+  gate.candidate.entryBarTs = Number(report.execution?.entryBarTimestamp ?? candle.timestamp - 1);
+  gate.candidate.openedAt = new Date(Number(report.execution?.executionTimestamp ?? candle.timestamp)).toISOString();
   const position = db.openPosition(gate.candidate, snapshotId, {
     settingsRevision: gate.settings.revision,
     settingsUpdatedAt: gate.settings.updatedAt

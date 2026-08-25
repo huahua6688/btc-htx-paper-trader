@@ -43,6 +43,7 @@ import { MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs"
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
 import {
   defaultHtxDownloadCenterDirectory,
+  fetchHtxDownloadCenterOnDemand,
   HTX_DOWNLOAD_CENTER_TYPES,
   updateHtxDownloadCenterCatalog
 } from "./htx-download-center.mjs";
@@ -200,6 +201,28 @@ async function downloadCenterUpdate(args) {
   });
   process.stdout.write(`${JSON.stringify({ directory: result.directory, manifest: result.manifest }, null, 2)}\n`);
   return result;
+}
+
+function booleanOption(value) {
+  if (value === true) return true;
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
+}
+
+async function downloadCenterFetch(args) {
+  const type = args.type === true ? null : args.type;
+  const date = args.date === true ? null : args.date;
+  if (!type || !date) throw new Error("On-demand fetch requires --type=<trades/depth type> and --date=YYYY-MM-DD");
+  const result = await fetchHtxDownloadCenterOnDemand({
+    type: String(type),
+    date: String(date),
+    parse: booleanOption(args.parse),
+    allowLargeDepth: booleanOption(args["allow-large-depth"]),
+    directory: args.catalog ?? defaultHtxDownloadCenterDirectory(),
+    onProgress: (item) => process.stderr.write(`Download Center on-demand ${item.type} ${item.date}\n`)
+  });
+  const archive = result.manifest.archives.find((item) => item.type === type && item.date === date) ?? null;
+  process.stdout.write(`${JSON.stringify({ directory: result.directory, archive, series: result.manifest.series?.[type] ?? null, manifestHash: result.manifest.manifestHash }, null, 2)}\n`);
+  return { ...result, archive };
 }
 
 async function breakoutV4Select(args) {
@@ -769,6 +792,24 @@ const COMMANDS = {
         directory: result?.directory ?? null,
         requestedCoverage: result?.manifest?.requestedCoverage ?? null,
         errors: result?.manifest?.errors ?? [],
+        settlementRestUsedAsDownloadCenter: false
+      }
+    })
+  },
+  "data:download-center:fetch": {
+    handler: (args) => downloadCenterFetch(args),
+    runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_ON_DEMAND_FETCH",
+    record: (result) => ({
+      status: result?.archive?.contentChecksumVerified && !result?.archive?.parseError ? "PASSED" : "PARTIAL",
+      dataManifestHash: result?.manifest?.manifestHash ?? null,
+      summary: {
+        directory: result?.directory ?? null,
+        type: result?.archive?.type ?? null,
+        date: result?.archive?.date ?? null,
+        availability: result?.archive?.availability ?? null,
+        contentChecksumVerified: result?.archive?.contentChecksumVerified ?? false,
+        parsedRecords: result?.archive?.records ?? 0,
+        parseError: result?.archive?.parseError ?? null,
         settlementRestUsedAsDownloadCenter: false
       }
     })
