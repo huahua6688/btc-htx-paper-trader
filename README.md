@@ -308,6 +308,10 @@ SHADOW_DB_PATH=/var/lib/btc-htx-paper/shadow-challenger.sqlite
 
 当 active Shadow 是 Breakout V4 时，monitor 会在每个 4h 收盘边界增加一次墙钟唤醒；5/15/60/240 分钟的常规轮询设置仍保留，但不会再让较长周期静默跳过固定 5 分钟 signal-age 窗口。相同 4h signal bar 由持久化 signal key 幂等去重。
 
+这次额外唤醒只运行 Shadow，不运行 V1.2 生产周期：启用一个研究 Shadow 不会改变冻结 Champion 的评估节奏。生产仍然严格按管理员选定的间隔执行。
+
+所有策略的入场 K 线格统一由 `src/execution-timing.mjs` 按「执行观察时刻所在的 15 分钟格」解析。研究策略使用已收盘视图，其 `latest15mBar` 比入场那一格更早，因此不能直接当作 `entry_bar_ts`，否则 `paper-engine` 的回溯保护会放行入场之前的价格走势去触发 SL/TP。
+
 Shadow 不会自动晋级。少于 30 个自然日或 100 个实际信号时，Promotion Gate 必须保持阻塞。ML 目前没有进入 Challenger：只有在简单统计/相似行情 baseline 之上通过严格 OOS 增量检验后，才允许研究 ML 候选。
 
 ## 使用的公开数据
