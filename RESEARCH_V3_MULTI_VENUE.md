@@ -41,8 +41,12 @@ npm run replay -- --strategy=multi-venue-v3 --from=2024-09-01T00:00:00.000Z --to
 npm run validate -- --baseline-strategy=research-v2 --candidate-strategy=multi-venue-v3
 
 # 5. 端到端 V3：baseline、同事件跨场所消融、OOS、成本/延迟/参数压力测试
-npm run research:v3 -- --iterations=1000
+npm run research:v3 -- --iterations=1000 --capital=reference --reference-capital=20000
 ```
 
 `research:v3` 即使 OOS 通过也不会自动晋级。跨场所消融必须有真实时点覆盖，之后还必须完成正式 Shadow Paper；
 任何一步证据不足都会以 `PARTIAL/BLOCKED` 留痕，不能伪装为完成。
+
+资金视角由 `--capital` / `--reference-capital` 统一传入，baseline、candidate、跨场所消融、Purged OOS 与
+稳健性使用同一套口径，并写入报告的 `capitalView`；不指定时全部回落到生产资金视角。
+省略这两个参数会得到与上面命令不同的数字，因为那是另一套资金口径，不是结果不稳定。

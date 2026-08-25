@@ -344,7 +344,10 @@ async function researchV3(args) {
   const directory = resolveOutputPath(runId("research-v3"));
   const result = await runResearchV3Pipeline(dataset, {
     outputDirectory: directory,
-    robustnessIterations: Number(args.iterations ?? 1_000)
+    robustnessIterations: Number(args.iterations ?? 1_000),
+    // research:v3 必须接受与 replay/robustness 相同的资金视角，
+    // 否则文档里的复现命令跑出来的数字和管线内部的不是同一套。
+    ...capitalOptions(args)
   });
   process.stdout.write(`${JSON.stringify({ directory, report: result.report }, null, 2)}\n`);
   return { dataset, result, directory };

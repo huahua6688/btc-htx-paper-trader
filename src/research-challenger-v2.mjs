@@ -1,4 +1,5 @@
 import { PAPER_CONFIG } from "./config.mjs";
+import { observationSourceFor, resolveObservationExecution } from "./execution-timing.mjs";
 import { buildMultiScaleContext } from "./indicator-profiles.mjs";
 import { hashObject, mean, quantile, round } from "./research-utils.mjs";
 
@@ -315,6 +316,11 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     symbol: "BTC-USDT", generatedAt: new Date(now).toISOString(), currentPrice: round(currentPrice, 2),
     latest15mBar,
     completed15mBar: latest15mBar,
+    execution: resolveObservationExecution({
+      observationTimestamp: now,
+      fillReferencePrice: currentPrice,
+      observationSource: observationSourceFor(market)
+    }),
     decision, candidateDecision, directionState: strengthState,
     confidencePct: 0,
     scoreTerminology: "OPPORTUNITY_SCORE_NOT_PROBABILITY",

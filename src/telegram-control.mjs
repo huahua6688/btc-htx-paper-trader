@@ -248,7 +248,8 @@ function cyclePanel(settings) {
       "⏱ Monitor 运行周期",
       `当前：每 ${settings.monitorIntervalMinutes} 分钟`,
       "修改写入 SQLite；monitor 每轮结束后重新读取，下一轮生效，无需重启。持仓风险动作仍只使用新鲜核心价格/K线。",
-      "若启用 Breakout V4 Shadow，系统会在每个完整 4h 收盘额外唤醒一次；5 分钟旧信号上限不会放宽。"
+      "若启用 Breakout V4 Shadow，系统会在每个完整 4h 收盘额外唤醒一次，且这一轮只跑 Shadow：",
+      "V1.2 生产周期仍然完全按你选的间隔执行，不会因为研究策略而改变。5 分钟旧信号上限不会放宽。"
     ].join("\n"),
     markup: { inline_keyboard: [
       [{ text: "5分钟", callback_data: "paper:set:monitorIntervalMinutes:5" }, { text: "15分钟", callback_data: "paper:set:monitorIntervalMinutes:15" }],
