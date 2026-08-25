@@ -7,6 +7,26 @@ const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, v
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const PAYLOAD_INTERVALS = Object.freeze({ kline15m: 15 * 60_000, kline1h: 60 * 60_000, kline4h: 4 * 60 * 60_000, kline1d: 24 * 60 * 60_000 });
 const contextCache = new Map();
+const CONTEXT_CACHE_LIMIT = 512;
+
+/**
+ * 缓存键必须能识别「算的是哪一份行情」，而不只是「什么时刻、什么价格」。
+ *
+ * 前视审计会在同一个 visibleAt 上分别分析完整数据集和前缀数据集：两者的 now 与
+ * currentPrice 完全相同，历史却不同。只按时间和价格做键，第二次调用会拿到第一次的
+ * 上下文，做出与真实数据相反的判断，而前视审计恰恰会因此永远「通过」。
+ * 目前所有这类调用都显式传了 useCache:false，但那是每个调用点各自记得，不是结构保证。
+ *
+ * 这里用每个周期已收盘 K 线的条数与最后一根的时间/收盘价做指纹：命中缓存意味着
+ * 输入确实一致，而不是碰巧时间戳一样。
+ */
+function visibleMarketFingerprint(visibleMarket) {
+  return Object.keys(PAYLOAD_INTERVALS).map((key) => {
+    const candles = visibleMarket[key]?.data ?? [];
+    const last = candles.at(-1);
+    return `${key}:${candles.length}:${last?.id ?? ""}:${last?.close ?? ""}`;
+  }).join("|");
+}
 
 export const RESEARCH_CHALLENGER_V2_PARAMETERS = Object.freeze({
   version: "research-challenger-v2.0.0",
@@ -248,13 +268,13 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
   if (!(now > 0) || !(currentPrice > 0)) throw new Error("V2 Challenger requires point-in-time market time and price");
   const visibleMarket = closedMarketView(market);
   const requestedProfile = options.indicatorProfile ?? parameters.indicatorProfile;
-  const cacheKey = `${now}:${currentPrice}:${requestedProfile}`;
+  const cacheKey = `${now}:${currentPrice}:${requestedProfile}:${visibleMarketFingerprint(visibleMarket)}`;
   let context = options.useCache === false ? null : contextCache.get(cacheKey);
   if (!context) {
     context = buildMultiScaleContext(visibleMarket, requestedProfile);
     if (options.useCache !== false) {
       contextCache.set(cacheKey, context);
-      if (contextCache.size > 512) contextCache.delete(contextCache.keys().next().value);
+      if (contextCache.size > CONTEXT_CACHE_LIMIT) contextCache.delete(contextCache.keys().next().value);
     }
   }
   const dimensions = directionDimensions(context, visibleMarket);
