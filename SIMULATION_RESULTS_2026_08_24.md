@@ -61,8 +61,11 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
   但已被项目过往研究触碰，不能重新包装成 untouched OOS。
 - 全区间按交易时间四等分后，净值分别为 -422.69、+2,932.49、+15.82、-1,488.29 CNY；收益并不跨状态稳定。
 - 1,000 次逐交易 bootstrap 的亏损概率为 38.7%，block bootstrap 为 38.2%；样本只有 28 笔，远低于研究门槛 100 笔。
-- development-only 前视审计 24/24 通过，`holdoutOpened=false`。150% 手续费为 +4.67%，200% 滑点为 +4.70%，2 根执行延迟为 +3.15%；
-  lookback 38/42、止损 2.375×ATR、目标 4.2R 的邻域回放仍为正，说明峰值并非单点崩塌。
+- development-only 前视审计 24/24 通过，`holdoutOpened=false`。150% 手续费为 +4.67%，200% 滑点为 +4.70%。
+  按当前 `BREAKOUT_V4_FIRST_OBSERVATION_V1` 重新运行后，`executionDelay2Bars`（15 分钟）和
+  `executionDelay3Bars`（30 分钟）均有 228 次信号被 `SIGNAL_TOO_OLD` 拒绝，结果均为 0 trades、0% 收益、PF 不可计算；
+  两个延迟场景在 5 分钟最大 signal age 下不可执行，不能解释为 robustness pass。lookback 38/42、止损 2.375×ATR、
+  目标 4.2R 的邻域回放仍为正，说明参数峰值并非单点崩塌。
 
 因此 V4 只满足“值得继续积累 Shadow 样本”，不满足“已有可靠生产 edge”。当前不登记为 Champion、不自动激活 Shadow，
 也不打开真实交易端口。
@@ -75,7 +78,7 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
 
 ## 本次合并前验证
 
-- 完整测试：254/254 通过。
+- 完整测试：257/257 通过。
 - Safety：通过；冻结 Champion SHA-256 仍为 `9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6`，未发现 exchange credential、write command 或提交的 Telegram Token。
 - V4 development-only prefix invariance：24/24 通过，`holdoutOpened=false`。
 - 官方 Download Center `2026-08-23` 单日真实目录：9/9 类型成功，无 fetch error；大体量 depth 未默认下载。
