@@ -1,5 +1,6 @@
 import { deriveMarketRegime, summarizeTimeframe } from "./analysis-engine.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
+import { observationSourceFor, resolveObservationExecution } from "./execution-timing.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
 export const CHALLENGER_BASE_PARAMETERS = Object.freeze({
@@ -161,6 +162,13 @@ export function analyzeChallenger(market, parameters = CHALLENGER_BASE_PARAMETER
     currentPrice: round(currentPrice, 2),
     latest15mBar: latestBar,
     completed15mBar: latestBar,
+    // latestBar 是最后一根已收盘 K 线，比入场那一格早。执行层必须按观察时刻
+    // 而不是按这根 K 线来确定 entry_bar_ts，否则入场前的极值会通过回溯保护。
+    execution: resolveObservationExecution({
+      observationTimestamp: now,
+      fillReferencePrice: currentPrice,
+      observationSource: observationSourceFor(market)
+    }),
     plan: decision === "WAIT" ? { entryPrice: null, stopLoss: null, takeProfit: null, riskReward: null } : {
       entryPrice: round(currentPrice, 2),
       stopLoss: round(stopLoss, 2),

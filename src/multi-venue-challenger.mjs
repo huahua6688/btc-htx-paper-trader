@@ -1,4 +1,5 @@
 import { PAPER_CONFIG } from "./config.mjs";
+import { observationSourceFor, resolveObservationExecution } from "./execution-timing.mjs";
 import { buildMultiScaleContext } from "./indicator-profiles.mjs";
 import {
   closedMarketView,
@@ -344,6 +345,11 @@ export function analyzeMultiVenueChallenger(market, parameters = MULTI_VENUE_CHA
     currentPrice: round(currentPrice, 2),
     latest15mBar,
     completed15mBar: latest15mBar,
+    execution: resolveObservationExecution({
+      observationTimestamp: now,
+      fillReferencePrice: currentPrice,
+      observationSource: observationSourceFor(market)
+    }),
     decision,
     candidateDecision,
     directionState: selected ? `${selected.opportunityScore >= 76 ? "STRONG" : "LEAN"}_${selected.side}` : "NEUTRAL",
@@ -397,7 +403,11 @@ export function analyzeMultiVenueChallenger(market, parameters = MULTI_VENUE_CHA
       entryMethod: geometry?.method ?? "NO_DIRECTION",
       positionManagementProfile: parameters.positionManagementProfile,
       managementContract: contract,
-      crossVenueProductionWeight: market.multiVenue?.funding?.venueCount >= 2 ? "RESEARCH_CANDIDATE" : 0,
+      // 恒为字符串：这一栏会落库并出现在面板上，string|number 的联合类型
+      // 会让「0」既像权重又像状态。生产权重本身在任何分支下都仍然是 0。
+      crossVenueProductionWeight: Number(market.multiVenue?.funding?.venueCount ?? 0) >= 2
+        ? "RESEARCH_CANDIDATE_ZERO_PRODUCTION_WEIGHT"
+        : "UNAVAILABLE_ZERO_PRODUCTION_WEIGHT",
       directionEntryRiskSeparated: true,
       frozenChampionModified: false
     },

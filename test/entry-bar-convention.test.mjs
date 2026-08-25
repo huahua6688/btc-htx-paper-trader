@@ -1,0 +1,124 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { analyzeSnapshot } from "../src/analysis-engine.mjs";
+import { analyzeAntiChaseChallenger } from "../src/anti-chase-challenger.mjs";
+import { analyzeBreakoutChallenger } from "../src/breakout-challenger.mjs";
+import { analyzeChallenger, analyzeHistoricalCompatible } from "../src/challenger-strategy.mjs";
+import { entryBarTimestampFor } from "../src/execution-timing.mjs";
+import { analyzeMultiVenueChallenger } from "../src/multi-venue-challenger.mjs";
+import { evaluatePaperExit } from "../src/paper-engine.mjs";
+import { analyzeResearchChallengerV2 } from "../src/research-challenger-v2.mjs";
+
+const MINUTE_MS = 60_000;
+const BAR_MS = 15 * MINUTE_MS;
+
+function candles(count, intervalMs, endExclusive) {
+  return Array.from({ length: count }, (_, index) => {
+    const base = 100 + index * 0.05;
+    return {
+      id: (endExclusive - (count - index) * intervalMs) / 1000,
+      open: base,
+      high: base + 0.4,
+      low: base - 0.4,
+      close: base + 0.1,
+      amount: 100,
+      vol: 10_000
+    };
+  });
+}
+
+// 观察时刻落在一根尚未收盘的 15 分钟 K 线中间：这正是实盘 monitor 每一轮的常态。
+function liveMarket({ minutesIntoBar = 3 } = {}) {
+  const lastClose = Date.UTC(2026, 0, 2, 0, 0, 0);
+  const now = lastClose + minutesIntoBar * MINUTE_MS;
+  const closed15m = candles(200, BAR_MS, lastClose);
+  return {
+    now,
+    lastClose,
+    market: {
+      ticker: { ts: now, tick: { close: 111 } },
+      // 最后一根是正在形成的 K 线，各研究策略会用 closedMarketView 把它裁掉。
+      kline15m: { data: [...closed15m, { id: lastClose / 1000, open: 110, high: 112, low: 109, close: 111, amount: 100, vol: 10_000 }] },
+      kline1h: { data: candles(200, 60 * MINUTE_MS, lastClose) },
+      kline4h: { data: candles(200, 4 * 60 * MINUTE_MS, lastClose) },
+      kline1d: { data: candles(200, 24 * 60 * MINUTE_MS, lastClose) },
+      fundingCurrent: { data: { funding_rate: "0", source: "TEST_POINT_IN_TIME" } },
+      fundingHistory: { data: { data: [] } }
+    }
+  };
+}
+
+// monitor.mjs 白名单里每一个可以成为 active Shadow 的策略，外加冻结 Champion。
+const ANALYZERS = Object.freeze([
+  ["champion", (market) => analyzeSnapshot(market)],
+  ["challenger", (market) => analyzeChallenger(market, undefined, undefined, { useCache: false })],
+  ["historical-compatible", (market) => analyzeHistoricalCompatible(market)],
+  ["anti-chase", (market) => analyzeAntiChaseChallenger(market)],
+  ["research-v2", (market) => analyzeResearchChallengerV2(market, undefined, undefined, { useCache: false })],
+  ["multi-venue-v3", (market) => analyzeMultiVenueChallenger(market)],
+  ["breakout-v4", (market) => analyzeBreakoutChallenger(market)]
+]);
+
+// paper-engine 用来决定 entry_bar_ts 的那一行，测试必须走同一条取值链路。
+function effectiveEntryBarTs(report) {
+  return Number(report.execution?.entryBarTimestamp ?? report.latest15mBar?.timestamp);
+}
+
+test("every live strategy resolves the same entry bar as the frozen Champion", () => {
+  for (const minutesIntoBar of [0, 3, 7, 14]) {
+    const { now, market } = liveMarket({ minutesIntoBar });
+    const expected = entryBarTimestampFor(now);
+    for (const [name, analyze] of ANALYZERS) {
+      assert.equal(
+        effectiveEntryBarTs(analyze(market)),
+        expected,
+        `${name} 在观察时刻 +${minutesIntoBar}m 解析出的入场 K 线格与 Champion 不一致`
+      );
+    }
+  }
+});
+
+test("a research strategy's closed latest15mBar never becomes the entry bar", () => {
+  const { lastClose, market } = liveMarket({ minutesIntoBar: 3 });
+  for (const [name, analyze] of ANALYZERS) {
+    if (name === "champion") continue;
+    const report = analyze(market);
+    const closedBarTs = Number(report.latest15mBar?.timestamp);
+    if (!Number.isFinite(closedBarTs)) continue;
+    // 已收盘的那一根必须严格早于入场格，否则它的 high/low 会通过回溯保护。
+    assert.ok(
+      closedBarTs < effectiveEntryBarTs(report),
+      `${name} 把已收盘 K 线当成了入场格`
+    );
+    assert.ok(closedBarTs <= lastClose, `${name} 的 latest15mBar 不该是尚未收盘的 K 线`);
+  }
+});
+
+test("price action from before the entry cannot trigger the stop or the target", () => {
+  const { now } = liveMarket({ minutesIntoBar: 3 });
+  const entryBarTs = entryBarTimestampFor(now);
+  const position = {
+    side: "LONG",
+    entry_price: 100,
+    initial_stop_loss: 95,
+    stop_loss: 95,
+    take_profit: 120,
+    entry_bar_ts: entryBarTs,
+    liquidation_price_estimate: null
+  };
+  // 入场那一格收盘后成为 latest15mBar；它的极值有一部分发生在入场之前。
+  const report = {
+    currentPrice: 101,
+    latest15mBar: { timestamp: entryBarTs, open: 99, high: 121, low: 94, close: 101 }
+  };
+  assert.equal(evaluatePaperExit(position, report, undefined, { checkStop: true, checkTarget: false }), null);
+  assert.equal(evaluatePaperExit(position, report, undefined, { checkStop: false, checkTarget: true }), null);
+
+  // 完全位于入场之后的下一根 K 线仍然必须能够正常触发。
+  const nextBar = {
+    currentPrice: 101,
+    latest15mBar: { timestamp: entryBarTs + BAR_MS, open: 101, high: 121, low: 94, close: 101 }
+  };
+  assert.equal(evaluatePaperExit(position, nextBar, undefined, { checkStop: true, checkTarget: false })?.exitReason, "SL");
+  assert.equal(evaluatePaperExit(position, nextBar, undefined, { checkStop: false, checkTarget: true })?.exitReason, "TP");
+});

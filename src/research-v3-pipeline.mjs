@@ -52,27 +52,33 @@ function resolvedRange(dataset) {
 
 export async function runResearchV3Pipeline(dataset, {
   outputDirectory,
-  robustnessIterations = 1_000
+  robustnessIterations = 1_000,
+  capitalProfile,
+  referenceCapitalCny
 } = {}) {
   if (!outputDirectory) throw new Error("Research V3 pipeline requires an output directory");
   await mkdir(outputDirectory, { recursive: true });
   const selected = resolvedRange(dataset);
+  // 同一次 V3 运行里 baseline、candidate、消融与稳健性必须共享一个资金视角，
+  // 否则「跨场所特征带来多少增量」会被两套资金口径的差异污染。
+  // developmentRange 只记录区间本身，不掺进资金参数。
+  const replayOptions = { ...selected, capitalProfile, referenceCapitalCny };
   const baseline = await runHistoricalReplay(dataset, {
     strategy: "research-v2",
     parameters: RESEARCH_CHALLENGER_V2_PARAMETERS,
-    ...selected,
+    ...replayOptions,
     outputDirectory: join(outputDirectory, "development-baseline")
   });
   const candidate = await runHistoricalReplay(dataset, {
     strategy: "multi-venue-v3",
     parameters: MULTI_VENUE_CHALLENGER_PARAMETERS,
-    ...selected,
+    ...replayOptions,
     outputDirectory: join(outputDirectory, "development-candidate")
   });
   const withoutCrossVenue = await runHistoricalReplay({ ...dataset, multiVenueFunding: [] }, {
     strategy: "multi-venue-v3",
     parameters: MULTI_VENUE_CHALLENGER_PARAMETERS,
-    ...selected,
+    ...replayOptions,
     outputDirectory: join(outputDirectory, "ablation-without-cross-venue")
   });
   const crossVenueEvents = candidate.trace.filter((item) => Number(item.multiVenueFunding?.venueCount ?? 0) >= 2).length;
@@ -111,13 +117,15 @@ export async function runResearchV3Pipeline(dataset, {
       candidateStrategy: "multi-venue-v3",
       baselineParameters: RESEARCH_CHALLENGER_V2_PARAMETERS,
       candidateParameters: MULTI_VENUE_CHALLENGER_PARAMETERS,
+      capitalProfile,
+      referenceCapitalCny,
       outputDirectory: join(outputDirectory, "purged-oos")
     });
     if (validation.passed) {
       robustness = await runMonteCarloRobustness(dataset, candidate, {
         strategy: "multi-venue-v3",
         parameters: MULTI_VENUE_CHALLENGER_PARAMETERS,
-        ...selected,
+        ...replayOptions,
         iterations: robustnessIterations,
         outputDirectory: join(outputDirectory, "robustness")
       });
@@ -139,6 +147,12 @@ export async function runResearchV3Pipeline(dataset, {
     paperOnly: true,
     frozenChampionChanged: false,
     developmentRange: { ...selected, policy: RESEARCH_V3_DEVELOPMENT_RANGE.policy },
+    // 报告必须自己写明这一轮用的是哪套资金口径，读者才能对上复现命令。
+    capitalView: {
+      capitalProfile: baseline.capital?.capitalProfile ?? null,
+      initialCapitalCny: baseline.capital?.initialCapitalCny ?? null,
+      sharedAcrossStages: "development baseline / candidate / cross-venue ablation / purged OOS / robustness"
+    },
     dataManifestHash: dataset.manifest.manifestHash,
     multiVenueManifestHash: dataset.multiVenueManifest?.manifestHash ?? null,
     baseline: performanceView(baseline),

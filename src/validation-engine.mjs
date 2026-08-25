@@ -135,7 +135,12 @@ export async function runValidationEngine(dataset, {
   walkForwardWindows = 4,
   outputDirectory,
   baselineStrategy = "challenger",
-  candidateStrategy = "challenger"
+  candidateStrategy = "challenger",
+  // 留空即沿用 runHistoricalReplay 的默认资金视角，既有调用者行为不变。
+  // 一旦调用方指定了资金视角，OOS 必须与开发段用同一套口径，
+  // 否则「开发段用参考资金、OOS 用生产资金」会做出无法比较的结论。
+  capitalProfile,
+  referenceCapitalCny
 } = {}) {
   const windows = buildWalkForwardWindows(dataset, walkForwardWindows);
   const matrix = buildHistoricalFeatureMatrix(dataset);
@@ -148,6 +153,8 @@ export async function runValidationEngine(dataset, {
       from: window.testStart,
       to: window.testEnd,
       collectTrace: false,
+      capitalProfile,
+      referenceCapitalCny,
       outputDirectory: outputDirectory ? `${outputDirectory}/window-${window.index}/baseline` : undefined
     });
     const candidate = await runHistoricalReplay(dataset, {
@@ -156,6 +163,8 @@ export async function runValidationEngine(dataset, {
       from: window.testStart,
       to: window.testEnd,
       collectTrace: false,
+      capitalProfile,
+      referenceCapitalCny,
       outputDirectory: outputDirectory ? `${outputDirectory}/window-${window.index}/candidate` : undefined
     });
     results.push({

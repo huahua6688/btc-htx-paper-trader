@@ -1,11 +1,11 @@
 import { PAPER_CONFIG } from "./config.mjs";
 import { atr, ema } from "./indicators.mjs";
+import { entryBarTimestampFor, observationSourceFor } from "./execution-timing.mjs";
 import { closedMarketView, coreDataQuality } from "./research-challenger-v2.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const FOUR_HOURS_MS = 4 * HOUR_MS;
-const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 const finite = (value) => value !== null && value !== undefined && Number.isFinite(Number(value));
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
@@ -55,7 +55,7 @@ export function resolveBreakoutV4Execution({
     contractVersion: BREAKOUT_V4_ENTRY_TIMING_CONTRACT.version,
     signalBarClosedAt: signalClosedAt,
     executionTimestamp,
-    entryBarTimestamp: Math.floor(executionTimestamp / FIFTEEN_MINUTES_MS) * FIFTEEN_MINUTES_MS,
+    entryBarTimestamp: entryBarTimestampFor(executionTimestamp),
     fillReferencePrice: price,
     fillReferenceSource: observationSource,
     signalAgeMs,
@@ -131,7 +131,7 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
     signalBarClosedAt,
     observationTimestamp: now,
     fillReferencePrice: currentPrice,
-    observationSource: market.replay?.pointInTime ? "REPLAY_OBSERVATION_PRICE" : "SHADOW_TICKER_PRICE"
+    observationSource: observationSourceFor(market)
   });
   const longBreakoutDistanceAtr = atr4h > 0 ? (latest.close - priorHigh) / atr4h : 0;
   const shortBreakoutDistanceAtr = atr4h > 0 ? (priorLow - latest.close) / atr4h : 0;
