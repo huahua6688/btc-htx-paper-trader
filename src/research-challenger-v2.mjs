@@ -268,6 +268,7 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     ? (leader.side === "LONG" ? "STRONG_LONG" : "STRONG_SHORT")
     : leader.side === "LONG" ? "LEAN_LONG" : "LEAN_SHORT";
   const dataQuality = coreDataQuality(visibleMarket, context);
+  const latest15mBar = context.frames["15m"].candles.at(-1) ?? null;
   const geometry = candidateDecision === "WAIT" ? null : entryGeometry(candidateDecision, context, visibleMarket, parameters);
   const edge = geometry ? tradableEdge(candidateDecision, geometry, context, visibleMarket, config, parameters, options.similarity) : null;
   const riskDistance = geometry?.riskDistance ?? 0;
@@ -312,6 +313,8 @@ export function analyzeResearchChallengerV2(market, parameters = RESEARCH_CHALLE
     strategyHash: hashObject(parameters),
     mode: "RESEARCH_CHALLENGER_V2_SHADOW_PAPER_ONLY",
     symbol: "BTC-USDT", generatedAt: new Date(now).toISOString(), currentPrice: round(currentPrice, 2),
+    latest15mBar,
+    completed15mBar: latest15mBar,
     decision, candidateDecision, directionState: strengthState,
     confidencePct: 0,
     scoreTerminology: "OPPORTUNITY_SCORE_NOT_PROBABILITY",

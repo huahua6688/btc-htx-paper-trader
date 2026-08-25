@@ -1,6 +1,6 @@
 import { PAPER_CONFIG } from "./config.mjs";
 import { atr, ema } from "./indicators.mjs";
-import { closedMarketView } from "./research-challenger-v2.mjs";
+import { closedMarketView, coreDataQuality } from "./research-challenger-v2.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -84,9 +84,7 @@ function waitReportBase(now, price, parameters, fundingRatePct, fundingSource) {
     currentPrice: round(price, 2),
     confidencePct: 0,
     scoreTerminology: "BREAKOUT_EVIDENCE_SCORE_NOT_PROBABILITY",
-    riskGates: [],
     derivatives: { fundingRatePct, fundingSource, oiUsd: null, pressureScore: null },
-    dataQuality: { validForEntry: true, failures: [], score: 100 },
     historicalCompatibility: { compatible: true, usesOnlyPointInTimeFeatures: true, futureDataFilled: false },
     safety: { apiKeyUsed: false, privateEndpointUsed: false, exchangeWriteEnabled: false, paperTradingOnly: true }
   };
@@ -100,12 +98,16 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const h15 = rows(visibleMarket.kline15m);
   const h4 = rows(visibleMarket.kline4h);
   const h1 = rows(visibleMarket.kline1h);
+  const d1 = rows(visibleMarket.kline1d);
   const minimum = Math.max(parameters.breakoutLookback4h + 1, parameters.trendEma4h + parameters.trendSlopeBars4h + 1, parameters.atrPeriod4h + 2);
   if (h4.length < minimum || h1.length < 20) throw new Error("Breakout V4 completed candle history is too short");
   const fundingRatePct = finite(visibleMarket.fundingCurrent?.data?.funding_rate)
     ? Number(visibleMarket.fundingCurrent.data.funding_rate) * 100
     : null;
   const base = waitReportBase(now, currentPrice, parameters, fundingRatePct, visibleMarket.fundingCurrent?.data?.source ?? "UNAVAILABLE_NOT_FILLED");
+  const dataQuality = coreDataQuality(visibleMarket, { frames: {
+    "15m": { candles: h15 }, "1h": { candles: h1 }, "4h": { candles: h4 }, "1d": { candles: d1 }
+  } });
   const latest = h4.at(-1);
   const closes = h4.map((item) => item.close);
   const trendLine = ema(closes, parameters.trendEma4h);
@@ -141,7 +143,8 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const longSignal = longBreakout && execution.eligible;
   const shortSignal = shortBreakout && execution.eligible;
   const candidateDecision = longSignal ? "LONG" : shortSignal ? "SHORT" : "WAIT";
-  const direction = candidateDecision === "LONG" ? 1 : candidateDecision === "SHORT" ? -1 : 0;
+  const decision = candidateDecision !== "WAIT" && dataQuality.validForEntry ? candidateDecision : "WAIT";
+  const direction = decision === "LONG" ? 1 : decision === "SHORT" ? -1 : 0;
   const riskDistance = atr4h * parameters.stopAtrMultiple;
   const stopLoss = direction ? currentPrice - direction * riskDistance : null;
   const takeProfit = direction ? currentPrice + direction * riskDistance * parameters.targetRiskMultiple : null;
@@ -151,15 +154,19 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
   const shortScore = clamp(20 + shortSupport - (longTrend ? 20 : 0), 0, 100);
   const riskPct = direction ? config.reducedRiskPerTradePct : 0;
   const staleBreakout = (longBreakout || shortBreakout) && !execution.signalFresh;
-  const reason = staleBreakout
+  const reason = candidateDecision !== "WAIT" && !dataQuality.validForEntry
+    ? `核心数据质量阻止入场：${dataQuality.failures.join("；")}`
+    : staleBreakout
     ? "完整 4h 突破信号已超过 5 分钟执行窗口，禁止服务恢复后补开旧信号"
     : candidateDecision === "WAIT"
     ? "最近完整 4h signal bar 尚未突破前高/前低并满足 EMA50 斜率"
     : `${parameters.breakoutLookback4h} 根4h区间突破，EMA${parameters.trendEma4h}方向一致`;
   return {
     ...base,
-    decision: candidateDecision,
+    decision,
     candidateDecision,
+    riskGates: dataQuality.failures,
+    dataQuality,
     execution,
     entryTimingContract: BREAKOUT_V4_ENTRY_TIMING_CONTRACT,
     latest15mBar: h15.length ? h15.at(-1) : null,
@@ -174,8 +181,9 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       managementContract: { profile: parameters.positionManagementProfile, hardStopAlwaysActive: true, hardTargetAlwaysActive: true, dynamicExitEnabled: false }
     } : { entryPrice: null, stopLoss: null, takeProfit: null, riskReward: null, netRiskReward: null, targetSource: null },
     entryAssessment: {
-      enterNow: Boolean(direction), method: direction ? "4H_DONCHIAN_BREAKOUT" : "WAIT_4H_BREAKOUT",
-      methodLabel: reason, reasons: [reason], missingConditions: direction ? [] : [reason], riskPct,
+      enterNow: Boolean(direction), method: direction ? "4H_DONCHIAN_BREAKOUT"
+        : candidateDecision !== "WAIT" && !dataQuality.validForEntry ? "WAIT_CORE_DATA_QUALITY" : "WAIT_4H_BREAKOUT",
+      methodLabel: reason, reasons: [reason], missingConditions: direction ? [] : [...new Set([...dataQuality.failures, reason])], riskPct,
       signalKey: direction ? signalKey : null,
       signalBarTimestamp,
       signalBarClosedAt,
@@ -192,10 +200,10 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
     },
     scores: { longOpportunity: round(longScore, 2), shortOpportunity: round(shortScore, 2), scoreGap: round(Math.abs(longScore - shortScore), 2), independent: true },
     timeframes: {
-      "15m": { atr14: null },
-      "1h": { atr14: round(atr1h, 6) },
-      "4h": { atr14: round(atr4h, 6), ema50: round(trendNow, 4), ema50Slope: round(trendNow - trendPrior, 6), priorHigh: round(priorHigh, 2), priorLow: round(priorLow, 2) },
-      "1d": { atr14: null }
+      "15m": { close: h15.at(-1)?.close ?? null, atr14: null },
+      "1h": { close: h1.at(-1)?.close ?? null, atr14: round(atr1h, 6) },
+      "4h": { close: h4.at(-1)?.close ?? null, atr14: round(atr4h, 6), ema50: round(trendNow, 4), ema50Slope: round(trendNow - trendPrior, 6), priorHigh: round(priorHigh, 2), priorLow: round(priorLow, 2) },
+      "1d": { close: d1.at(-1)?.close ?? null, atr14: null }
     },
     strategy: {
       version: parameters.version,
@@ -204,7 +212,7 @@ export function analyzeBreakoutChallenger(market, parameters = BREAKOUT_V4_PARAM
       state: direction ? "ENTER_NOW" : "WAIT",
       riskPct,
       riskTier: "REDUCED",
-      hardBlocks: [], softWarnings: direction ? [] : [reason], entryMethod: direction ? "4H_DONCHIAN_BREAKOUT" : "WAIT",
+      hardBlocks: dataQuality.failures, softWarnings: direction ? [] : [reason], entryMethod: direction ? "4H_DONCHIAN_BREAKOUT" : "WAIT",
       positionManagementProfile: parameters.positionManagementProfile,
       managementContract: { profile: parameters.positionManagementProfile, hardStopAlwaysActive: true, hardTargetAlwaysActive: true, dynamicExitEnabled: false },
       frozenChampionModified: false

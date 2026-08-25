@@ -747,6 +747,20 @@ export function researchV2RunRecord(result) {
   };
 }
 
+export function robustnessRunRecord(result) {
+  return {
+    status: result?.report?.status === "ok" ? "PASSED" : "PARTIAL",
+    artifactPath: result?.directory ?? null,
+    dataManifestHash: dataManifestHashOf(result),
+    summary: {
+      status: result?.report?.status ?? null,
+      reason: result?.report?.reason ?? null,
+      delayedExecutionEvidence: result?.report?.delayedExecutionEvidence ?? null,
+      stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
+    }
+  };
+}
+
 const dataManifestHashOf = (result) => result?.dataset?.manifest?.manifestHash ?? null;
 
 const COMMANDS = {
@@ -931,14 +945,7 @@ const COMMANDS = {
   robustness: {
     handler: (args) => robustness(args),
     runType: "MONTE_CARLO_ROBUSTNESS",
-    record: (result) => ({
-      artifactPath: result?.directory ?? null,
-      dataManifestHash: dataManifestHashOf(result),
-      summary: {
-        status: result?.report?.status ?? null,
-        stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
-      }
-    })
+    record: (result) => robustnessRunRecord(result)
   },
   counterfactual: {
     handler: (args) => counterfactual(args),

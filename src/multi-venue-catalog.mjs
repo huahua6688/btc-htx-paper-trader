@@ -311,7 +311,33 @@ export function pointInTimeFundingContext(rows = [], visibleAt, { maximumAgeMs =
   };
 }
 
-export async function collectCurrentMultiVenueFunding({ fetchImpl = fetch, now = Date.now } = {}) {
+function normalizeLiveHtxFunding(history, visibleAt) {
+  const latest = (history?.data?.data ?? [])
+    .map((row) => ({
+      timestamp: Number(row?.funding_time),
+      fundingRate: Number(row?.realized_rate ?? row?.funding_rate)
+    }))
+    .filter((row) => finite(row.timestamp) && finite(row.fundingRate) && row.timestamp <= visibleAt)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .at(-1);
+  if (!latest) return null;
+  return {
+    exchange: "htx",
+    instrument: "BTC-USDT",
+    timestamp: latest.timestamp,
+    visibleAt: latest.timestamp,
+    fundingRate: latest.fundingRate,
+    provenance: "HTX_PUBLIC_LIVE_REALIZED_HISTORY",
+    timestampSemantics: "funding_time is the realized funding settlement timestamp",
+    pointInTime: true
+  };
+}
+
+export async function collectCurrentMultiVenueFunding({
+  fetchImpl = fetch,
+  now = Date.now,
+  htxFundingHistory = null
+} = {}) {
   const visibleAt = Number(now());
   const startMs = visibleAt - 24 * HOUR_MS;
   const settled = await Promise.allSettled(Object.keys(MULTI_VENUE_FUNDING_SOURCES).map(async (exchange) => [
@@ -325,7 +351,14 @@ export async function collectCurrentMultiVenueFunding({ fetchImpl = fetch, now =
     if (result.status === "fulfilled") rows.push(...result.value[1].rows);
     else errors[exchange] = result.reason.message;
   });
-  return { ...pointInTimeFundingContext(rows, visibleAt), errors, source: "PUBLIC_NO_AUTH" };
+  const htx = normalizeLiveHtxFunding(htxFundingHistory, visibleAt);
+  if (htx) rows.push(htx);
+  return {
+    ...pointInTimeFundingContext(rows, visibleAt),
+    errors,
+    source: "PUBLIC_NO_AUTH_HTX_AND_EXTERNAL",
+    htxIncluded: Boolean(htx)
+  };
 }
 
 export const MULTI_VENUE_DATASET = Object.freeze({ id: DATASET_ID, maximumFundingAgeMs: DEFAULT_MAX_AGE_MS });

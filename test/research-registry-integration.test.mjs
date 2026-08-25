@@ -21,7 +21,8 @@ import {
   EXEMPT_RESEARCH_COMMANDS,
   executeResearchCommand,
   RESEARCH_COMMANDS,
-  researchV2RunRecord
+  researchV2RunRecord,
+  robustnessRunRecord
 } from "../src/research-cli.mjs";
 import { TelegramControlPanel } from "../src/telegram-control.mjs";
 
@@ -299,6 +300,21 @@ test("a handler-declared PARTIAL status is preserved rather than upgraded to PAS
     persist: async (runType, startedAt, status) => { recorded.push(status); }
   });
   assert.deepEqual(recorded, ["PARTIAL"]);
+});
+
+test("zero-trade delayed execution evidence records V4 robustness as PARTIAL", () => {
+  const record = robustnessRunRecord({
+    directory: "/tmp/robustness",
+    replay: { tradeCount: 28 },
+    report: {
+      status: "partial",
+      reason: "delayed execution produced no trades",
+      delayedExecutionEvidence: { available: false }
+    }
+  });
+  assert.equal(record.status, "PARTIAL");
+  assert.equal(record.summary.delayedExecutionEvidence.available, false);
+  assert.match(record.summary.reason, /no trades/);
 });
 
 test("a failing invocation records exactly one BLOCKED or FAILED run and rethrows", async () => {

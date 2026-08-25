@@ -157,8 +157,20 @@ export function extractSingleCsvZip(buffer) {
   const localExtraLength = buffer.readUInt16LE(localOffset + 28);
   const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
   const compressed = buffer.subarray(dataOffset, dataOffset + compressedSize);
-  const content = method === 0 ? compressed : method === 8 ? inflateRawSync(compressed) : null;
+  let content = null;
+  if (method === 0) content = compressed;
+  else if (method === 8) {
+    try {
+      content = inflateRawSync(compressed, { maxOutputLength: MAX_NORMALIZED_ARCHIVE_BYTES });
+    } catch (error) {
+      if (error?.code === "ERR_BUFFER_TOO_LARGE") {
+        throw new Error("PIT-normalized archive exceeds the fixed safe size limit", { cause: error });
+      }
+      throw error;
+    }
+  }
   if (!content) throw new Error(`Unsupported ZIP compression method: ${method}`);
+  if (content.length > MAX_NORMALIZED_ARCHIVE_BYTES) throw new Error("PIT-normalized archive exceeds the fixed safe size limit");
   return { fileName, csv: content.toString("utf8") };
 }
 

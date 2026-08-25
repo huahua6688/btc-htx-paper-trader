@@ -9,10 +9,12 @@ import { manageOpenPosition } from "../src/position-manager.mjs";
 import { buildPointInTimeMarket } from "../src/replay-market.mjs";
 import { REPLAY_STRATEGIES, runHistoricalReplay } from "../src/replay-engine.mjs";
 import { runMonitorCycle } from "../src/monitor-cycle.mjs";
+import { nextMonitorDelayMs } from "../src/monitor-schedule.mjs";
 import { paperReport } from "./helpers.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const FOUR_HOURS_MS = 4 * HOUR_MS;
+const V4_BOUNDARY = Date.UTC(2026, 0, 2, 0, 0, 0);
 
 function frame({ interval, now, count, side }) {
   return Array.from({ length: count }, (_, index) => {
@@ -33,19 +35,20 @@ function frame({ interval, now, count, side }) {
 }
 
 function breakoutMarket(side, { offsetMs = 0 } = {}) {
-  const boundary = Date.UTC(2026, 0, 2, 0, 0, 0);
+  const boundary = V4_BOUNDARY;
   const now = boundary + offsetMs;
   const latestClosed15m = Math.floor(now / (15 * 60_000)) * 15 * 60_000;
   const h15 = frame({ interval: 15 * 60_000, now: latestClosed15m, count: 100, side });
   const h4 = frame({ interval: FOUR_HOURS_MS, now: boundary, count: 70, side });
   const h1 = frame({ interval: HOUR_MS, now: boundary, count: 100, side });
+  const d1 = frame({ interval: 24 * HOUR_MS, now: boundary, count: 70, side });
   const currentPrice = h4.at(-1).close;
   return {
     ticker: { ts: now, tick: { close: currentPrice } },
     kline15m: { data: h15 },
     kline1h: { data: h1 },
     kline4h: { data: h4 },
-    kline1d: { data: [] },
+    kline1d: { data: d1 },
     fundingCurrent: { data: { funding_rate: "0", source: "TEST_POINT_IN_TIME" } }
   };
 }
@@ -70,7 +73,7 @@ test("Breakout V4 binds LONG and SHORT signals to the latest completed 4h signal
     assert.equal(liveStyle.breakout.isExactWallClockBoundary, false);
     assert.equal(liveStyle.entryAssessment.signalKey, long.entryAssessment.signalKey);
     assert.equal(liveStyle.entryAssessment.signalBarTimestamp, long.entryAssessment.signalBarTimestamp);
-    assert.equal(liveStyle.entryAssessment.executionTimestamp, Date.UTC(2026, 0, 2) + offsetMs);
+    assert.equal(liveStyle.entryAssessment.executionTimestamp, V4_BOUNDARY + offsetMs);
     assert.equal(liveStyle.execution.fillReferencePrice, liveStyle.currentPrice);
     assert.equal(liveStyle.execution.signalAgeMs, offsetMs);
   }
@@ -83,6 +86,34 @@ test("Breakout V4 binds LONG and SHORT signals to the latest completed 4h signal
   assert.equal(stale.breakout.signalFresh, false);
   assert.equal(stale.entryAssessment.signalKey, null);
   assert.match(stale.entryAssessment.missingConditions.join(" "), /超过 5 分钟/);
+});
+
+test("every legal monitor interval reaches a live-style V4 decision inside the fixed signal-age window", () => {
+  for (const minutes of [5, 15, 60, 240]) {
+    const startedAt = V4_BOUNDARY - 3 * 60_000;
+    const finishedAt = startedAt + 37_000;
+    const delay = nextMonitorDelayMs({
+      cycleStartedAtMs: startedAt,
+      cycleFinishedAtMs: finishedAt,
+      configuredIntervalMs: minutes * 60_000,
+      activeShadowStrategyType: "breakout-v4"
+    });
+    assert.equal(finishedAt + delay, V4_BOUNDARY);
+    const report = analyzeBreakoutChallenger(breakoutMarket("LONG", { offsetMs: 37_000 }));
+    assert.equal(report.decision, "LONG", `${minutes}m cadence must not silently disable V4 Shadow`);
+    assert.equal(report.execution.signalFresh, true);
+  }
+});
+
+test("Breakout V4 uses real core data quality instead of a hard-coded pass", () => {
+  const market = breakoutMarket("LONG");
+  market.kline15m = { data: [] };
+  const report = analyzeBreakoutChallenger(market);
+  assert.equal(report.candidateDecision, "LONG");
+  assert.equal(report.decision, "WAIT");
+  assert.equal(report.dataQuality.validForEntry, false);
+  assert.ok(report.riskGates.some((item) => item.includes("15m")));
+  assert.equal(report.entryAssessment.signalKey, null);
 });
 
 test("Shadow service recovery never opens an hours-old completed 4h breakout", async () => {

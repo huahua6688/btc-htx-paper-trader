@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { evaluateEntryGeometry, trimMarketToClosedCandles } from "../src/anti-chase-challenger.mjs";
+import { analyzeAntiChaseChallenger, evaluateEntryGeometry, trimMarketToClosedCandles } from "../src/anti-chase-challenger.mjs";
 
 function rows({ count = 80, intervalMs, start = 1_700_000_000_000, first = 100, step = 0.05, lastVolume = 100 } = {}) {
   return Array.from({ length: count }, (_, index) => {
@@ -44,6 +44,23 @@ test("Anti-Chase removes every still-open candle before analysis", () => {
   const trimmed = trimMarketToClosedCandles(market);
   assert.equal(trimmed.kline15m.data.some((item) => item.open === 999), false);
   assert.ok(trimmed.kline15m.data.every((item) => item.id * 1000 + interval <= visibleAt));
+});
+
+test("Anti-Chase inherits completed 15m bars from its historical-compatible base report", () => {
+  const interval = 15 * 60_000;
+  const closed = rows({ count: 140, intervalMs: interval });
+  const visibleAt = closed.at(-1).id * 1000 + interval;
+  const market = {
+    ticker: { ts: visibleAt, tick: { close: closed.at(-1).close } },
+    kline15m: { data: closed },
+    kline1h: { data: rows({ count: 140, intervalMs: 60 * 60_000, start: visibleAt - 140 * 60 * 60_000 }) },
+    kline4h: { data: rows({ count: 140, intervalMs: 4 * 60 * 60_000, start: visibleAt - 140 * 4 * 60 * 60_000 }) },
+    kline1d: { data: rows({ count: 140, intervalMs: 24 * 60 * 60_000, start: visibleAt - 140 * 24 * 60 * 60_000 }) },
+    fundingCurrent: { data: { funding_rate: "0" } }
+  };
+  const report = analyzeAntiChaseChallenger(market);
+  assert.ok(report.latest15mBar?.timestamp);
+  assert.equal(report.completed15mBar?.timestamp, report.latest15mBar.timestamp);
 });
 
 test("Anti-Chase blocks an extended momentum LONG instead of buying after the move", () => {

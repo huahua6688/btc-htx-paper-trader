@@ -281,6 +281,7 @@ export function analyzeMultiVenueChallenger(market, parameters = MULTI_VENUE_CHA
   }
   const selected = candidateDecision === "WAIT" ? null : reads[candidateDecision];
   const dataQuality = coreDataQuality(visibleMarket, context);
+  const latest15mBar = context.frames["15m"].candles.at(-1) ?? null;
   let geometry = selected ? entryGeometry(candidateDecision, context, visibleMarket, parameters) : null;
   const edge = geometry ? tradableEdge(candidateDecision, geometry, context, visibleMarket, config, parameters, options.similarity) : null;
   const riskDistance = Number(geometry?.riskDistance ?? 0);
@@ -341,6 +342,8 @@ export function analyzeMultiVenueChallenger(market, parameters = MULTI_VENUE_CHA
     symbol: "BTC-USDT",
     generatedAt: new Date(now).toISOString(),
     currentPrice: round(currentPrice, 2),
+    latest15mBar,
+    completed15mBar: latest15mBar,
     decision,
     candidateDecision,
     directionState: selected ? `${selected.opportunityScore >= 76 ? "STRONG" : "LEAN"}_${selected.side}` : "NEUTRAL",

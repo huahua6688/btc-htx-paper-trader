@@ -7,6 +7,7 @@ import { createDisabledLiveExchangeInterface, LIVE_EXCHANGE_OPERATIONS } from ".
 import { HISTORICAL_DATA_TYPES, loadHistoricalDataset, updateHistoricalDataset } from "../src/historical-data.mjs";
 import { HTX_SKILL_CAPABILITIES, HTX_SKILL_NAMES, htxSkillCapabilityReport } from "../src/htx-skill-capabilities.mjs";
 import {
+  collectCurrentMultiVenueFunding,
   loadMultiVenueFundingDataset,
   pointInTimeFundingContext,
   updateMultiVenueFundingDataset
@@ -103,6 +104,34 @@ test("point-in-time multi-venue context never sees a future settlement and expir
   assert.ok(context.observations.every((item) => item.timestamp <= now));
 });
 
+test("live multi-venue context includes the already-collected HTX observation just like Replay", async () => {
+  const now = Date.UTC(2026, 7, 25, 8, 1, 0);
+  const settledAt = now - HOUR_MS;
+  const fetchImpl = async (url) => {
+    if (url.hostname === "fapi.binance.com") return response([{ fundingTime: settledAt, fundingRate: "0.0001" }]);
+    if (url.hostname === "api.bybit.com") return response({ retCode: 0, result: { list: [
+      { fundingRateTimestamp: String(settledAt), fundingRate: "-0.0001" }
+    ] } });
+    if (url.hostname === "www.okx.com") return response({ code: "0", data: [
+      { fundingTime: String(settledAt), realizedRate: "0.00005" }
+    ] });
+    throw new Error(`unexpected host ${url.hostname}`);
+  };
+  const context = await collectCurrentMultiVenueFunding({
+    fetchImpl,
+    now: () => now,
+    htxFundingHistory: { data: { data: [
+      { funding_time: String(now + HOUR_MS), funding_rate: "0.9" },
+      { funding_time: String(settledAt), funding_rate: "0.0002" }
+    ] } }
+  });
+  assert.equal(context.htxIncluded, true);
+  assert.equal(context.venueCount, 4);
+  assert.equal(context.observations.find((item) => item.exchange === "htx").fundingRate, 0.0002);
+  assert.equal(context.observations.find((item) => item.exchange === "htx").timestamp, settledAt);
+  assert.equal(context.observations.find((item) => item.exchange === "htx").provenance, "HTX_PUBLIC_LIVE_REALIZED_HISTORY");
+});
+
 test("HTX settlement history is downloaded into the main catalog without becoming directional alpha", async () => {
   const directory = await mkdtemp(join(tmpdir(), "htx-settlement-"));
   const fromMs = Date.UTC(2025, 0, 1);
@@ -192,6 +221,8 @@ test("V3 LONG and SHORT are separate scores and antithetic zero-drift paths are 
   for (let seed = 1; seed <= 24; seed += 1) {
     for (const mirror of [false, true]) {
       const report = analyzeMultiVenueChallenger(market(seed, { mirror }));
+      assert.ok(report.latest15mBar?.timestamp);
+      assert.equal(report.completed15mBar?.timestamp, report.latest15mBar.timestamp);
       const long = report.scores.longOpportunity;
       const short = report.scores.shortOpportunity;
       sums.add(Math.round((long + short) * 10) / 10);

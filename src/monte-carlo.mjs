@@ -57,7 +57,8 @@ function scenarioSummary(report) {
     maxDrawdownPct: report.performance.maxDrawdownPct,
     profitFactor: report.performance.profitFactor,
     tradeSharpe: report.performance.tradeSharpe,
-    totalCostsCny: report.performance.totalCostsCny
+    totalCostsCny: report.performance.totalCostsCny,
+    executable: report.tradeCount > 0
   };
 }
 
@@ -130,8 +131,15 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
     });
     parameterRuns.push({ label: item.label, parameters: perturbed, result: scenarioSummary(report) });
   }
+  const delay2Summary = scenarioSummary(delay2);
+  const delay3Summary = scenarioSummary(delay3);
+  const delayedExecutionEvidenceAvailable = delay2Summary.executable && delay3Summary.executable;
+  const delayedExecutionBlocksV4Robustness = strategy === "breakout-v4" && !delayedExecutionEvidenceAvailable;
   return {
-    status: "ok",
+    status: delayedExecutionBlocksV4Robustness ? "partial" : "ok",
+    reason: delayedExecutionBlocksV4Robustness
+      ? "Breakout V4 delayed-execution scenarios produced no executable trades under the maximum signal-age contract"
+      : null,
     runType: "MONTE_CARLO_AND_REPLAY_ROBUSTNESS",
     generatedAt: new Date().toISOString(),
     seed,
@@ -142,11 +150,17 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
     deterministicStress: {
       costDeterioration150Pct: scenarioSummary(costWorse),
       slippageDeterioration200Pct: scenarioSummary(slippageWorse),
-      executionDelay2Bars: scenarioSummary(delay2),
-      executionDelay3Bars: scenarioSummary(delay3),
+      executionDelay2Bars: delay2Summary,
+      executionDelay3Bars: delay3Summary,
       allLossesFirst: { returnPct: round(lossStreak.returnPct, 4), maxDrawdownPct: round(lossStreak.maxDrawdownPct, 4), endingEquity: round(lossStreak.endingEquity, 4) }
     },
     parameterPerturbation: parameterRuns,
+    delayedExecutionEvidence: {
+      available: delayedExecutionEvidenceAvailable,
+      interpretation: delayedExecutionEvidenceAvailable
+        ? "Both delayed-entry scenarios produced executable trades"
+        : "At least one delayed-entry scenario produced zero trades and cannot count as a robustness pass"
+    },
     interpretation: "Resampling distributions preserve observed net trade outcomes; deterministic stresses are fresh event-by-event replays with worsened assumptions."
   };
 }

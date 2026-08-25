@@ -29,7 +29,7 @@
 | Multi-venue V3.0（HTX + Binance） | 64 | -1,067.67 | -10.60% | 0.492 | 淘汰；跨场所数据有改善但没有 edge |
 | V3.0 HTX-only 消融 | 71 | -1,465.47 | -13.12% | 0.455 | 跨场所 Funding 减少 7 笔并改善 2.52 个百分点，但仍失败 |
 | V3.1 target-aligned | 64 | -1,191.75 | -11.18% | 0.472 | 比 V3.0 更差，保留为可复现实验而非默认值 |
-| Breakout V4 | 28 | +1,413.91 | +5.19% | 1.153 | 保留为研究/Shadow 候选，不晋级 |
+| Breakout V4 | 28 | +1,413.91 | +5.19% | 1.153 | 仅作工程 Shadow 可达性/数据采集观察，不晋级 |
 
 V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固定 4R 硬目标。
 `HARD_BRACKET_HOLD_V1` 禁止旧的 1R 保本、1.5R 跟踪、目标延伸和短周期反向评分退出，解决“按 4R 入场、按 1R 离场”的契约冲突。
@@ -37,11 +37,19 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
 ## V4 live Shadow 4h 修复
 
 - 决策不再要求 ticker 时间戳精确满足 `now % 4h == 0`，而是绑定最近一根已经完整关闭的 4h signal bar。
+- 常规 monitor 周期仍可配置为 5/15/60/240 分钟；V4 激活为 Shadow 时，调度器会在每个 4h 收盘边界额外唤醒一次。因此长轮询周期不会跳过 5 分钟 signal-age 窗口，也没有为迁就轮询而放宽最大 signal age。
 - signal key 由策略哈希、品种、周期和 4h bar 开盘时间组成。Shadow SQLite 用主键原子 claim，同一 signal bar 跨 5 分钟轮询和进程重启都只处理一次；Replay 使用同一 key 做事件级去重。
 - `4h close +37 秒`、`+3 分钟` 均与 Replay 整点得到相同方向、signal key 和 signal bar；第二次 Shadow cycle 返回 `DUPLICATE_SIGNAL_BAR`，不重复开仓。
 - Shadow 与 Replay 共享 `BREAKOUT_V4_FIRST_OBSERVATION_V1` 入场时序：记录实际 execution timestamp，以该观察时点可见价格作为 fill reference；Replay 的观察点是下一根15分钟开盘。Signal 最长只允许 5 分钟，服务恢复时更老的4小时突破直接 WAIT，禁止补开旧仓。
 - 新测试不仅比较方向，还比较实际 Paper 仓位的 `opened_at`、`entry_bar_ts`、`signal_entry_price` 与 Replay 成交引用；延迟3分钟的 Shadow 记录真实延迟时间，不回填成整点成交。
 - 修复后全区间精确 Paper 结果仍为 28 笔、+5.1867%、PF 1.1532，说明只修 live 可达性/幂等，没有借机改变研究成绩。
+
+## 独立 review 修复
+
+- Breakout V4 不再硬编码 `dataQuality.validForEntry=true` 或空 `riskGates`。它现在使用真实 15m/1h/4h/1d 核心数据质量门禁；核心数据缺失时保留 candidate 诊断，但实际决策为 `WAIT_CORE_DATA_QUALITY`，不能生成 signal key 或建仓。
+- Research V2 与 Multi-venue V3 的 live-style 报告均显式携带最近已完成的 15m bar；Anti-Chase 从 historical-compatible 基类继承同一字段，并新增直接回归测试。Paper freshness gate 因此不会把有效 live Shadow 报告误判成缺少 bar。
+- Multi-venue V3 的实时上下文现在纳入同一轮已采集的 HTX 最近已结算 Funding 历史，并排除未来 settlement；与 Replay 均使用 realized settlement timestamp 语义，而不是把当前预估费率混入历史中位数。
+- Safety 新增真实反例：篡改 Private Account/Trading capability 后执行实际安全脚本，必须 fail-closed。Download Center ZIP 解压同时对实际 inflated bytes 设置 20 MiB 上限，不能靠伪造 ZIP metadata 绕过。
 
 ## V4 development-only 参数选择记录
 
@@ -64,11 +72,12 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
 - development-only 前视审计 24/24 通过，`holdoutOpened=false`。150% 手续费为 +4.67%，200% 滑点为 +4.70%。
   按当前 `BREAKOUT_V4_FIRST_OBSERVATION_V1` 重新运行后，`executionDelay2Bars`（15 分钟）和
   `executionDelay3Bars`（30 分钟）均有 228 次信号被 `SIGNAL_TOO_OLD` 拒绝，结果均为 0 trades、0% 收益、PF 不可计算；
-  两个延迟场景在 5 分钟最大 signal age 下不可执行，不能解释为 robustness pass。lookback 38/42、止损 2.375×ATR、
+  两个延迟场景在 5 分钟最大 signal age 下不可执行，不能解释为 robustness pass；本次 robustness 顶层状态因此为 `PARTIAL`，
+  `delayedExecutionEvidence.available=false`。lookback 38/42、止损 2.375×ATR、
   目标 4.2R 的邻域回放仍为正，说明参数峰值并非单点崩塌。
 
-因此 V4 只满足“值得继续积累 Shadow 样本”，不满足“已有可靠生产 edge”。当前不登记为 Champion、不自动激活 Shadow，
-也不打开真实交易端口。
+因此 V4 目前只允许工程 Shadow 可达性与数据采集观察，不能把它表述成 robustness 或晋级证据，更不满足“已有可靠生产 edge”。
+当前不登记为 Champion、不自动激活 Shadow，也不打开真实交易端口。
 
 ## 17 项 HTX Skills 实际接线审计
 
@@ -78,7 +87,7 @@ V4 是 4h Donchian(40) 突破、EMA50 方向/斜率、2.5×ATR14 硬止损、固
 
 ## 本次合并前验证
 
-- 完整测试：257/257 通过。
+- 完整测试：267/267 通过。
 - Safety：通过；冻结 Champion SHA-256 仍为 `9b7d3c533b9c1d971e3695348d22f1d3f2feacb8f22519d619a4a63aa7990fa6`，未发现 exchange credential、write command 或提交的 Telegram Token。
 - V4 development-only prefix invariance：24/24 通过，`holdoutOpened=false`。
 - 官方 Download Center `2026-08-23` 单日真实目录：9/9 类型成功，无 fetch error；大体量 depth 未默认下载。

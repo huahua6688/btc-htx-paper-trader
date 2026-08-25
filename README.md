@@ -306,6 +306,8 @@ SHADOW_PAPER_ENABLED=true
 SHADOW_DB_PATH=/var/lib/btc-htx-paper/shadow-challenger.sqlite
 ```
 
+当 active Shadow 是 Breakout V4 时，monitor 会在每个 4h 收盘边界增加一次墙钟唤醒；5/15/60/240 分钟的常规轮询设置仍保留，但不会再让较长周期静默跳过固定 5 分钟 signal-age 窗口。相同 4h signal bar 由持久化 signal key 幂等去重。
+
 Shadow 不会自动晋级。少于 30 个自然日或 100 个实际信号时，Promotion Gate 必须保持阻塞。ML 目前没有进入 Challenger：只有在简单统计/相似行情 baseline 之上通过严格 OOS 增量检验后，才允许研究 ML 候选。
 
 ## 使用的公开数据

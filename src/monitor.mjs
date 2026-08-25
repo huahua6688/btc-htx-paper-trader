@@ -14,6 +14,7 @@ import { resolveHtxArchiveIdentity } from "./htx-upstream.mjs";
 import { analyzeMultiVenueChallenger } from "./multi-venue-challenger.mjs";
 import { collectCurrentMultiVenueFunding } from "./multi-venue-catalog.mjs";
 import { analyzeBreakoutChallenger } from "./breakout-challenger.mjs";
+import { nextMonitorDelayMs } from "./monitor-schedule.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
@@ -97,7 +98,9 @@ async function cycle() {
         const shadow = await runMonitorCycle(shadowDb, {
           collect: async () => {
             if (activeShadow?.strategyType !== "multi-venue-v3") return result.marketSnapshot;
-            const funding = await collectCurrentMultiVenueFunding();
+            const funding = await collectCurrentMultiVenueFunding({
+              htxFundingHistory: result.marketSnapshot.fundingHistory
+            });
             return { ...result.marketSnapshot, multiVenue: { funding } };
           },
           analyze: shadowAnalyze
@@ -150,13 +153,17 @@ async function main() {
       closeAndExit();
       return;
     }
-    const elapsed = Date.now() - cycleStartedAt;
     // 读坏的设置绝不能变成 setTimeout(loop, NaN) —— 那会退化成一个不停敲打 HTX 的忙循环。
     const configuredMinutes = Number(db.getRuntimeSettings()?.monitorIntervalMinutes);
     const configuredInterval = Number.isFinite(configuredMinutes) && configuredMinutes >= 1
       ? configuredMinutes * 60_000
       : PAPER_CONFIG.monitorIntervalMs;
-    const delay = Math.max(0, configuredInterval - elapsed);
+    const delay = nextMonitorDelayMs({
+      cycleStartedAtMs: cycleStartedAt,
+      cycleFinishedAtMs: Date.now(),
+      configuredIntervalMs: configuredInterval,
+      activeShadowStrategyType: activeShadow?.strategyType ?? null
+    });
     process.stdout.write(`下一次运行：约 ${Math.ceil(delay / 60_000)} 分钟后。按 Ctrl+C 安全停止。\n`);
     timer = setTimeout(loop, delay);
   };
