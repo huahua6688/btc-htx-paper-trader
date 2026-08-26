@@ -415,7 +415,11 @@ export async function updateHistoricalDataset({
   dataTypes = HISTORICAL_DATA_TYPES,
   researchClient = null,
   delay = undefined,
-  attempts = undefined
+  attempts = undefined,
+  // 被判定为「HTX 保留窗口拒绝」的数据源会记成已完成，同一区间不再重复请求
+  // 一个必然被拒的调用。但 HTX 若日后放宽保留窗口，同一区间就永远不会重试了。
+  // 这个开关只清掉那一类完成标记，正常成功的完成标记不受影响。
+  retryUnavailable = false
 } = {}) {
   if (!from || !to) throw new Error("Historical update requires explicit --from and --to; implicit cherry-picked periods are forbidden");
   const requestedStart = ceilBar(parseIso(from, "from"));
@@ -436,6 +440,11 @@ export async function updateHistoricalDataset({
   const checkpoint = loadedCheckpoint?.rangeKey === rangeKey
     ? loadedCheckpoint
     : { schemaVersion: 2, datasetId: DATASET_ID, rangeKey, requestedStart, requestedEnd, completed: {}, attempts: {} };
+  if (retryUnavailable) {
+    for (const [type, entry] of Object.entries(checkpoint.completed ?? {})) {
+      if (entry?.historicalUnavailableReason) delete checkpoint.completed[type];
+    }
+  }
   const saveCheckpoint = async (status = "IN_PROGRESS") => {
     checkpoint.status = status;
     checkpoint.updatedAt = new Date().toISOString();

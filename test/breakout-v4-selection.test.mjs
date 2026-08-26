@@ -140,6 +140,38 @@ test("long-history selection rejects proxy winners that cannot pass the real Pap
   assert.equal(result.isolation.holdoutOpened, false);
 });
 
+test("--long-history 才切到扩展规格，默认保持已登记的选参可复现", async () => {
+  const { breakoutV4SpecOption } = await import("../src/research-cli.mjs");
+  const {
+    BREAKOUT_V4_DEVELOPMENT_SPEC: base,
+    BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC: extended
+  } = await import("../src/breakout-v4-selection.mjs");
+
+  assert.equal(breakoutV4SpecOption({}), base);
+  assert.equal(breakoutV4SpecOption({ "long-history": "false" }), base);
+  assert.equal(breakoutV4SpecOption({ "long-history": "0" }), base);
+  assert.equal(breakoutV4SpecOption({ "long-history": true }), extended);
+  assert.equal(breakoutV4SpecOption({ "long-history": "true" }), extended);
+  assert.equal(base.executionModel.minimumRiskReward, undefined);
+  assert.ok(Number.isFinite(extended.executionModel.minimumRiskReward));
+  assert.equal(extended.developmentRange.to, base.developmentRange.to);
+  assert.ok(new Date(extended.developmentRange.from) < new Date(base.developmentRange.from));
+});
+
+test("--retry-unavailable 只清掉保留窗口拒绝的完成标记", async () => {
+  const completed = {
+    kline: { at: "2026-08-26T00:00:00.000Z", records: 67104 },
+    funding: { at: "2026-08-26T00:00:00.000Z", records: 2098 },
+    settlement: { at: "2026-08-26T00:00:00.000Z", records: 0, historicalUnavailableReason: "HTX_RETENTION_BOUNDED_REQUEST_REJECTED" }
+  };
+  const cleared = { ...completed };
+  for (const [type, entry] of Object.entries(cleared)) {
+    if (entry?.historicalUnavailableReason) delete cleared[type];
+  }
+  assert.deepEqual(Object.keys(cleared).sort(), ["funding", "kline"]);
+  assert.equal(cleared.kline.records, 67104);
+});
+
 test("exact-Paper selector prefers cross-segment stability over one concentrated profit period", async () => {
   const dataset = syntheticCatalog();
   const grid = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC);

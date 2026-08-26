@@ -30,7 +30,12 @@ if (activeShadow?.strategyType === "tradable-edge"
   throw new Error("Active Tradable Edge Shadow model is missing or its hash does not match");
 }
 const shadowDatabasePath = activeShadow?.databasePath ?? SHADOW_CONFIG.databasePath;
-const shadowStrategyVersion = activeShadow?.version ?? SHADOW_CONFIG.strategyVersion;
+// 有 active 配置时绝不回退到 SHADOW_CONFIG.strategyVersion：那是一个与当前配置
+// 无关的常量。回退之后日志会声称在跑 challenger-technical-v1，而实际跑的是配置
+// 里指定的策略 —— 一条读不出真相的日志比没有日志更糟。
+const shadowStrategyVersion = activeShadow
+  ? (activeShadow.version ?? activeShadow.strategyType)
+  : SHADOW_CONFIG.strategyVersion;
 const shadowAnalyze = activeShadow
   ? activeShadow.strategyType === "research-v2"
     ? (market) => analyzeResearchChallengerV2(market, activeShadow.parameters, undefined, {
@@ -104,7 +109,9 @@ async function shadowCycle(marketSnapshot) {
       : `${edgeEstimates[side].netTradableEdgePct}%`;
     const edgeText = edgeEstimates ? `；净优势 多 ${edgeValue("LONG")} / 空 ${edgeValue("SHORT")}` : "";
     const scope = marketSnapshot ? "" : "（4h 边界，仅 Shadow）";
-    process.stdout.write(`Shadow ${shadowStrategyVersion}${scope}: ${shadow.report.decision}; ${types}${edgeText}; 独立权益 ${Number(shadowDb.getAccount().cash_cny).toFixed(2)} CNY\n`);
+    // 策略自己报出来的 version 才是地面真相；配置里的名字只是标签。
+    const runningVersion = shadow.report.version ?? shadowStrategyVersion;
+    process.stdout.write(`Shadow ${runningVersion}${scope}: ${shadow.report.decision}; ${types}${edgeText}; 独立权益 ${Number(shadowDb.getAccount().cash_cny).toFixed(2)} CNY\n`);
   } catch (error) {
     process.stderr.write(`Shadow Paper failed independently: ${error.message}\n`);
   }
