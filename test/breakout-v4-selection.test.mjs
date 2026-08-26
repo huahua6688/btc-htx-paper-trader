@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   BREAKOUT_V4_DEVELOPMENT_SPEC,
+  BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   breakoutV4CandidateGrid,
   runBreakoutV4DevelopmentSelection
 } from "../src/breakout-v4-selection.mjs";
@@ -66,4 +67,20 @@ test("the committed V4 selection record matches the executable spec and winner",
   assert.equal(record.winner.parameterHash, hashObject(BREAKOUT_V4_PARAMETERS));
   assert.equal(record.postSelectionRole, "RESEARCH_SHADOW_CANDIDATE");
   assert.equal(record.championChanged, false);
+});
+
+test("long-history selection rejects proxy winners that cannot pass the real Paper net-RR gate", () => {
+  const dataset = syntheticCatalog();
+  const spec = {
+    ...BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
+    developmentRange: BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange
+  };
+  const result = runBreakoutV4DevelopmentSelection(dataset, { spec });
+  const twoRiskCandidates = result.candidates.filter((item) => item.parameters.targetRiskMultiple === 2);
+  assert.ok(twoRiskCandidates.length > 0);
+  assert.ok(twoRiskCandidates.every((item) => item.metrics.tradeCount === 0));
+  assert.ok(twoRiskCandidates.every((item) => item.metrics.eligible === false));
+  assert.ok(twoRiskCandidates.every((item) => item.metrics.netRrRejectedSignals > 0));
+  assert.ok(result.winner.parameters.targetRiskMultiple > spec.executionModel.minimumRiskReward);
+  assert.equal(result.isolation.holdoutOpened, false);
 });

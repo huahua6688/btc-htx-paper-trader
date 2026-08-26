@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   analyzeBreakoutChallenger,
-  BREAKOUT_V4_ENTRY_TIMING_CONTRACT
+  BREAKOUT_V4_ENTRY_TIMING_CONTRACT,
+  BREAKOUT_V4_PARAMETERS
 } from "../src/breakout-challenger.mjs";
 import { PaperDatabase } from "../src/db.mjs";
 import { manageOpenPosition } from "../src/position-manager.mjs";
@@ -219,6 +220,42 @@ test("real Replay orchestration and live Shadow monitor keep decision parity aft
   } finally {
     db.close();
   }
+});
+
+test("V4 timing safety follows the selected strategy even when robustness perturbs the version label", async () => {
+  const barMs = 15 * 60_000;
+  const start = Date.UTC(2025, 8, 1);
+  const candles = [];
+  let prior = 100;
+  for (let index = 0; index < 86 * 96; index += 1) {
+    const timestamp = start + index * barMs;
+    const close = 100 + index * 0.01;
+    candles.push({ timestamp, open: prior, high: close + 0.04, low: prior - 0.04, close, volumeBtc: 1, volumeContracts: 1, turnoverUsdt: close, trades: 1 });
+    prior = close;
+  }
+  const boundaryIndex = candles.findLastIndex((item, index) => index < candles.length - 2 && (item.timestamp + barMs) % FOUR_HOURS_MS === 0);
+  const boundaryCandle = candles[boundaryIndex];
+  const dataset = {
+    manifest: {
+      manifestHash: "breakout-version-perturbation-test",
+      datasetId: "breakout-version-perturbation-test",
+      requestedCoverage: { from: new Date(start).toISOString(), to: new Date(candles.at(-1).timestamp).toISOString() },
+      actualCoverage: { from: new Date(start).toISOString(), to: new Date(candles.at(-1).timestamp).toISOString() }
+    },
+    candles,
+    funding: [],
+    series: {}
+  };
+  const replay = await runHistoricalReplay(dataset, {
+    strategy: "breakout-v4",
+    parameters: { ...BREAKOUT_V4_PARAMETERS, version: "breakout-v4-robustness-perturbation" },
+    from: new Date(boundaryCandle.timestamp).toISOString(),
+    to: new Date(boundaryCandle.timestamp + 2 * barMs).toISOString(),
+    executionDelayBars: 2,
+    forceCloseAtEnd: true
+  });
+  assert.equal(replay.tradeCount, 0);
+  assert.ok(replay.entryRejections.byCode.SIGNAL_TOO_OLD > 0);
 });
 
 test("HARD_BRACKET_HOLD_V1 never recreates break-even, trailing, target extension, or signal exits", () => {

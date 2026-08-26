@@ -184,7 +184,7 @@ function portfolioLimitsInForce(db) {
 
 function clone(value) { return structuredClone(value); }
 
-function executionReport(signal, candle, delayBars) {
+function executionReport(signal, candle, delayBars, strategy) {
   const report = clone(signal);
   const oldEntry = Number(signal.currentPrice);
   const newEntry = Number(candle.open);
@@ -198,7 +198,7 @@ function executionReport(signal, candle, delayBars) {
     delayBars,
     delayMs: Number.isFinite(signalGeneratedAtMs) ? candle.timestamp - signalGeneratedAtMs : null
   };
-  if (signal.version === BREAKOUT_V4_PARAMETERS.version) {
+  if (strategy === "breakout-v4") {
     report.execution = {
       ...report.execution,
       ...resolveBreakoutV4Execution({
@@ -273,10 +273,10 @@ function managePositions(db, report, actions, config) {
   }
 }
 
-function executePending(db, signal, candle, market, actions, config, delayBars, rejectionCounts) {
+function executePending(db, signal, candle, market, actions, config, delayBars, rejectionCounts, strategy) {
   if (!signal || !["LONG", "SHORT"].includes(signal.decision)) return null;
-  const report = executionReport(signal, candle, delayBars);
-  if (signal.version === BREAKOUT_V4_PARAMETERS.version && !report.execution.signalFresh) {
+  const report = executionReport(signal, candle, delayBars, strategy);
+  if (strategy === "breakout-v4" && !report.execution.signalFresh) {
     rejectionCounts.SIGNAL_TOO_OLD = (rejectionCounts.SIGNAL_TOO_OLD ?? 0) + 1;
     actions.push({
       type: "DELAYED_ENTRY_REJECTED",
@@ -562,7 +562,7 @@ export async function runHistoricalReplay(dataset, {
         multiVenueFunding: dataset.multiVenueFunding ?? dataset.multiVenue?.funding ?? []
       });
       if (pending?.remaining === 1) {
-        executePending(db, pending.report, candle, market, actions, config, executionDelayBars, rejectionCounts);
+        executePending(db, pending.report, candle, market, actions, config, executionDelayBars, rejectionCounts, strategy);
         pending = null;
       } else if (pending) pending.remaining -= 1;
       const report = buildReport(strategy, market, parameters, config);

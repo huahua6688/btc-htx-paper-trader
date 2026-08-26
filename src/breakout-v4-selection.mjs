@@ -1,5 +1,6 @@
 import { ema } from "./indicators.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
+import { PAPER_CONFIG } from "./config.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
 const BAR_MS = 15 * 60 * 1000;
@@ -48,6 +49,21 @@ export const BREAKOUT_V4_DEVELOPMENT_SPEC = Object.freeze({
     "lexicographically smaller parameter hash as deterministic tie-break"
   ],
   holdoutPolicy: "No post-cutoff OHLCV value may enter feature, trade, metric or winner selection; this program does not open the immature holdout registry."
+});
+
+export const BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC = Object.freeze({
+  ...BREAKOUT_V4_DEVELOPMENT_SPEC,
+  schemaVersion: 2,
+  developmentRange: Object.freeze({
+    from: "2020-10-21T16:00:00.000Z",
+    to: BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to
+  }),
+  executionModel: Object.freeze({
+    ...BREAKOUT_V4_DEVELOPMENT_SPEC.executionModel,
+    minimumRiskReward: PAPER_CONFIG.minimumRiskReward
+  }),
+  confirmationPolicy: "Proxy candidates that cannot meet the Paper net-RR gate are ineligible. The selected winner must still be rerun through the exact Paper replay core with timestamp-visible Funding and production costs before it is reported as executable evidence.",
+  holdoutPolicy: "Only the extended pre-cutoff development catalog is read. No post-cutoff or immature holdout value may enter feature, trade, metric or winner selection."
 });
 
 export function breakoutV4CandidateGrid(spec = BREAKOUT_V4_DEVELOPMENT_SPEC) {
@@ -165,7 +181,9 @@ function summarizeTrades(trades, spec, start, end) {
 function simulateCandidate(candles, h4, candidate, spec, start, end) {
   const signals = signalsFor(h4, candidate.parameters, start, end);
   const costPct = spec.executionModel.roundTripCostPct;
+  const minimumRiskReward = Number(spec.executionModel.minimumRiskReward);
   const trades = [];
+  let netRrRejectedSignals = 0;
   let position = null;
   for (const candle of candles) {
     const timestamp = Number(candle.timestamp);
@@ -185,13 +203,22 @@ function simulateCandidate(candles, h4, candidate, spec, start, end) {
     if (!position && signal) {
       const direction = signal.side === "LONG" ? 1 : -1;
       const entry = Number(candle.open);
+      const stop = round(entry - direction * signal.riskDistance, 2);
+      const target = round(entry + direction * signal.riskDistance * candidate.parameters.targetRiskMultiple, 2);
+      const stopDistancePct = Math.abs(stop / entry - 1) * 100;
+      const targetDistancePct = Math.abs(target / entry - 1) * 100;
+      const proxyNetRr = (targetDistancePct - costPct) / (stopDistancePct + costPct);
+      if (Number.isFinite(minimumRiskReward) && (!(proxyNetRr >= minimumRiskReward))) {
+        netRrRejectedSignals += 1;
+        continue;
+      }
       position = {
         side: signal.side,
         openedAt: timestamp,
         signalBarTimestamp: signal.signalBarTimestamp,
         entry,
-        stop: round(entry - direction * signal.riskDistance, 2),
-        target: round(entry + direction * signal.riskDistance * candidate.parameters.targetRiskMultiple, 2)
+        stop,
+        target
       };
     }
   }
@@ -204,7 +231,14 @@ function simulateCandidate(candles, h4, candidate, spec, start, end) {
       trades.push({ ...position, closedAt: Number(last.timestamp) + BAR_MS, exit, exitReason: "DEVELOPMENT_END", grossReturnPct, netReturnPct: grossReturnPct - costPct });
     }
   }
-  return { ...candidate, metrics: summarizeTrades(trades, spec, start, end) };
+  return {
+    ...candidate,
+    metrics: {
+      ...summarizeTrades(trades, spec, start, end),
+      netRrRejectedSignals,
+      minimumRiskReward: Number.isFinite(minimumRiskReward) ? minimumRiskReward : null
+    }
+  };
 }
 
 function rankCandidates(left, right) {
