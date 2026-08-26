@@ -118,6 +118,30 @@ export const REPLAY_ASSUMPTIONS = Object.freeze({
   unavailableHistory: "order book/OI/elite/liquidation/basis are null, never synthesized"
 });
 
+/**
+ * 记录本次回放实际生效的组合限制。
+ *
+ * NET 模式下关闭加仓会把 maxOpenPositions 强制成 1（见 runtime-settings.mjs），
+ * 这一条不写进报告，就没人能解释「为什么两年只有二十几笔」。
+ */
+function portfolioLimitsInForce(db) {
+  const settings = db.getRuntimeSettings();
+  const maxOpenPositions = Number(settings.maxOpenPositions);
+  const forcedToSingleSlot = maxOpenPositions === 1
+    && settings.positionMode === "NET"
+    && settings.allowPyramiding !== true;
+  return {
+    maxOpenPositions,
+    positionMode: settings.positionMode,
+    allowPyramiding: settings.allowPyramiding === true,
+    forcedToSingleSlot,
+    note: forcedToSingleSlot
+      ? "NET 模式且未开启加仓：同一时间只能持有一个仓位，持仓期间的新信号会被直接丢弃，成交笔数因此受设置限制而非行情限制"
+      : `同一时间最多 ${maxOpenPositions} 个仓位`,
+    matchesLiveAccount: "UNKNOWN_REPLAY_USES_PAPER_CONFIG_DEFAULTS_NOT_THE_LIVE_ACCOUNT_SETTINGS"
+  };
+}
+
 function clone(value) { return structuredClone(value); }
 
 function executionReport(signal, candle, delayBars) {
@@ -572,6 +596,11 @@ export async function runHistoricalReplay(dataset, {
       // 「合约步进拒绝」和「风险/保证金拒绝」必须分开统计：前者是小账户的粒度问题，
       // 后者才是策略本身的风险约束。混在一起就无法判断 edge 是否存在。
       entryRejections: summarizeEntryRejections(rejectionCounts),
+      // 组合限制会直接决定成交笔数的上限：只有一个仓位槽时，持仓期间的每一个新信号
+      // 都会被丢弃，交易数因此可能被设置卡住而不是被行情卡住。回放用的是
+      // PAPER_CONFIG 默认值，未必等于实盘账户的设置，所以必须如实记录下来，
+      // 否则读者会把「一个槽位的成交笔数」误读成「这套策略的自然频率」。
+      portfolioLimits: portfolioLimitsInForce(db),
       assumptions: { ...REPLAY_ASSUMPTIONS, executionDelayBars },
       pointInTimeGuarantees: {
         closedCandlesOnly: true,

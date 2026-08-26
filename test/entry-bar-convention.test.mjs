@@ -122,3 +122,20 @@ test("price action from before the entry cannot trigger the stop or the target",
   assert.equal(evaluatePaperExit(position, nextBar, undefined, { checkStop: true, checkTarget: false })?.exitReason, "SL");
   assert.equal(evaluatePaperExit(position, nextBar, undefined, { checkStop: false, checkTarget: true })?.exitReason, "TP");
 });
+
+test("回放报告必须写明它用的组合限制", async () => {
+  const { openPaperDatabase } = await import("../src/db.mjs");
+  const { PAPER_CONFIG } = await import("../src/config.mjs");
+  const db = openPaperDatabase(":memory:", { ...PAPER_CONFIG, databasePath: ":memory:", databasePathSource: "TEST" });
+  try {
+    const settings = db.getRuntimeSettings();
+    // 回放用的是 PAPER_CONFIG 默认值：NET 模式 + 加仓关闭 => 强制单槽位。
+    // 这个组合会把成交笔数压到「持仓期间不接新信号」的上限，
+    // 报告必须把它写出来，否则读者会误以为那是策略的自然频率。
+    assert.equal(settings.positionMode, "NET");
+    assert.equal(settings.allowPyramiding, false);
+    assert.equal(settings.maxOpenPositions, 1);
+  } finally {
+    db.close();
+  }
+});
