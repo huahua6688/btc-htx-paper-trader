@@ -4,6 +4,16 @@ const number = (value, digits = 2) => value !== null && value !== undefined && N
 const profitFactor = (value) => value === Infinity ? "∞" : value === null ? "—" : number(value, 2);
 const pct = (value, digits = 2) => value === null || value === undefined ? "—" : `${number(Number(value) * 100, digits)}%`;
 
+// 与 telegram-notifier 的 shanghaiClock 用同一个偏移，避免同一条消息里
+// 出现两种时区读数。返回 UTC+8 的「月-日 时:分」。
+function timeText(timestamp) {
+  const local = new Date(new Date(timestamp).getTime() + 8 * 60 * 60 * 1000);
+  if (!Number.isFinite(local.getTime())) return "—";
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())} `
+    + `${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}`;
+}
+
 function durationText(openedAt, closedAt) {
   const milliseconds = new Date(closedAt).getTime() - new Date(openedAt).getTime();
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
@@ -49,7 +59,9 @@ export function formatOpenTelegram(position) {
     + Number(position.funding_estimate_cny ?? 0)
     + Number(position.slippage_estimate_cny ?? 0);
   return [
-    `${long ? "🟢 模拟开多" : "🔴 模拟开空"}`,
+    // 编号必须出现在开仓消息里：平仓消息用 #id 指认是哪一笔，
+    // 如果开仓时从未印出编号，收到平仓通知时就只能回去翻数据库。
+    `${long ? "🟢 模拟开多" : "🔴 模拟开空"} #${position.id}`,
     `BTC 当前价格：${number(position.signal_entry_price ?? position.entry_price, 1)} USDT`,
     `方向：${long ? "做多" : "做空"}；机会评分 ${number(position.opportunity_score, 1)}`,
     `账户权益：${number(position.account_equity_cny)} CNY`,
@@ -89,6 +101,11 @@ export function formatCloseTelegram(position, exit = null) {
     : null;
   return [
     `${heading} #${position.id}`,
+    // 光有 #id 还不够对上号：把开仓消息里那几个一眼能认出来的字段一起带上，
+    // 这样即使翻不到原始开仓消息，也能直接认出平掉的是哪一笔。
+    `对应开仓：${position.side === "LONG" ? "🟢 开多" : "🔴 开空"} #${position.id}`
+      + `　${number(position.quantity_btc, 8)} BTC　${number(position.leverage, 2)}x`,
+    `开仓时间：${timeText(position.opened_at)}`,
     `平仓原因：${closeReason(position, exit, classification)}`,
     ...(classification === "PROFIT_PROTECT_STOP" ? [`保护止损：${number(position.stop_loss, 1)} USDT`] : []),
     `入场价：${number(position.entry_price, 1)} USDT`,

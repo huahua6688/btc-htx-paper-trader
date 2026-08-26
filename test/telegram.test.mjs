@@ -287,3 +287,54 @@ test("Shanghai summary clock uses UTC+8", () => {
   assert.deepEqual(shanghaiClock("2026-08-21T15:55:00.000Z"), { dayKey: "2026-08-21", minuteOfDay: 23 * 60 + 55 });
   assert.deepEqual(shanghaiClock("2026-08-21T16:00:00.000Z"), { dayKey: "2026-08-22", minuteOfDay: 0 });
 });
+
+test("平仓通知能独立指认是哪一笔开仓", () => {
+  const position = {
+    id: 37,
+    side: "LONG",
+    quantity_btc: 0.009,
+    leverage: 12.5,
+    entry_price: 95_134.2,
+    exit_price: 96_890.1,
+    stop_loss: 94_100,
+    take_profit: 98_900,
+    opened_at: "2026-08-24T02:15:00.000Z",
+    closed_at: "2026-08-24T09:45:00.000Z",
+    exit_reason: "TP",
+    account_equity_cny: 5_000,
+    gross_pnl_cny: 245.3,
+    entry_fee_cny: 5.2,
+    exit_fee_cny: 5.3,
+    funding_cny: -1.04,
+    net_pnl_cny: 233.1,
+    openingReasons: ["4h EMA50 向上"]
+  };
+  const open = formatOpenTelegram(position);
+  const close = formatCloseTelegram(position, null);
+
+  // 开仓消息必须带编号，否则平仓消息里的 #id 在历史记录里无从对应。
+  assert.match(open, /模拟开多 #37/);
+
+  // 平仓消息即使脱离开仓消息，也要能认出方向、数量、杠杆和开仓时间。
+  assert.match(close, /模拟平仓（盈利） #37/);
+  assert.match(close, /对应开仓：🟢 开多 #37/);
+  assert.match(close, /0\.00900000 BTC/);
+  assert.match(close, /12\.50x/);
+  // 开仓时间按 UTC+8 显示，与 shanghaiClock 一致（02:15Z -> 10:15）。
+  assert.match(close, /开仓时间：08-24 10:15/);
+
+  const short = formatCloseTelegram({ ...position, side: "SHORT" }, null);
+  assert.match(short, /对应开仓：🔴 开空 #37/);
+});
+
+test("开仓时间缺失或非法时不会让平仓通知崩掉", () => {
+  const broken = {
+    id: 8, side: "SHORT", quantity_btc: 0.002, leverage: 5,
+    entry_price: 100, exit_price: 95, stop_loss: 105, take_profit: 90,
+    opened_at: "not-a-timestamp", closed_at: "2026-08-24T09:45:00.000Z",
+    exit_reason: "TP", account_equity_cny: 1_000,
+    gross_pnl_cny: 10, entry_fee_cny: 0.1, exit_fee_cny: 0.1,
+    funding_cny: 0, net_pnl_cny: 9.8, openingReasons: []
+  };
+  assert.match(formatCloseTelegram(broken, null), /开仓时间：—/);
+});
