@@ -147,18 +147,28 @@ test("--long-history 才切到扩展规格，默认保持已登记的选参可�
     BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC: extended
   } = await import("../src/breakout-v4-selection.mjs");
 
+  // 不传参数必须拿到旧规格：已登记的 selection hash 依赖它逐字节不变。
   assert.equal(breakoutV4SpecOption({}), base);
   assert.equal(breakoutV4SpecOption({ "long-history": "false" }), base);
   assert.equal(breakoutV4SpecOption({ "long-history": "0" }), base);
+
+  // 显式开启才用扩展规格。
   assert.equal(breakoutV4SpecOption({ "long-history": true }), extended);
   assert.equal(breakoutV4SpecOption({ "long-history": "true" }), extended);
+
+  // 旧规格不得带净 RR 门槛，否则旧的 winner 会被重新筛掉。
   assert.equal(base.executionModel.minimumRiskReward, undefined);
   assert.ok(Number.isFinite(extended.executionModel.minimumRiskReward));
+
+  // 两套规格的开发区间终点必须一致：只有起点前推，cutoff 不能被顺手放宽，
+  // 否则「不打开未成熟 holdout」这条保证就破了。
   assert.equal(extended.developmentRange.to, base.developmentRange.to);
   assert.ok(new Date(extended.developmentRange.from) < new Date(base.developmentRange.from));
 });
 
 test("--retry-unavailable 只清掉保留窗口拒绝的完成标记", async () => {
+  // 模拟 checkpoint 的清理逻辑：只有带 historicalUnavailableReason 的条目会被删，
+  // 真正成功下载过的条目必须原样保留，否则一次开关会让整个目录重下。
   const completed = {
     kline: { at: "2026-08-26T00:00:00.000Z", records: 67104 },
     funding: { at: "2026-08-26T00:00:00.000Z", records: 2098 },
