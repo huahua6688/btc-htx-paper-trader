@@ -361,7 +361,9 @@ function sourceManifest(type, records, {
   payloadHashes = [],
   endpointCoverage = null,
   fetchedAt = null,
-  fetchError = null
+  fetchError = null,
+  historicalUnavailableReason = null,
+  sourceError = null
 } = {}) {
   const capability = HTX_HISTORICAL_CAPABILITIES[type];
   const audit = auditTimedRecords(records, BOUNDED_REQUESTS[type]?.intervalMs ?? null);
@@ -387,8 +389,18 @@ function sourceManifest(type, records, {
     gaps: audit.gaps,
     duplicateEventTimes: audit.duplicates,
     error: fetchError,
+    historicalUnavailableReason,
+    sourceError,
     futureBackfillUsed: false
   };
+}
+
+function boundedRetentionUnavailability(type, error) {
+  const message = String(error?.message ?? error ?? "");
+  if (type === "settlement" && /HTX status=error: Illegal parameter (?:start_time|end_time)\.?/i.test(message)) {
+    return "HTX_RETENTION_BOUNDED_REQUEST_REJECTED";
+  }
+  return null;
 }
 
 export function defaultCatalogDirectory() { return resolveResearchPath("catalog", DATASET_ID); }
@@ -554,6 +566,8 @@ export async function updateHistoricalDataset({
     }
     let result = null;
     let fetchError = null;
+    let historicalUnavailableReason = null;
+    let sourceError = null;
     if (!checkpoint.completed[type]) {
       checkpoint.attempts[type] = Number(checkpoint.attempts[type] ?? 0) + 1;
       try {
@@ -571,19 +585,41 @@ export async function updateHistoricalDataset({
         };
         await saveCheckpoint();
       } catch (error) {
-        fetchError = error.message;
-        fetchErrors.push({ type, error: error.message });
+        sourceError = error.message;
+        historicalUnavailableReason = boundedRetentionUnavailability(type, error);
+        // Every manifest file reference must exist, even when an optional HTX
+        // source is unavailable or temporarily fails.  This keeps a truthful
+        // partial catalog inspectable without fabricating historical records.
+        await writeJsonAtomic(path, records);
+        if (historicalUnavailableReason) {
+          checkpoint.completed[type] = {
+            at: new Date().toISOString(),
+            records: records.length,
+            endpointCoverage: null,
+            rawPayloadHash: null,
+            historicalUnavailableReason,
+            sourceError
+          };
+          await saveCheckpoint();
+        } else {
+          fetchError = error.message;
+          fetchErrors.push({ type, error: error.message });
+        }
       }
     }
     const serialized = `${JSON.stringify(records, null, 2)}\n`;
     const completed = checkpoint.completed[type];
+    historicalUnavailableReason ??= completed?.historicalUnavailableReason ?? null;
+    sourceError ??= completed?.sourceError ?? null;
     sources[type] = sourceManifest(type, records, {
       file: relativeFile,
       fileSha256: await readJson(path, null) ? sha256(serialized) : null,
       payloadHashes: completed?.rawPayloadHash ? [completed.rawPayloadHash] : [],
       endpointCoverage: result?.endpointCoverage ?? completed?.endpointCoverage ?? null,
       fetchedAt: result?.fetchedAt ?? completed?.at ?? null,
-      fetchError
+      fetchError,
+      historicalUnavailableReason,
+      sourceError
     });
     series[type] = records;
   }

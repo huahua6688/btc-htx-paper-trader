@@ -167,6 +167,72 @@ test("HTX settlement history is downloaded into the main catalog without becomin
   }
 });
 
+test("settlement outside HTX retention is truthfully unavailable without blocking a valid candle catalog", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-settlement-retention-"));
+  const fromMs = Date.UTC(2025, 0, 1);
+  const toMs = fromMs + 15 * 60_000;
+  let settlementCalls = 0;
+  const fetchImpl = async (url) => {
+    assert.match(url.pathname, /history\/kline/);
+    return response({ status: "ok", data: [
+      { id: fromMs / 1000, open: 100, high: 102, low: 99, close: 101, amount: 1, vol: 100, trade_turnover: 101, count: 10 },
+      { id: toMs / 1000, open: 101, high: 103, low: 100, close: 102, amount: 1, vol: 100, trade_turnover: 102, count: 10 }
+    ] });
+  };
+  const researchClient = {
+    get: async () => {
+      settlementCalls += 1;
+      throw new Error("HTX status=error: Illegal parameter end_time.");
+    }
+  };
+  const args = {
+    from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), directory,
+    fetchImpl, researchClient, dataTypes: ["kline", "settlement"]
+  };
+  try {
+    const result = await updateHistoricalDataset(args);
+    assert.equal(result.manifest.quality, "VALID");
+    assert.equal(result.manifest.checkpoint.status, "COMPLETE");
+    assert.deepEqual(result.manifest.fetchErrors, []);
+    assert.equal(result.manifest.sources.settlement.availability, "HISTORICAL_UNAVAILABLE_FOR_REQUESTED_RANGE");
+    assert.equal(result.manifest.sources.settlement.provenance, "HISTORICAL_UNAVAILABLE");
+    assert.equal(result.manifest.sources.settlement.historicalUnavailableReason, "HTX_RETENTION_BOUNDED_REQUEST_REJECTED");
+    assert.match(result.manifest.sources.settlement.sourceError, /Illegal parameter end_time/);
+    const loaded = await loadHistoricalDataset(directory);
+    assert.deepEqual(loaded.series.settlement, []);
+
+    await updateHistoricalDataset(args);
+    assert.equal(settlementCalls, 1, "known retention unavailability should be checkpointed idempotently");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an unexpected optional-series failure remains partial but the catalog stays inspectable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "htx-settlement-partial-"));
+  const fromMs = Date.UTC(2025, 0, 1);
+  const toMs = fromMs + 15 * 60_000;
+  const fetchImpl = async () => response({ status: "ok", data: [
+    { id: fromMs / 1000, open: 100, high: 102, low: 99, close: 101, amount: 1, vol: 100, trade_turnover: 101, count: 10 },
+    { id: toMs / 1000, open: 101, high: 103, low: 100, close: 102, amount: 1, vol: 100, trade_turnover: 102, count: 10 }
+  ] });
+  const researchClient = { get: async () => { throw new Error("HTTP 503"); } };
+  try {
+    const result = await updateHistoricalDataset({
+      from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), directory,
+      fetchImpl, researchClient, dataTypes: ["kline", "settlement"]
+    });
+    assert.equal(result.manifest.quality, "DEGRADED");
+    assert.equal(result.manifest.checkpoint.status, "PARTIAL");
+    assert.equal(result.manifest.sources.settlement.availability, "LIVE_FAILURE");
+    assert.equal(result.manifest.fetchErrors.length, 1);
+    const loaded = await loadHistoricalDataset(directory);
+    assert.deepEqual(loaded.series.settlement, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function seeded(seed) {
   let state = seed >>> 0;
   return () => {
