@@ -292,6 +292,30 @@ async function multiVenueUpdate(args) {
  * 可用 --reference-capital=50000 指定金额。参考资金只用于判断 edge 是否存在，
  * 永远不会改变生产 Paper 账户。
  */
+/**
+ * 解析 --max-open-positions / --position-mode / --allow-pyramiding。
+ *
+ * 一个都不给就返回 null，回放沿用默认单槽位，既有结果保持可复现。
+ * 给了才覆盖 —— 用来按真实账户的组合限制重新测一遍。
+ */
+export function portfolioOptions(args) {
+  const portfolio = {};
+  if (args["max-open-positions"] !== undefined) {
+    const limit = Math.trunc(Number(args["max-open-positions"]));
+    if (!Number.isFinite(limit) || limit < 1) throw new Error("--max-open-positions 必须是不小于 1 的整数");
+    portfolio.maxOpenPositions = limit;
+  }
+  if (args["position-mode"] !== undefined) {
+    const mode = String(args["position-mode"]).toUpperCase();
+    if (!["NET", "HEDGE"].includes(mode)) throw new Error("--position-mode 只接受 NET 或 HEDGE");
+    portfolio.positionMode = mode;
+  }
+  if (args["allow-pyramiding"] !== undefined) {
+    portfolio.allowPyramiding = !["0", "false", "no"].includes(String(args["allow-pyramiding"]).toLowerCase());
+  }
+  return Object.keys(portfolio).length ? portfolio : null;
+}
+
 export function capitalOptions(args) {
   const raw = String(args.capital ?? "").toUpperCase();
   const capitalProfile = ["REFERENCE", "EDGE", "EDGE_REFERENCE_CAPITAL"].includes(raw)
@@ -396,10 +420,19 @@ async function replay(args) {
     parameters: defaultParametersFor(strategy),
     ...selected,
     ...capital,
+    portfolio: portfolioOptions(args),
     outputDirectory: directory
   });
   const path = await save(join(directory, `${strategy}-replay.json`), report);
-  process.stdout.write(`${JSON.stringify({ path, compact: compactReplay(report), capital: report.capital, entryRejections: report.entryRejections }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({
+    path,
+    compact: compactReplay(report),
+    capital: report.capital,
+    // 仓位上限直接决定成交笔数的上限，必须和收益一起显示，
+    // 否则「两年只有二十几笔」会被误读成策略的自然频率。
+    portfolioLimits: report.portfolioLimits,
+    entryRejections: report.entryRejections
+  }, null, 2)}\n`);
   return { dataset, report, directory };
 }
 

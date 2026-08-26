@@ -308,6 +308,16 @@ SHADOW_DB_PATH=/var/lib/btc-htx-paper/shadow-challenger.sqlite
 
 当 active Shadow 是 Breakout V4 时，monitor 会在每个 4h 收盘边界增加一次墙钟唤醒；5/15/60/240 分钟的常规轮询设置仍保留，但不会再让较长周期静默跳过固定 5 分钟 signal-age 窗口。相同 4h signal bar 由持久化 signal key 幂等去重。
 
+回放默认使用 `PAPER_CONFIG` 的组合限制：NET 模式、关闭加仓，因此 `maxOpenPositions` 被强制为 1。
+单槽位下持仓期间的新信号会被直接丢弃，成交笔数可能受设置限制而非行情限制，报告的 `portfolioLimits`
+会如实写明这一点。实盘账户的设置未必相同；要按真实账户重测，用：
+
+```bash
+npm run replay -- --strategy=breakout-v4 --max-open-positions=4 --allow-pyramiding=true
+```
+
+不传这些参数时行为与既往逐字节一致，已记录的研究数字保持可复现。
+
 这次额外唤醒只运行 Shadow，不运行 V1.2 生产周期：启用一个研究 Shadow 不会改变冻结 Champion 的评估节奏。生产仍然严格按管理员选定的间隔执行。
 
 所有策略的入场 K 线格统一由 `src/execution-timing.mjs` 按「执行观察时刻所在的 15 分钟格」解析。研究策略使用已收盘视图，其 `latest15mBar` 比入场那一格更早，因此不能直接当作 `entry_bar_ts`，否则 `paper-engine` 的回溯保护会放行入场之前的价格走势去触发 SL/TP。
