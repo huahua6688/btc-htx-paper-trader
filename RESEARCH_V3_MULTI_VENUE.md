@@ -50,3 +50,33 @@ npm run research:v3 -- --iterations=1000 --capital=reference --reference-capital
 资金视角由 `--capital` / `--reference-capital` 统一传入，baseline、candidate、跨场所消融、Purged OOS 与
 稳健性使用同一套口径，并写入报告的 `capitalView`；不指定时全部回落到生产资金视角。
 省略这两个参数会得到与上面命令不同的数字，因为那是另一套资金口径，不是结果不稳定。
+
+## Breakout V4 选参规格
+
+`npm run research:v4-select` 默认使用 schemaVersion 1（开发区间自 2024-09），
+已登记的 selection hash 因此保持逐字节可复现。
+
+加 `--long-history` 切到 schemaVersion 2：
+
+```bash
+npm run research:v4-select -- --long-history
+npm run research:v4-lookahead -- --long-history
+```
+
+两者的差别：
+
+- 开发区间起点前推到 `2020-10-21`；**终点不变**，不打开未成熟 holdout。
+- 候选必须通过真实 Paper 的净 RR 门槛；过不了的直接没有参选资格，
+  被拒的信号数记在 `metrics.netRrRejectedSignals`。
+
+选参与前视审计由同一个 `breakoutV4SpecOption` 解析规格，两者的 cutoff 永远一致；
+报告会写明本次用的 `spec.schemaVersion` 与开发区间。
+
+两套规格的胜出参数可能不同。**只看 winner 而不看用了哪套规则，是无法解释的数字。**
+
+若某个数据源因 HTX 保留窗口被拒，目录会记 `HTX_RETENTION_BOUNDED_REQUEST_REJECTED`
+并按 0 条继续，不阻塞其余类型；同一区间不再重复请求。HTX 日后放宽保留窗口时用：
+
+```bash
+npm run data:update -- --from=... --to=... --retry-unavailable
+```

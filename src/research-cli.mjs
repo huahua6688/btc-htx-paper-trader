@@ -49,6 +49,7 @@ import {
 } from "./htx-download-center.mjs";
 import {
   BREAKOUT_V4_DEVELOPMENT_SPEC,
+  BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   runBreakoutV4DevelopmentSelection
 } from "./breakout-v4-selection.mjs";
 
@@ -178,6 +179,9 @@ async function dataUpdate(args, defaults = null) {
     ...selected,
     directory: args.catalog ?? defaultCatalogDirectory(),
     concurrency: Number(args.concurrency ?? 3),
+    // --retry-unavailable：重试上次因 HTX 保留窗口被拒的数据源。
+    retryUnavailable: args["retry-unavailable"] !== undefined
+      && !["0", "false", "no"].includes(String(args["retry-unavailable"]).toLowerCase()),
     onProgress: (item) => {
       const message = item.type === "kline" ? `Kline ${item.completed}/${item.total}` : `Funding page ${item.completed}`;
       if (message !== lastProgress) process.stderr.write(`${message}\n`);
@@ -225,19 +229,46 @@ async function downloadCenterFetch(args) {
   return { ...result, archive };
 }
 
+/**
+ * 选参规格：默认沿用 schemaVersion 1，已登记的 selection hash 因此保持可复现。
+ * `--long-history` 切到 schemaVersion 2：开发区间前推到 2020-10，并且候选必须
+ * 通过真实 Paper 的净 RR 门槛。
+ *
+ * 两者必须由同一个函数解析：选参和前视审计如果各自认一个 cutoff，
+ * 审计就会在选参没读过的区间上做检查，等于没审。
+ */
+export function breakoutV4SpecOption(args) {
+  return args["long-history"] !== undefined
+    && !["0", "false", "no"].includes(String(args["long-history"]).toLowerCase())
+    ? BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC
+    : BREAKOUT_V4_DEVELOPMENT_SPEC;
+}
+
 async function breakoutV4Select(args) {
   const dataset = await load(args);
-  const report = runBreakoutV4DevelopmentSelection(dataset);
+  const spec = breakoutV4SpecOption(args);
+  const report = runBreakoutV4DevelopmentSelection(dataset, { spec });
   const directory = resolveOutputPath(runId("breakout-v4-development-selection"));
   await mkdir(directory, { recursive: true });
   const reportPath = await save(join(directory, "selection.json"), report);
-  process.stdout.write(`${JSON.stringify({ directory, reportPath, winner: report.winner, isolation: report.isolation, search: report.search, selectionHash: report.selectionHash }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({
+    directory,
+    reportPath,
+    // 规格必须和结果一起显示：两个 spec 的 winner 可以不同，
+    // 只看 winner 而不知道用了哪套规则，等于拿到一个无法解释的数字。
+    spec: { schemaVersion: spec.schemaVersion ?? 1, developmentRange: spec.developmentRange },
+    winner: report.winner,
+    isolation: report.isolation,
+    search: report.search,
+    selectionHash: report.selectionHash
+  }, null, 2)}\n`);
   return { dataset, report, directory, reportPath };
 }
 
 async function breakoutV4Lookahead(args) {
   const dataset = await load(args);
-  const cutoff = new Date(BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+  const spec = breakoutV4SpecOption(args);
+  const cutoff = new Date(spec.developmentRange.to).getTime();
   const barMs = 15 * 60 * 1000;
   const development = {
     ...dataset,
@@ -250,7 +281,8 @@ async function breakoutV4Lookahead(args) {
   };
   const report = runLookaheadAudit(development, { strategies: ["breakout-v4"], parameters: BREAKOUT_V4_PARAMETERS });
   report.developmentOnly = true;
-  report.developmentCutoff = BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to;
+  report.developmentCutoff = spec.developmentRange.to;
+  report.specSchemaVersion = spec.schemaVersion ?? 1;
   report.holdoutOpened = false;
   const directory = resolveOutputPath(runId("breakout-v4-lookahead"));
   await mkdir(directory, { recursive: true });
