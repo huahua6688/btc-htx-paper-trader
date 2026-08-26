@@ -81,7 +81,7 @@ const MARGIN_CODES = new Set([
   "PORTFOLIO_NOTIONAL_BUDGET_EXHAUSTED"
 ]);
 
-function summarizeEntryRejections(rejectionCounts) {
+export function summarizeEntryRejections(rejectionCounts) {
   const total = Object.values(rejectionCounts).reduce((sum, value) => sum + value, 0);
   const bucket = (codes) => Object.entries(rejectionCounts)
     .filter(([code]) => codes.has(code))
@@ -94,7 +94,12 @@ function summarizeEntryRejections(rejectionCounts) {
     marginRejections: bucket(MARGIN_CODES),
     netRrRejections: (rejectionCounts.NO_TARGET_MEETS_NET_RR ?? 0) + (rejectionCounts.NET_RR_BELOW_MINIMUM ?? 0),
     liquidationBufferRejections: (rejectionCounts.STOP_BEYOND_LIQUIDATION_BUFFER ?? 0)
-      + (rejectionCounts.PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER ?? 0)
+      + (rejectionCounts.PORTFOLIO_STOP_BEYOND_LIQUIDATION_BUFFER ?? 0),
+    // 这两类不是「策略/账户拒绝了这笔交易」，而是「组合已经装不下了」。
+    // 必须与风险类拒绝分开，否则会把「车位不够」误读成「策略挑剔」。
+    portfolioCapacityRejections: (rejectionCounts.NO_POSITION_SLOT_AVAILABLE ?? 0)
+      + (rejectionCounts.EXECUTION_ALREADY_PENDING ?? 0),
+    duplicateSignalBarRejections: rejectionCounts.DUPLICATE_SIGNAL_BAR ?? 0
   };
 }
 
@@ -118,12 +123,6 @@ export const REPLAY_ASSUMPTIONS = Object.freeze({
   unavailableHistory: "order book/OI/elite/liquidation/basis are null, never synthesized"
 });
 
-/**
- * 记录本次回放实际生效的组合限制。
- *
- * NET 模式下关闭加仓会把 maxOpenPositions 强制成 1（见 runtime-settings.mjs），
- * 这一条不写进报告，就没人能解释「为什么两年只有二十几笔」。
- */
 /**
  * 让回放能按真实账户的组合限制重跑。
  *
@@ -159,6 +158,12 @@ function applyPortfolioOverride(db, portfolio) {
   }
 }
 
+/**
+ * 记录本次回放实际生效的组合限制。
+ *
+ * NET 模式下关闭加仓会把 maxOpenPositions 强制成 1（见 runtime-settings.mjs），
+ * 这一条不写进报告，就没人能解释「为什么两年只有二十几笔」。
+ */
 function portfolioLimitsInForce(db) {
   const settings = db.getRuntimeSettings();
   const maxOpenPositions = Number(settings.maxOpenPositions);
@@ -538,6 +543,9 @@ export async function runHistoricalReplay(dataset, {
   const decisionCounts = { LONG: 0, SHORT: 0, WAIT: 0 };
   const candidateDecisionCounts = { LONG: 0, SHORT: 0, WAIT: 0 };
   let pending = null;
+  // 回放期间设置不会变，读一次即可；逐事件查 SQLite 会白白拖慢六万多次循环。
+  // 默认是 1，`length >= 1` 与原来的 `length === 0` 完全等价，既有结果逐字节不变。
+  const replayMaxOpenPositions = Math.max(1, Math.trunc(Number(db.getRuntimeSettings().maxOpenPositions) || 1));
   const seenSignalKeys = new Set();
   let lastReport = null;
   try {
@@ -594,8 +602,21 @@ export async function runHistoricalReplay(dataset, {
         validForEntry: report.dataQuality.validForEntry,
         riskGates: report.riskGates
       });
-      if (!duplicateSignalBar && !pending && ["LONG", "SHORT"].includes(report.decision) && db.getOpenPositions().length === 0) {
-        pending = { report: clone(report), remaining: executionDelayBars };
+      // 仓位槽必须按运行时设置判断，不能写死「必须空仓」：写死之后
+      // maxOpenPositions 对回放毫无作用，报告却仍会显示用户请求的上限，
+      // 那是一份自相矛盾的报告。
+      //
+      // 而且被这里丢掉的信号此前完全不留痕：它们没走到 evaluatePaperEntry，
+      // 所以 entryRejections 是 0，读者看到「228 个信号、28 笔成交、0 次拒绝」
+      // 无从解释中间那 200 个去哪了。现在两种丢弃都单独计数。
+      if (!duplicateSignalBar && ["LONG", "SHORT"].includes(report.decision)) {
+        if (pending) {
+          rejectionCounts.EXECUTION_ALREADY_PENDING = (rejectionCounts.EXECUTION_ALREADY_PENDING ?? 0) + 1;
+        } else if (db.getOpenPositions().length >= replayMaxOpenPositions) {
+          rejectionCounts.NO_POSITION_SLOT_AVAILABLE = (rejectionCounts.NO_POSITION_SLOT_AVAILABLE ?? 0) + 1;
+        } else {
+          pending = { report: clone(report), remaining: executionDelayBars };
+        }
       }
       lastReport = report;
     }

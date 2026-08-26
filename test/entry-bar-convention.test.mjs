@@ -172,3 +172,39 @@ test("回放可以按真实账户的仓位上限重跑，且默认完全不变",
     4
   );
 });
+
+test("回放的仓位槽按运行时设置判断，默认与原来的「必须空仓」等价", () => {
+  // 排队门禁的取值表。上限为 1 时必须与写死的 `openPositions.length === 0` 逐一相同，
+  // 否则所有既有回放结果都会漂移。
+  const canQueue = (openCount, maxOpenPositions) => openCount < maxOpenPositions;
+  for (const openCount of [0, 1, 2, 3, 4, 5]) {
+    assert.equal(canQueue(openCount, 1), openCount === 0, `上限 1、持仓 ${openCount} 时与原逻辑不一致`);
+  }
+  // 上限提高后必须真的能排队，否则 --max-open-positions 只是一个不起作用的展示值。
+  assert.equal(canQueue(1, 4), true);
+  assert.equal(canQueue(3, 4), true);
+  assert.equal(canQueue(4, 4), false);
+});
+
+test("组合容量拒绝与风险拒绝分开统计", async () => {
+  const { summarizeEntryRejections } = await import("../src/replay-engine.mjs");
+  const summary = summarizeEntryRejections({
+    NO_POSITION_SLOT_AVAILABLE: 180,
+    EXECUTION_ALREADY_PENDING: 20,
+    DUPLICATE_SIGNAL_BAR: 5,
+    BELOW_MIN_CONTRACT_STEP: 3,
+    RISK_BUDGET_EXCEEDED: 2
+  });
+  // 「车位不够」「已有待执行信号」属于组合容量，不是策略或账户挑剔，
+  // 混进风险类会让人把设置限制误读成策略行为。
+  assert.equal(summary.portfolioCapacityRejections, 200);
+  assert.equal(summary.duplicateSignalBarRejections, 5);
+  assert.equal(summary.riskRejections, 2);
+  assert.equal(summary.contractStepRejections, 3);
+  assert.equal(summary.total, 210);
+
+  // 一个都没有时必须是 0，不能是 undefined —— 报告要能直接相加。
+  const empty = summarizeEntryRejections({});
+  assert.equal(empty.portfolioCapacityRejections, 0);
+  assert.equal(empty.duplicateSignalBarRejections, 0);
+});
