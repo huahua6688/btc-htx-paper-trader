@@ -66,3 +66,25 @@ test("the extra 4h wake runs the Shadow alone and never re-times the frozen Cham
     }).shadowOnly, false, `${strategyType} 不该触发额外唤醒`);
   }
 });
+
+test("Shadow 日志标签必须反映真正在跑的策略", () => {
+  // monitor.mjs:33 的取值链路。有 active 配置时不得回退到 SHADOW_CONFIG 的常量，
+  // 否则日志会声称在跑 challenger-technical-v1，而实际跑的是配置指定的策略。
+  const SHADOW_DEFAULT = "challenger-technical-v1";
+  const label = (activeShadow) => (activeShadow
+    ? (activeShadow.version ?? activeShadow.strategyType)
+    : SHADOW_DEFAULT);
+
+  // 只写 strategyType（最常见的手写配置）也必须显示成 breakout-v4。
+  assert.equal(label({ strategyType: "breakout-v4", paperOnly: true }), "breakout-v4");
+  assert.equal(label({ strategyType: "multi-venue-v3", paperOnly: true }), "multi-venue-v3");
+  // 显式写了 version 就用 version。
+  assert.equal(label({ strategyType: "breakout-v4", version: "breakout-challenger-v4.0.0" }), "breakout-challenger-v4.0.0");
+  // 没有 active 配置时才用默认常量。
+  assert.equal(label(null), SHADOW_DEFAULT);
+
+  // 打印时以策略自报的 version 为准：配置里的名字只是标签。
+  const printed = (report, fallback) => report.version ?? fallback;
+  assert.equal(printed({ version: "breakout-challenger-v4.0.0" }, "breakout-v4"), "breakout-challenger-v4.0.0");
+  assert.equal(printed({}, "breakout-v4"), "breakout-v4");
+});
