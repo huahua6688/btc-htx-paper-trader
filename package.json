@@ -42,6 +42,7 @@
     "research:v2": "node src/research-cli.mjs research:v2",
     "research:v3": "node src/research-cli.mjs research:v3",
     "research:v4-select": "node src/research-cli.mjs research:v4-select",
+    "research:v4-paper-select": "node src/research-cli.mjs research:v4-paper-select",
     "research:v4-lookahead": "node src/research-cli.mjs research:v4-lookahead",
     "research:runs": "node src/research-cli.mjs research:runs",
     "research:register-candidate": "node src/research-cli.mjs research:register-candidate",

@@ -1,6 +1,7 @@
 import { ema } from "./indicators.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
+import { CAPITAL_PROFILES, runHistoricalReplay } from "./replay-engine.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
 const BAR_MS = 15 * 60 * 1000;
@@ -64,6 +65,45 @@ export const BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC = Object.freeze({
   }),
   confirmationPolicy: "Proxy candidates that cannot meet the Paper net-RR gate are ineligible. The selected winner must still be rerun through the exact Paper replay core with timestamp-visible Funding and production costs before it is reported as executable evidence.",
   holdoutPolicy: "Only the extended pre-cutoff development catalog is read. No post-cutoff or immature holdout value may enter feature, trade, metric or winner selection."
+});
+
+export const BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC = Object.freeze({
+  ...BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
+  schemaVersion: 3,
+  selectionEngine: "EXACT_PAPER_CONTINUOUS_REPLAY_WITH_CHRONOLOGICAL_TRADE_SEGMENTS",
+  executionModel: Object.freeze({
+    strategy: "breakout-v4",
+    signal: "completed 4h bar only",
+    entry: "BREAKOUT_V4_FIRST_OBSERVATION_V1; next visible 15m open",
+    executionDelayBars: 1,
+    eventStride: 1,
+    costs: "PAPER_CONFIG fees, slippage and timestamp-visible Funding",
+    capitalProfile: CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
+    initialCapitalCny: PAPER_CONFIG.initialCapitalCny,
+    portfolio: Object.freeze({ maxOpenPositions: 1, positionMode: "NET", allowPyramiding: false }),
+    forceCloseAtDevelopmentEnd: true
+  }),
+  eligibility: Object.freeze({
+    minimumTrades: 40,
+    minimumTradesPerChronologicalSegment: 8,
+    chronologicalSegments: 4,
+    minimumPositiveSegments: 3,
+    minimumFullProfitFactor: 1.05,
+    maximumFullDrawdownPct: 25,
+    maximumSinglePositiveSegmentSharePct: 70
+  }),
+  selectionOrder: Object.freeze([
+    "eligible exact-Paper candidates before ineligible candidates",
+    "more positive chronological development segments",
+    "higher worst-segment exact-Paper net return",
+    "lower concentration in the single best positive segment",
+    "higher full-development exact-Paper profit factor",
+    "higher full-development exact-Paper net return",
+    "lower full-development exact-Paper maximum drawdown",
+    "lexicographically smaller parameter hash as deterministic tie-break"
+  ]),
+  confirmationPolicy: "Every grid candidate is executed through the exact Paper replay core. If no candidate passes all predeclared stability gates, the program returns no winner; it never promotes the least-bad candidate.",
+  holdoutPolicy: "The exact-Paper selector creates a cutoff-filtered in-memory dataset before replay. No post-cutoff candle, Funding, auxiliary series or multi-venue observation is passed to any candidate, and the immature holdout registry is never opened."
 });
 
 export function breakoutV4CandidateGrid(spec = BREAKOUT_V4_DEVELOPMENT_SPEC) {
@@ -301,6 +341,224 @@ export function runBreakoutV4DevelopmentSelection(dataset, { spec = BREAKOUT_V4_
       metrics: winner.metrics,
       matchesCommittedBreakoutV4: winner.parameterHash === expectedWinner
     },
+    candidates: ranked.map((item) => ({
+      rank: item.rank,
+      parameters: {
+        breakoutLookback4h: item.parameters.breakoutLookback4h,
+        stopAtrMultiple: item.parameters.stopAtrMultiple,
+        targetRiskMultiple: item.parameters.targetRiskMultiple,
+        trendFilter: item.parameters.trendFilter
+      },
+      parameterHash: item.parameterHash,
+      metrics: item.metrics
+    }))
+  };
+  result.selectionHash = hashObject({ ...result, selectionHash: undefined });
+  return result;
+}
+
+function timestampOf(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function cutoffVisibleRows(rows, cutoff) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((item) => {
+    const visibleAt = timestampOf(item?.visibleAt ?? item?.eventTime ?? item?.timestamp);
+    return visibleAt !== null && visibleAt <= cutoff;
+  });
+}
+
+export function exactPaperDevelopmentDataset(dataset, spec = BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC) {
+  if (!Array.isArray(dataset?.candles)) throw new Error("Breakout V4 exact-Paper selection requires catalog candles");
+  const start = new Date(spec.developmentRange.from).getTime();
+  const cutoff = new Date(spec.developmentRange.to).getTime();
+  const candles = dataset.candles.filter((item) => {
+    const timestamp = timestampOf(item?.timestamp);
+    return timestamp !== null && timestamp >= start && timestamp + BAR_MS <= cutoff;
+  });
+  if (!candles.length) throw new Error("No completed exact-Paper development candles before the fixed cutoff");
+  const series = Object.fromEntries(Object.entries(dataset.series ?? {}).map(([key, rows]) => [key, cutoffVisibleRows(rows, cutoff)]));
+  const multiVenueFunding = cutoffVisibleRows(dataset.multiVenueFunding ?? dataset.multiVenue?.funding ?? [], cutoff);
+  return {
+    ...dataset,
+    manifest: {
+      ...(dataset.manifest ?? {}),
+      requestedCoverage: {
+        from: spec.developmentRange.from,
+        to: new Date(cutoff - BAR_MS).toISOString()
+      }
+    },
+    candles,
+    funding: cutoffVisibleRows(dataset.funding ?? [], cutoff),
+    series,
+    multiVenueFunding,
+    multiVenue: dataset.multiVenue ? { ...dataset.multiVenue, funding: multiVenueFunding } : dataset.multiVenue
+  };
+}
+
+function paperProfitFactor(netResults) {
+  const profits = netResults.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
+  const losses = Math.abs(netResults.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
+  return losses > 0 ? round(profits / losses, 8) : profits > 0 ? Number.MAX_SAFE_INTEGER : 0;
+}
+
+function paperSegmentMetrics(trades, initialCapitalCny, index) {
+  const netResults = trades.map((trade) => Number(trade.net_pnl_cny ?? 0));
+  const netPnlCny = netResults.reduce((sum, value) => sum + value, 0);
+  const grossPnlCny = trades.reduce((sum, trade) => sum + Number(trade.gross_pnl_cny ?? 0), 0);
+  const profitFactor = paperProfitFactor(netResults);
+  return {
+    index,
+    tradeCount: trades.length,
+    wins: netResults.filter((value) => value > 0).length,
+    netPnlCny: round(netPnlCny, 8),
+    netReturnPct: round(netPnlCny / initialCapitalCny * 100, 8),
+    grossPnlCny: round(grossPnlCny, 8),
+    totalCostsCny: round(grossPnlCny - netPnlCny, 8),
+    profitFactor,
+    expectancyCny: trades.length ? round(netPnlCny / trades.length, 8) : 0,
+    positive: netPnlCny > 0 && profitFactor > 1
+  };
+}
+
+export function summarizeExactPaperCandidate(replay, spec = BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC) {
+  const start = timestampOf(replay.effectiveRange?.from) ?? new Date(spec.developmentRange.from).getTime();
+  const end = timestampOf(replay.effectiveRange?.to) ?? new Date(spec.developmentRange.to).getTime();
+  const segmentTrades = Array.from({ length: spec.eligibility.chronologicalSegments }, () => []);
+  for (const trade of replay.trades ?? []) {
+    const openedAt = timestampOf(trade.opened_at);
+    if (openedAt === null || openedAt < start || openedAt > end) continue;
+    segmentTrades[segmentIndex(openedAt, start, end, segmentTrades.length)].push(trade);
+  }
+  const initialCapitalCny = Number(replay.capital?.initialCapitalCny ?? spec.executionModel.initialCapitalCny);
+  const segments = segmentTrades.map((trades, index) => paperSegmentMetrics(trades, initialCapitalCny, index));
+  const positiveSegmentPnl = segments.filter((item) => item.netPnlCny > 0).map((item) => item.netPnlCny);
+  const totalPositiveSegmentPnl = positiveSegmentPnl.reduce((sum, value) => sum + value, 0);
+  const largestPositiveSegmentSharePct = totalPositiveSegmentPnl > 0
+    ? round(Math.max(...positiveSegmentPnl) / totalPositiveSegmentPnl * 100, 8)
+    : 100;
+  const performance = replay.performance ?? {};
+  const tradeCount = Number(performance.totalTrades ?? replay.tradeCount ?? 0);
+  const rawProfitFactor = Number(performance.profitFactor ?? 0);
+  const profitFactor = Number.isFinite(rawProfitFactor) ? rawProfitFactor : Number.MAX_SAFE_INTEGER;
+  const maxDrawdownPct = Number(performance.maxDrawdownPct ?? 0);
+  const positiveSegments = segments.filter((item) => item.positive).length;
+  const eligibilityReasons = [];
+  if (tradeCount < spec.eligibility.minimumTrades) eligibilityReasons.push("MINIMUM_TRADES_NOT_MET");
+  if (segments.some((item) => item.tradeCount < spec.eligibility.minimumTradesPerChronologicalSegment)) eligibilityReasons.push("MINIMUM_TRADES_PER_SEGMENT_NOT_MET");
+  if (positiveSegments < spec.eligibility.minimumPositiveSegments) eligibilityReasons.push("MINIMUM_POSITIVE_SEGMENTS_NOT_MET");
+  if (!(profitFactor >= spec.eligibility.minimumFullProfitFactor)) eligibilityReasons.push("MINIMUM_FULL_PROFIT_FACTOR_NOT_MET");
+  if (!(maxDrawdownPct <= spec.eligibility.maximumFullDrawdownPct)) eligibilityReasons.push("MAXIMUM_FULL_DRAWDOWN_EXCEEDED");
+  if (!(largestPositiveSegmentSharePct <= spec.eligibility.maximumSinglePositiveSegmentSharePct)) eligibilityReasons.push("SINGLE_SEGMENT_PROFIT_CONCENTRATION_EXCEEDED");
+  return {
+    executionMode: "EXACT_PAPER",
+    eligible: eligibilityReasons.length === 0,
+    eligibilityReasons,
+    tradeCount,
+    wins: Number(performance.wins ?? 0),
+    netReturnPct: Number(performance.cumulativeReturnPct ?? 0),
+    netPnlCny: Number(performance.cumulativePnlCny ?? 0),
+    profitFactor,
+    expectancyCny: Number(performance.expectancyCny ?? 0),
+    tradeSharpe: performance.tradeSharpe ?? null,
+    maxDrawdownPct,
+    totalCostsCny: Number(performance.totalCostsCny ?? 0),
+    positiveSegments,
+    worstSegmentNetReturnPct: round(Math.min(...segments.map((item) => item.netReturnPct)), 8),
+    largestPositiveSegmentSharePct,
+    entryRejections: replay.entryRejections ?? null,
+    portfolioLimits: replay.portfolioLimits ?? null,
+    segments
+  };
+}
+
+function rankExactPaperCandidates(left, right) {
+  const a = left.metrics;
+  const b = right.metrics;
+  if (a.eligible !== b.eligible) return a.eligible ? -1 : 1;
+  if (a.positiveSegments !== b.positiveSegments) return b.positiveSegments - a.positiveSegments;
+  if (a.worstSegmentNetReturnPct !== b.worstSegmentNetReturnPct) return b.worstSegmentNetReturnPct - a.worstSegmentNetReturnPct;
+  if (a.largestPositiveSegmentSharePct !== b.largestPositiveSegmentSharePct) return a.largestPositiveSegmentSharePct - b.largestPositiveSegmentSharePct;
+  if (a.profitFactor !== b.profitFactor) return b.profitFactor - a.profitFactor;
+  if (a.netReturnPct !== b.netReturnPct) return b.netReturnPct - a.netReturnPct;
+  if (a.maxDrawdownPct !== b.maxDrawdownPct) return a.maxDrawdownPct - b.maxDrawdownPct;
+  return left.parameterHash.localeCompare(right.parameterHash);
+}
+
+export async function runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+  spec = BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC,
+  candidates = breakoutV4CandidateGrid(spec),
+  replayRunner = runHistoricalReplay,
+  onProgress = null
+} = {}) {
+  if (!candidates.length) throw new Error("Breakout V4 exact-Paper selection requires at least one candidate");
+  const developmentDataset = exactPaperDevelopmentDataset(dataset, spec);
+  const developmentStart = new Date(spec.developmentRange.from).getTime();
+  const developmentEnd = new Date(spec.developmentRange.to).getTime();
+  const evaluated = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const replay = await replayRunner(developmentDataset, {
+      strategy: "breakout-v4",
+      parameters: candidate.parameters,
+      from: new Date(developmentStart).toISOString(),
+      to: new Date(developmentEnd - BAR_MS).toISOString(),
+      eventStride: spec.executionModel.eventStride,
+      executionDelayBars: spec.executionModel.executionDelayBars,
+      collectTrace: false,
+      forceCloseAtEnd: spec.executionModel.forceCloseAtDevelopmentEnd,
+      capitalProfile: spec.executionModel.capitalProfile,
+      portfolio: spec.executionModel.portfolio
+    });
+    evaluated.push({
+      ...candidate,
+      metrics: summarizeExactPaperCandidate(replay, spec)
+    });
+    onProgress?.({ completed: index + 1, total: candidates.length, parameterHash: candidate.parameterHash });
+  }
+  const ranked = evaluated.sort(rankExactPaperCandidates).map((item, index) => ({ rank: index + 1, ...item }));
+  const winner = ranked.find((item) => item.metrics.eligible) ?? null;
+  const expectedWinner = hashObject(BREAKOUT_V4_PARAMETERS);
+  const candidateSummary = (item) => item ? {
+    rank: item.rank,
+    parameters: item.parameters,
+    parameterHash: item.parameterHash,
+    metrics: item.metrics,
+    matchesCommittedBreakoutV4: item.parameterHash === expectedWinner
+  } : null;
+  const result = {
+    schemaVersion: 1,
+    runType: "BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+    selectionStatus: winner ? "ELIGIBLE_WINNER_FOUND" : "NO_ELIGIBLE_WINNER",
+    strategyRoleAfterSelection: "RESEARCH_SHADOW_CANDIDATE",
+    championChanged: false,
+    spec,
+    specHash: hashObject(spec),
+    datasetManifestHash: dataset.manifest?.manifestHash ?? null,
+    isolation: {
+      holdoutOpened: false,
+      postCutoffOutcomeFieldsRead: false,
+      developmentCutoff: spec.developmentRange.to,
+      maximumCandleOpenRead: new Date(developmentDataset.candles.at(-1).timestamp).toISOString(),
+      maximumCandleVisibleAtRead: new Date(developmentDataset.candles.at(-1).timestamp + BAR_MS).toISOString(),
+      fundingRowsPassedToReplay: developmentDataset.funding.length,
+      maximumFundingTimestampRead: developmentDataset.funding.length
+        ? new Date(Math.max(...developmentDataset.funding.map((item) => timestampOf(item.timestamp)))).toISOString()
+        : null
+    },
+    search: {
+      candidateCount: ranked.length,
+      exactPaperCandidateCount: ranked.length,
+      candidateGridHash: hashObject(candidates.map((item) => item.parameterHash)),
+      eligibleCandidateCount: ranked.filter((item) => item.metrics.eligible).length,
+      rankingPolicy: spec.selectionOrder
+    },
+    winner: candidateSummary(winner),
+    bestObservedCandidate: candidateSummary(ranked[0]),
     candidates: ranked.map((item) => ({
       rank: item.rank,
       parameters: {

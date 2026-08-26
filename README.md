@@ -224,6 +224,7 @@ npm run data:inspect
 
 # V4 参数选择和前视审计只使用固定 development cutoff，不读取未成熟 holdout
 npm run research:v4-select
+npm run research:v4-paper-select -- --catalog=/path/to/pre-cutoff-long-history-catalog
 npm run research:v4-lookahead
 
 # 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
@@ -269,6 +270,8 @@ npm run edge:pipeline -- --diagnosis=<challenger-diagnosis.json> --ablation=<fea
 # 使用源码中预先声明的完整连续区间运行整套研究验收
 npm run research:run
 ```
+
+`research:v4-paper-select` 会让固定网格的 128 组参数逐一经过与 Paper 相同的手续费、滑点、Funding、合约步进、仓位槽和入场时序，并在一次连续回放内按交易时间划分四段。候选必须至少 40 笔、每段至少 8 笔、至少三段净盈利、全段 PF 不低于 1.05、最大回撤不高于 25%，且单一盈利段占全部正段利润不得超过 70%。没有候选通过时输出 `NO_ELIGIBLE_WINNER`，不会把排名第一但不合格的参数冒充 winner；该命令始终只产生 Research/Shadow Candidate，不修改 Champion。
 
 ### Tradable Edge（可交易优势）
 

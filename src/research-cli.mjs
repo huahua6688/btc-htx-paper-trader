@@ -49,6 +49,7 @@ import {
 } from "./htx-download-center.mjs";
 import {
   BREAKOUT_V4_DEVELOPMENT_SPEC,
+  runBreakoutV4ExactPaperDevelopmentSelection,
   runBreakoutV4DevelopmentSelection
 } from "./breakout-v4-selection.mjs";
 
@@ -232,6 +233,27 @@ async function breakoutV4Select(args) {
   await mkdir(directory, { recursive: true });
   const reportPath = await save(join(directory, "selection.json"), report);
   process.stdout.write(`${JSON.stringify({ directory, reportPath, winner: report.winner, isolation: report.isolation, search: report.search, selectionHash: report.selectionHash }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
+async function breakoutV4ExactPaperSelect(args) {
+  const dataset = await load(args);
+  const report = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    onProgress: (item) => process.stderr.write(`Exact Paper candidate ${item.completed}/${item.total}\n`)
+  });
+  const directory = resolveOutputPath(runId("breakout-v4-exact-paper-development-selection"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "selection.json"), report);
+  process.stdout.write(`${JSON.stringify({
+    directory,
+    reportPath,
+    selectionStatus: report.selectionStatus,
+    winner: report.winner,
+    bestObservedCandidate: report.bestObservedCandidate,
+    isolation: report.isolation,
+    search: report.search,
+    selectionHash: report.selectionHash
+  }, null, 2)}\n`);
   return { dataset, report, directory, reportPath };
 }
 
@@ -827,6 +849,26 @@ const COMMANDS = {
       summary: {
         candidateCount: result?.report?.search?.candidateCount ?? null,
         winner: result?.report?.winner ?? null,
+        isolation: result?.report?.isolation ?? null,
+        championChanged: false
+      }
+    })
+  },
+  "research:v4-paper-select": {
+    handler: (args) => breakoutV4ExactPaperSelect(args),
+    runType: "BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+    record: (result) => ({
+      status: "PARTIAL",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.report?.datasetManifestHash ?? null,
+      strategyVersion: result?.report?.winner?.parameters?.version ?? null,
+      summary: {
+        selectionStatus: result?.report?.selectionStatus ?? null,
+        candidateCount: result?.report?.search?.candidateCount ?? null,
+        exactPaperCandidateCount: result?.report?.search?.exactPaperCandidateCount ?? null,
+        eligibleCandidateCount: result?.report?.search?.eligibleCandidateCount ?? null,
+        winner: result?.report?.winner ?? null,
+        bestObservedCandidate: result?.report?.bestObservedCandidate ?? null,
         isolation: result?.report?.isolation ?? null,
         championChanged: false
       }
