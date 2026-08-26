@@ -118,6 +118,65 @@ export const REPLAY_ASSUMPTIONS = Object.freeze({
   unavailableHistory: "order book/OI/elite/liquidation/basis are null, never synthesized"
 });
 
+/**
+ * 记录本次回放实际生效的组合限制。
+ *
+ * NET 模式下关闭加仓会把 maxOpenPositions 强制成 1（见 runtime-settings.mjs），
+ * 这一条不写进报告，就没人能解释「为什么两年只有二十几笔」。
+ */
+/**
+ * 让回放能按真实账户的组合限制重跑。
+ *
+ * 默认（portfolio 为 null）不写任何设置，行为与既有回放逐字节一致，
+ * 所有已记录的研究数字因此保持可复现。只有显式传入时才改写。
+ *
+ * 存在的理由：实盘账户可能开着加仓、仓位上限是 4，而回放默认是单槽位。
+ * 两者不一致时，回放测出来的成交笔数和风险暴露都描述不了那个账户。
+ */
+function applyPortfolioOverride(db, portfolio) {
+  if (!portfolio) return;
+  const patch = {};
+  if (portfolio.positionMode !== undefined) patch.positionMode = String(portfolio.positionMode).toUpperCase();
+  if (portfolio.allowPyramiding !== undefined) patch.allowPyramiding = portfolio.allowPyramiding === true;
+  if (portfolio.maxOpenPositions !== undefined) {
+    const limit = Math.trunc(Number(portfolio.maxOpenPositions));
+    if (!Number.isFinite(limit) || limit < 1) throw new Error("maxOpenPositions 必须是不小于 1 的整数");
+    // 用 MANUAL 固定住，否则 AUTO 会按当轮暴露重新推导，回放就不可复现。
+    patch.positionLimitMode = "MANUAL";
+    patch.positionLimitManual = limit;
+  }
+  if (!Object.keys(patch).length) return;
+  db.updateRuntimeSettings(patch, { source: "HISTORICAL_REPLAY_PORTFOLIO_OVERRIDE" });
+  const applied = db.getRuntimeSettings();
+  if (portfolio.maxOpenPositions !== undefined
+    && Number(applied.maxOpenPositions) !== Math.trunc(Number(portfolio.maxOpenPositions))) {
+    // NET + 关闭加仓会把上限强制回 1。与其安静地按 1 跑完再交出一份
+    // 看不出所以然的报告，不如直接报错说明冲突。
+    throw new Error(
+      `请求的仓位上限 ${portfolio.maxOpenPositions} 未生效（实际 ${applied.maxOpenPositions}）：`
+      + `NET 模式下必须同时开启加仓，或改用 HEDGE 模式`
+    );
+  }
+}
+
+function portfolioLimitsInForce(db) {
+  const settings = db.getRuntimeSettings();
+  const maxOpenPositions = Number(settings.maxOpenPositions);
+  const forcedToSingleSlot = maxOpenPositions === 1
+    && settings.positionMode === "NET"
+    && settings.allowPyramiding !== true;
+  return {
+    maxOpenPositions,
+    positionMode: settings.positionMode,
+    allowPyramiding: settings.allowPyramiding === true,
+    forcedToSingleSlot,
+    note: forcedToSingleSlot
+      ? "NET 模式且未开启加仓：同一时间只能持有一个仓位，持仓期间的新信号会被直接丢弃，成交笔数因此受设置限制而非行情限制"
+      : `同一时间最多 ${maxOpenPositions} 个仓位`,
+    matchesLiveAccount: "UNKNOWN_REPLAY_USES_PAPER_CONFIG_DEFAULTS_NOT_THE_LIVE_ACCOUNT_SETTINGS"
+  };
+}
+
 function clone(value) { return structuredClone(value); }
 
 function executionReport(signal, candle, delayBars) {
@@ -426,6 +485,9 @@ export async function runHistoricalReplay(dataset, {
   forceCloseAtEnd = true,
   capitalProfile = CAPITAL_PROFILES.PRODUCTION_FAITHFUL,
   referenceCapitalCny = DEFAULT_REFERENCE_CAPITAL_CNY,
+  // 留空即沿用 PAPER_CONFIG 默认组合限制，既有回放结果逐字节不变。
+  // 传入 { maxOpenPositions, positionMode, allowPyramiding } 可按真实账户重跑。
+  portfolio = null,
   archive = null
 } = {}) {
   if (!REPLAY_STRATEGIES.includes(strategy)) throw new Error(`Unknown replay strategy: ${strategy}`);
@@ -459,6 +521,7 @@ export async function runHistoricalReplay(dataset, {
     databasePathSource: "HISTORICAL_REPLAY"
   };
   const db = openPaperDatabase(resolvedDbPath, config);
+  applyPortfolioOverride(db, portfolio);
   const rejectionCounts = {};
   const trace = [];
   const actionCounts = {};
@@ -572,6 +635,11 @@ export async function runHistoricalReplay(dataset, {
       // 「合约步进拒绝」和「风险/保证金拒绝」必须分开统计：前者是小账户的粒度问题，
       // 后者才是策略本身的风险约束。混在一起就无法判断 edge 是否存在。
       entryRejections: summarizeEntryRejections(rejectionCounts),
+      // 组合限制会直接决定成交笔数的上限：只有一个仓位槽时，持仓期间的每一个新信号
+      // 都会被丢弃，交易数因此可能被设置卡住而不是被行情卡住。回放用的是
+      // PAPER_CONFIG 默认值，未必等于实盘账户的设置，所以必须如实记录下来，
+      // 否则读者会把「一个槽位的成交笔数」误读成「这套策略的自然频率」。
+      portfolioLimits: portfolioLimitsInForce(db),
       assumptions: { ...REPLAY_ASSUMPTIONS, executionDelayBars },
       pointInTimeGuarantees: {
         closedCandlesOnly: true,
