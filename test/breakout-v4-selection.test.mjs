@@ -7,6 +7,7 @@ import {
   BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   breakoutV4CandidateGrid,
   runBreakoutV4ExactPaperDevelopmentSelection,
+  runBreakoutV4LocalResilienceSelection,
   runBreakoutV4DevelopmentSelection
 } from "../src/breakout-v4-selection.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "../src/breakout-challenger.mjs";
@@ -270,4 +271,69 @@ test("exact-Paper winner artifact is hash-verified before downstream research", 
     () => verifyBreakoutV4SelectionReport({ ...report, selectionStatus: "NO_ELIGIBLE_WINNER", winner: null }),
     /没有通过 eligibility gate/
   );
+});
+
+test("local-resilience selection rejects an isolated winner and advances to the first stable candidate", async () => {
+  const dataset = syntheticCatalog();
+  const candidates = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .filter((item) => item.parameters.targetRiskMultiple === 4
+      && item.parameters.stopAtrMultiple === 1.5
+      && item.parameters.trendFilter === "EMA50_PRICE_ALIGNMENT")
+    .slice(0, 2);
+  const source = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates,
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay(options.parameters)
+  });
+  const ordered = source.candidates.filter((item) => item.metrics.eligible);
+  assert.equal(ordered.length, 2);
+  const isolatedLookback = Math.round(ordered[0].parameters.breakoutLookback4h * 0.95);
+  const calls = [];
+  const report = await runBreakoutV4LocalResilienceSelection(dataset, source, {
+    replayRunner: async (cutoffDataset, options) => {
+      calls.push(options.parameters.version);
+      const isolated = options.parameters.version.endsWith("lookback-minus-5pct")
+        && options.parameters.breakoutLookback4h === isolatedLookback;
+      return isolated
+        ? fakePaperReplay({ ...options.parameters, targetRiskMultiple: 5 })
+        : fakePaperReplay(options.parameters);
+    }
+  });
+  assert.equal(calls.length, 7);
+  assert.equal(report.selectionStatus, "LOCAL_RESILIENCE_WINNER_FOUND");
+  assert.equal(report.evaluatedCandidates.length, 2);
+  assert.equal(report.evaluatedCandidates[0].passed, false);
+  assert.equal(report.evaluatedCandidates[0].perturbations.length, 1);
+  assert.equal(report.evaluatedCandidates[0].unrunPerturbations.length, 5);
+  assert.equal(report.winner.sourceRank, ordered[1].rank);
+  assert.equal(report.winner.perturbations.length, 6);
+  assert.ok(report.winner.perturbations.every((item) => item.metrics.eligible));
+  assert.equal(report.isolation.holdoutOpened, false);
+  assert.equal(report.championChanged, false);
+
+  const { verifyBreakoutV4ResilienceReport } = await import("../src/research-cli.mjs");
+  const selected = verifyBreakoutV4ResilienceReport(report);
+  assert.equal(selected.parameterHash, report.winner.parameterHash);
+  assert.equal(selected.replayOptions.executionDelayBars, 1);
+  assert.throws(
+    () => verifyBreakoutV4ResilienceReport({ ...report, resilienceSelectionHash: "tampered" }),
+    /selectionHash/
+  );
+});
+
+test("local-resilience selection returns no winner instead of promoting a least-bad candidate", async () => {
+  const dataset = syntheticCatalog();
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 4);
+  const source = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates: [candidate],
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay(options.parameters)
+  });
+  const report = await runBreakoutV4LocalResilienceSelection(dataset, source, {
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay({ ...options.parameters, targetRiskMultiple: 5 })
+  });
+  assert.equal(report.selectionStatus, "NO_LOCAL_RESILIENCE_WINNER");
+  assert.equal(report.winner, null);
+  assert.equal(report.search.evaluatedCandidateCount, 1);
+  assert.equal(report.search.perturbationReplayCount, 1);
+  assert.equal(report.strategyRoleAfterSelection, "NO_CANDIDATE");
 });

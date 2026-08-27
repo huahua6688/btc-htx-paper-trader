@@ -50,6 +50,7 @@ import {
 import {
   BREAKOUT_V4_DEVELOPMENT_SPEC,
   runBreakoutV4ExactPaperDevelopmentSelection,
+  runBreakoutV4LocalResilienceSelection,
   BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   runBreakoutV4DevelopmentSelection
 } from "./breakout-v4-selection.mjs";
@@ -133,11 +134,51 @@ export function verifyBreakoutV4SelectionReport(report) {
   };
 }
 
+export function verifyBreakoutV4ResilienceReport(report) {
+  if (!report || typeof report !== "object") throw new Error("--selection 必须指向完整的 V4 local-resilience selection.json");
+  if (report.runType !== "BREAKOUT_V4_LOCAL_RESILIENCE_DEVELOPMENT_ONLY_SELECTION") throw new Error("--selection 不是 V4 local-resilience 选择产物");
+  if (report.selectionStatus !== "LOCAL_RESILIENCE_WINNER_FOUND" || !report.winner?.passed) throw new Error("V4 local-resilience selection 没有通过局部稳定性 gate 的 winner");
+  if (report.strategyRoleAfterSelection !== "RESEARCH_CANDIDATE_REQUIRES_FULL_ROBUSTNESS" || report.championChanged !== false) {
+    throw new Error("V4 local-resilience 生命周期不安全：必须继续接受完整 robustness 且 Champion 未改变");
+  }
+  if (report.resilienceSpecHash !== hashObject(report.resilienceSpec)) throw new Error("V4 local-resilience specHash 校验失败");
+  if (report.resilienceSelectionHash !== hashObject({ ...report, resilienceSelectionHash: undefined })) throw new Error("V4 local-resilience selectionHash 校验失败");
+  if (report.winner.parameterHash !== hashObject(report.winner.parameters)) throw new Error("V4 local-resilience parameterHash 校验失败");
+  if (!report.winner.parameters?.researchOnly) throw new Error("V4 local-resilience winner 必须保持 researchOnly=true");
+  if (!Array.isArray(report.winner.perturbations) || report.winner.perturbations.length !== report.resilienceSpec.perturbationOrder.length) {
+    throw new Error("V4 local-resilience winner 的参数扰动证据不完整");
+  }
+  if (report.winner.perturbations.some((item) => !item?.metrics?.eligible)) throw new Error("V4 local-resilience winner 包含未通过的参数扰动");
+  const from = new Date(report.developmentRange?.from).getTime();
+  const cutoff = new Date(report.developmentRange?.to).getTime();
+  if (!Number.isFinite(from) || !Number.isFinite(cutoff) || cutoff - BAR_MS <= from) throw new Error("V4 local-resilience developmentRange 无效");
+  const execution = report.replayContract;
+  if (execution?.strategy !== "breakout-v4") throw new Error("V4 local-resilience 的执行策略不是 breakout-v4");
+  return {
+    report,
+    parameters: report.winner.parameters,
+    parameterHash: report.winner.parameterHash,
+    selectionHash: report.resilienceSelectionHash,
+    datasetManifestHash: report.datasetManifestHash,
+    developmentRange: { from: new Date(from).toISOString(), to: new Date(cutoff - BAR_MS).toISOString() },
+    replayOptions: {
+      eventStride: Number(execution.eventStride),
+      executionDelayBars: Number(execution.executionDelayBars),
+      collectTrace: false,
+      forceCloseAtEnd: execution.forceCloseAtDevelopmentEnd === true,
+      capitalProfile: execution.capitalProfile,
+      portfolio: execution.portfolio
+    }
+  };
+}
+
 export async function loadBreakoutV4Selection(path) {
   if (!path || path === true) throw new Error("--selection=<selection.json> 必须提供文件路径");
   const report = await readJson(String(path));
   if (!report) throw Object.assign(new Error(`ENOENT: V4 selection file not found: ${path}`), { code: "ENOENT" });
-  return verifyBreakoutV4SelectionReport(report);
+  return report.runType === "BREAKOUT_V4_LOCAL_RESILIENCE_DEVELOPMENT_ONLY_SELECTION"
+    ? verifyBreakoutV4ResilienceReport(report)
+    : verifyBreakoutV4SelectionReport(report);
 }
 
 function assertSelectionDataset(selection, dataset, { allowDifferent = false } = {}) {
@@ -353,6 +394,33 @@ async function breakoutV4ExactPaperSelect(args) {
     isolation: report.isolation,
     search: report.search,
     selectionHash: report.selectionHash
+  }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
+async function breakoutV4ResilientSelect(args) {
+  if (!args.selection || args.selection === true) throw new Error("research:v4-resilient-select requires --selection=<exact-Paper selection.json>");
+  const sourceSelection = await readJson(String(args.selection));
+  if (!sourceSelection) throw Object.assign(new Error(`ENOENT: V4 selection file not found: ${args.selection}`), { code: "ENOENT" });
+  verifyBreakoutV4SelectionReport(sourceSelection);
+  const dataset = await load(args);
+  const directory = resolveOutputPath(runId("breakout-v4-local-resilience-selection"));
+  await mkdir(directory, { recursive: true });
+  const report = await runBreakoutV4LocalResilienceSelection(dataset, sourceSelection, {
+    outputDirectory: join(directory, "replays"),
+    onProgress: (item) => process.stderr.write(
+      `Local resilience rank ${item.sourceRank} (${item.candidateIndex}/${item.eligibleCandidateCount}) ${item.perturbation}: ${item.passed ? "PASS" : "FAIL"}\n`
+    )
+  });
+  const reportPath = await save(join(directory, "resilience-selection.json"), report);
+  process.stdout.write(`${JSON.stringify({
+    directory,
+    reportPath,
+    selectionStatus: report.selectionStatus,
+    winner: report.winner,
+    isolation: report.isolation,
+    search: report.search,
+    resilienceSelectionHash: report.resilienceSelectionHash
   }, null, 2)}\n`);
   return { dataset, report, directory, reportPath };
 }
@@ -1006,6 +1074,25 @@ const COMMANDS = {
         winner: result?.report?.winner ?? null,
         bestObservedCandidate: result?.report?.bestObservedCandidate ?? null,
         isolation: result?.report?.isolation ?? null,
+        championChanged: false
+      }
+    })
+  },
+  "research:v4-resilient-select": {
+    handler: (args) => breakoutV4ResilientSelect(args),
+    runType: "BREAKOUT_V4_LOCAL_RESILIENCE_DEVELOPMENT_ONLY_SELECTION",
+    record: (result) => ({
+      status: result?.report?.winner?.passed ? "PARTIAL" : "FAILED",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.report?.datasetManifestHash ?? null,
+      strategyVersion: result?.report?.winner?.parameters?.version ?? null,
+      summary: {
+        selectionStatus: result?.report?.selectionStatus ?? null,
+        sourceSelection: result?.report?.sourceSelection ?? null,
+        search: result?.report?.search ?? null,
+        winner: result?.report?.winner ?? null,
+        isolation: result?.report?.isolation ?? null,
+        fullRobustnessStillRequired: Boolean(result?.report?.winner),
         championChanged: false
       }
     })

@@ -1,6 +1,7 @@
 import { ema } from "./indicators.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
+import { robustnessParameterPerturbations } from "./monte-carlo.mjs";
 import { CAPITAL_PROFILES, runHistoricalReplay } from "./replay-engine.mjs";
 import { hashObject, round } from "./research-utils.mjs";
 
@@ -104,6 +105,26 @@ export const BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC = Object.freeze({
   ]),
   confirmationPolicy: "Every grid candidate is executed through the exact Paper replay core. If no candidate passes all predeclared stability gates, the program returns no winner; it never promotes the least-bad candidate.",
   holdoutPolicy: "The exact-Paper selector creates a cutoff-filtered in-memory dataset before replay. No post-cutoff candle, Funding, auxiliary series or multi-venue observation is passed to any candidate, and the immature holdout registry is never opened."
+});
+
+export const BREAKOUT_V4_LOCAL_RESILIENCE_SPEC = Object.freeze({
+  schemaVersion: 1,
+  sourceRunType: "BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_ONLY_PARAMETER_SELECTION",
+  strategy: "breakout-v4",
+  candidateOrder: "source exact-Paper rank; ineligible source candidates are never reconsidered",
+  perturbationFractionPct: 5,
+  perturbationOrder: Object.freeze([
+    "lookback-minus-5pct",
+    "lookback-plus-5pct",
+    "stop-atr-minus-5pct",
+    "stop-atr-plus-5pct",
+    "target-rr-minus-5pct",
+    "target-rr-plus-5pct"
+  ]),
+  acceptance: "the source candidate and every local perturbation must pass the complete exact-Paper eligibility policy",
+  earlyStop: "stop a candidate at its first failed perturbation; stop the search at the first fully resilient candidate in source rank order",
+  nextGate: "a resilient development winner still requires full Monte Carlo/cost robustness and timestamped Shadow evidence before promotion",
+  holdoutPolicy: "reuse only the source selection's cutoff-filtered development catalog; never open or read the immature holdout"
 });
 
 export function breakoutV4CandidateGrid(spec = BREAKOUT_V4_DEVELOPMENT_SPEC) {
@@ -572,5 +593,152 @@ export async function runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
     }))
   };
   result.selectionHash = hashObject({ ...result, selectionHash: undefined });
+  return result;
+}
+
+function assertExactPaperSelectionSource(report, dataset) {
+  if (!report || typeof report !== "object") throw new Error("Local resilience selection requires a complete exact-Paper selection report");
+  if (report.runType !== BREAKOUT_V4_LOCAL_RESILIENCE_SPEC.sourceRunType) throw new Error("Local resilience source is not an exact-Paper selection report");
+  if (report.selectionStatus !== "ELIGIBLE_WINNER_FOUND" || !report.winner?.metrics?.eligible) throw new Error("Local resilience source has no eligible exact-Paper winner");
+  if (report.selectionHash !== hashObject({ ...report, selectionHash: undefined })) throw new Error("Local resilience source selectionHash verification failed");
+  if (report.specHash !== hashObject(report.spec)) throw new Error("Local resilience source specHash verification failed");
+  if (report.datasetManifestHash !== dataset?.manifest?.manifestHash) {
+    throw new Error(`Local resilience dataset manifest mismatch: expected ${report.datasetManifestHash}, received ${dataset?.manifest?.manifestHash ?? null}`);
+  }
+  const eligible = (report.candidates ?? []).filter((item) => item?.metrics?.eligible).sort((a, b) => Number(a.rank) - Number(b.rank));
+  if (!eligible.length || eligible.length !== Number(report.search?.eligibleCandidateCount)) {
+    throw new Error("Local resilience source eligible-candidate count is inconsistent");
+  }
+  const ranks = new Set();
+  for (const item of eligible) {
+    if (!Number.isInteger(Number(item.rank)) || ranks.has(Number(item.rank))) throw new Error("Local resilience source candidate ranks are invalid");
+    ranks.add(Number(item.rank));
+    const parameters = { ...report.winner.parameters, ...item.parameters };
+    if (hashObject(parameters) !== item.parameterHash) throw new Error(`Local resilience source parameterHash verification failed at rank ${item.rank}`);
+  }
+  return eligible;
+}
+
+function exactPaperReplayOptions(spec, parameters, outputDirectory) {
+  const start = new Date(spec.developmentRange.from).getTime();
+  const cutoff = new Date(spec.developmentRange.to).getTime();
+  return {
+    strategy: "breakout-v4",
+    parameters,
+    from: new Date(start).toISOString(),
+    to: new Date(cutoff - BAR_MS).toISOString(),
+    eventStride: spec.executionModel.eventStride,
+    executionDelayBars: spec.executionModel.executionDelayBars,
+    collectTrace: false,
+    forceCloseAtEnd: spec.executionModel.forceCloseAtDevelopmentEnd,
+    capitalProfile: spec.executionModel.capitalProfile,
+    portfolio: spec.executionModel.portfolio,
+    outputDirectory
+  };
+}
+
+export async function runBreakoutV4LocalResilienceSelection(dataset, sourceSelection, {
+  resilienceSpec = BREAKOUT_V4_LOCAL_RESILIENCE_SPEC,
+  replayRunner = runHistoricalReplay,
+  outputDirectory = null,
+  onProgress = null
+} = {}) {
+  const eligible = assertExactPaperSelectionSource(sourceSelection, dataset);
+  const exactSpec = sourceSelection.spec;
+  const developmentDataset = exactPaperDevelopmentDataset(dataset, exactSpec);
+  const expectedLabels = robustnessParameterPerturbations("breakout-v4", sourceSelection.winner.parameters).map((item) => item.label);
+  if (hashObject(expectedLabels) !== hashObject(resilienceSpec.perturbationOrder)) {
+    throw new Error("Local resilience perturbation policy does not match the executable robustness policy");
+  }
+  const evaluatedCandidates = [];
+  let perturbationReplayCount = 0;
+  let winner = null;
+  for (let candidateIndex = 0; candidateIndex < eligible.length; candidateIndex += 1) {
+    const sourceCandidate = eligible[candidateIndex];
+    const parameters = { ...sourceSelection.winner.parameters, ...sourceCandidate.parameters };
+    const perturbations = robustnessParameterPerturbations("breakout-v4", parameters);
+    const perturbationResults = [];
+    for (const item of perturbations) {
+      const perturbedParameters = { ...parameters, ...item.patch, version: `${parameters.version}-${item.label}` };
+      const replay = await replayRunner(developmentDataset, exactPaperReplayOptions(
+        exactSpec,
+        perturbedParameters,
+        outputDirectory ? `${outputDirectory}/rank-${sourceCandidate.rank}/${item.label}` : undefined
+      ));
+      const metrics = summarizeExactPaperCandidate(replay, exactSpec);
+      perturbationReplayCount += 1;
+      perturbationResults.push({
+        label: item.label,
+        parameters: perturbedParameters,
+        parameterHash: hashObject(perturbedParameters),
+        metrics
+      });
+      onProgress?.({
+        sourceRank: sourceCandidate.rank,
+        candidateIndex: candidateIndex + 1,
+        eligibleCandidateCount: eligible.length,
+        perturbation: item.label,
+        perturbationReplayCount,
+        passed: metrics.eligible
+      });
+      if (!metrics.eligible) break;
+    }
+    const passed = perturbationResults.length === perturbations.length
+      && perturbationResults.every((item) => item.metrics.eligible);
+    const unrunPerturbations = resilienceSpec.perturbationOrder.slice(perturbationResults.length);
+    const failureReasons = perturbationResults.flatMap((item) => item.metrics.eligibilityReasons.map((reason) => `${item.label}:${reason}`));
+    const evaluated = {
+      sourceRank: sourceCandidate.rank,
+      parameters,
+      parameterHash: sourceCandidate.parameterHash,
+      baseMetrics: sourceCandidate.metrics,
+      passed,
+      failureReasons,
+      perturbations: perturbationResults,
+      unrunPerturbations
+    };
+    evaluatedCandidates.push(evaluated);
+    if (passed) {
+      winner = evaluated;
+      break;
+    }
+  }
+  const result = {
+    schemaVersion: 1,
+    runType: "BREAKOUT_V4_LOCAL_RESILIENCE_DEVELOPMENT_ONLY_SELECTION",
+    selectionStatus: winner ? "LOCAL_RESILIENCE_WINNER_FOUND" : "NO_LOCAL_RESILIENCE_WINNER",
+    strategyRoleAfterSelection: winner ? "RESEARCH_CANDIDATE_REQUIRES_FULL_ROBUSTNESS" : "NO_CANDIDATE",
+    championChanged: false,
+    sourceSelection: {
+      runType: sourceSelection.runType,
+      selectionHash: sourceSelection.selectionHash,
+      specHash: sourceSelection.specHash,
+      datasetManifestHash: sourceSelection.datasetManifestHash,
+      eligibleCandidateCount: eligible.length
+    },
+    resilienceSpec,
+    resilienceSpecHash: hashObject(resilienceSpec),
+    datasetManifestHash: dataset.manifest?.manifestHash ?? null,
+    developmentRange: exactSpec.developmentRange,
+    replayContract: exactSpec.executionModel,
+    isolation: {
+      holdoutOpened: false,
+      postCutoffOutcomeFieldsRead: false,
+      developmentCutoff: exactSpec.developmentRange.to,
+      maximumCandleOpenRead: new Date(developmentDataset.candles.at(-1).timestamp).toISOString(),
+      maximumCandleVisibleAtRead: new Date(developmentDataset.candles.at(-1).timestamp + BAR_MS).toISOString()
+    },
+    search: {
+      sourceEligibleCandidateCount: eligible.length,
+      evaluatedCandidateCount: evaluatedCandidates.length,
+      perturbationReplayCount,
+      stoppedAtFirstPassingCandidate: Boolean(winner),
+      candidateOrder: resilienceSpec.candidateOrder,
+      earlyStop: resilienceSpec.earlyStop
+    },
+    winner,
+    evaluatedCandidates
+  };
+  result.resilienceSelectionHash = hashObject({ ...result, resilienceSelectionHash: undefined });
   return result;
 }

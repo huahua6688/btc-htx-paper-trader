@@ -273,6 +273,12 @@ npm run research:run
 
 `research:v4-paper-select` 会让固定网格的 128 组参数逐一经过与 Paper 相同的手续费、滑点、Funding、合约步进、仓位槽和入场时序，并在一次连续回放内按交易时间划分四段。候选必须至少 40 笔、每段至少 8 笔、至少三段净盈利、全段 PF 不低于 1.05、最大回撤不高于 25%，且单一盈利段占全部正段利润不得超过 70%。没有候选通过时输出 `NO_ELIGIBLE_WINNER`，不会把排名第一但不合格的参数冒充 winner；该命令始终只产生 Research/Shadow Candidate，不修改 Champion。
 
+基础 winner 还必须经过局部稳定性筛选。`research:v4-resilient-select` 按原 exact-Paper 排名依次测试合格候选，对回看周期、止损 ATR 和目标 RR 分别执行真实 Paper `±5%` 回放。任一扰动未通过完整的分段、PF、回撤和利润集中度门槛，就立即淘汰该候选并检查下一名；只有本身和六个附近参数都合格的第一名才能成为 local-resilience winner。全部失败时输出 `NO_LOCAL_RESILIENCE_WINNER`，表示当前 V4 参数结构没有可靠赢家。这个阶段仍只读 development 数据，不打开 holdout，也不替换 Champion。
+
+```bash
+npm run research:v4-resilient-select -- --selection=/path/to/exact-paper-selection.json --catalog=/path/to/the-same-catalog
+```
+
 选出 winner 后，后续压力测试必须传入该次完整 `selection.json`，CLI 会同时校验 selection、spec 和参数哈希，并沿用选参时的资金、单槽位、成本和入场时序。直接运行不带 `--selection` 的 `robustness` 仍然测试源码中已提交的旧参数。
 
 ```bash
