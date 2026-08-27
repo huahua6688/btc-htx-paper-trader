@@ -948,6 +948,7 @@ export function robustnessRunRecord(result) {
       status: result?.report?.status ?? null,
       reason: result?.report?.reason ?? null,
       selectionSource: result?.selectionSource ?? null,
+      robustnessGate: result?.report?.gate ?? null,
       delayedExecutionEvidence: result?.report?.delayedExecutionEvidence ?? null,
       stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
     }

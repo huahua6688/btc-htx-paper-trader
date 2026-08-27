@@ -15,7 +15,11 @@ import { generateDiagnosisCandidates } from "../src/edge-candidate-pipeline.mjs"
 import { runCounterfactualReview } from "../src/counterfactual-review.mjs";
 import { auditExternalMarketFeatures } from "../src/external-features.mjs";
 import { loadHistoricalDataset, updateHistoricalDataset } from "../src/historical-data.mjs";
-import { runMonteCarloRobustness } from "../src/monte-carlo.mjs";
+import {
+  evaluateV4RobustnessEvidence,
+  repriceObservedTrades,
+  runMonteCarloRobustness
+} from "../src/monte-carlo.mjs";
 import { buildPointInTimeMarket } from "../src/replay-market.mjs";
 import { runChampionChallengerComparison, runHistoricalReplay } from "../src/replay-engine.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "../src/similarity-engine.mjs";
@@ -248,7 +252,53 @@ test("robustness runs resampling, block bootstrap, worsened costs/delay and para
   assert.equal(result.executionContract.baseExecutionDelayBars, 1);
   assert.equal(result.executionContract.portfolio.maxOpenPositions, 1);
   assert.equal(result.deterministicStress.costDeterioration150Pct.portfolioLimits.maxOpenPositions, 1);
+  assert.ok(result.pairedAccounting.costDeterioration150Pct.returnPct < result.base.returnPct);
+  assert.ok(result.pairedAccounting.slippageDeterioration200Pct.returnPct < result.base.returnPct);
   assert.equal(result.parameterPerturbation.length, 4);
+});
+
+test("V4 robustness gate reports parameter brittleness separately from unobservable sub-bar latency", () => {
+  const evidence = evaluateV4RobustnessEvidence({
+    tradeOrderResampling: { lossProbabilityPct: 11.4, maxDrawdownPct: { p95: 53.7 } },
+    blockBootstrap: { lossProbabilityPct: 5.55, maxDrawdownPct: { p95: 38.1 } },
+    pairedAccounting: {
+      costDeterioration150Pct: { returnPct: 55, profitFactor: 1.2 },
+      slippageDeterioration200Pct: { returnPct: 58, profitFactor: 1.2 }
+    },
+    parameterPerturbation: [{
+      label: "lookback-plus-5pct",
+      result: { executable: true, returnPct: 7.97, profitFactor: 1.0434, maxDrawdownPct: 26.42 }
+    }],
+    delayedExecutionEvidence: { available: false, safetyRejectionExpected: true },
+    deterministicStress: {
+      costDeterioration150Pct: { returnPct: 74, sameTradePathAsBase: false },
+      slippageDeterioration200Pct: { returnPct: 73, sameTradePathAsBase: false },
+      allLossesFirst: { maxDrawdownPct: 158 }
+    },
+    base: { returnPct: 63.7 }
+  });
+  assert.equal(evidence.passed, false);
+  assert.ok(evidence.gateReasons.includes("DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE"));
+  assert.ok(evidence.gateReasons.includes("PARAMETER_PERTURBATION_PROFIT_FACTOR_FAILED:lookback-plus-5pct"));
+  assert.ok(evidence.gateReasons.includes("PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-plus-5pct"));
+  assert.ok(evidence.warnings.includes("TRADE_ORDER_P95_DRAWDOWN_ABOVE_DEVELOPMENT_LIMIT"));
+  assert.ok(evidence.warnings.includes("FIXED_PNL_PATH_CROSSES_ZERO_EQUITY"));
+});
+
+test("same-trade cost repricing is monotonic and preserves the observed trade path", () => {
+  const trades = [{
+    net_pnl_cny: 10,
+    entry_fee_cny: 1,
+    exit_fee_cny: 1,
+    entry_slippage_cny: 0.5,
+    exit_slippage_cny: 0.5
+  }];
+  const base = repriceObservedTrades(trades, 100);
+  const feeWorse = repriceObservedTrades(trades, 100, { feeMultiplier: 1.5 });
+  const slippageWorse = repriceObservedTrades(trades, 100, { slippageMultiplier: 2 });
+  assert.equal(base.returnPct, 10);
+  assert.equal(feeWorse.returnPct, 9);
+  assert.equal(slippageWorse.returnPct, 9);
 });
 
 test("post-hoc review covers trades and WAIT without feeding outcomes into decisions", async () => {
