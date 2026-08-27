@@ -18,6 +18,7 @@ import { loadHistoricalDataset, updateHistoricalDataset } from "../src/historica
 import {
   evaluateV4RobustnessEvidence,
   repriceObservedTrades,
+  robustnessParameterPerturbations,
   runMonteCarloRobustness
 } from "../src/monte-carlo.mjs";
 import { buildPointInTimeMarket } from "../src/replay-market.mjs";
@@ -278,11 +279,30 @@ test("V4 robustness gate reports parameter brittleness separately from unobserva
     base: { returnPct: 63.7 }
   });
   assert.equal(evidence.passed, false);
+  assert.equal(evidence.status, "failed");
+  assert.ok(evidence.failureReasons.includes("PARAMETER_PERTURBATION_PROFIT_FACTOR_FAILED:lookback-plus-5pct"));
+  assert.deepEqual(evidence.blockedReasons, ["DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE"]);
   assert.ok(evidence.gateReasons.includes("DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE"));
   assert.ok(evidence.gateReasons.includes("PARAMETER_PERTURBATION_PROFIT_FACTOR_FAILED:lookback-plus-5pct"));
   assert.ok(evidence.gateReasons.includes("PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-plus-5pct"));
   assert.ok(evidence.warnings.includes("TRADE_ORDER_P95_DRAWDOWN_ABOVE_DEVELOPMENT_LIMIT"));
   assert.ok(evidence.warnings.includes("FIXED_PNL_PATH_CROSSES_ZERO_EQUITY"));
+});
+
+test("V4 robustness perturbs every tuned numeric parameter in both directions", () => {
+  const perturbations = robustnessParameterPerturbations("breakout-v4", {
+    breakoutLookback4h: 40,
+    stopAtrMultiple: 1.5,
+    targetRiskMultiple: 4
+  });
+  assert.deepEqual(perturbations.map((item) => item.label), [
+    "lookback-minus-5pct",
+    "lookback-plus-5pct",
+    "stop-atr-minus-5pct",
+    "stop-atr-plus-5pct",
+    "target-rr-minus-5pct",
+    "target-rr-plus-5pct"
+  ]);
 });
 
 test("same-trade cost repricing is monotonic and preserves the observed trade path", () => {

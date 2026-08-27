@@ -279,7 +279,7 @@ npm run research:run
 npm run robustness -- --selection=/path/to/selection.json --catalog=/path/to/the-same-catalog --iterations=2000
 ```
 
-V4 robustness 的正式 gate 会复用选参前已经声明的 PF≥1.05、参数扰动回撤≤25% 和现有 Promotion Gate 的 Monte Carlo 亏损概率≤50%。成本压力同时输出两种证据：同一批交易只增加费用的 `pairedAccounting`（保证成本越高净收益不会反而增加），以及重新执行完整账户路径的 fresh replay（成本改变合约步进或单仓位占用时，交易路径可能变化）。15m 历史无法诚实生成 1～5 分钟延迟价格；延迟 2/3 根 K 线被 5 分钟信号寿命拒绝属于安全规则生效，但亚 K 线延迟证据仍需由带时间戳的 Shadow/Paper 收集，不能伪造。
+V4 robustness 的正式 gate 会把选参前已经声明的完整候选 PF≥1.05、回撤≤25% 和现有 Promotion Gate 的 Monte Carlo 亏损概率≤50% 继续用于局部稳定性检查，并对回看周期、止损 ATR 和目标 RR 分别执行对称的 ±5% 扰动。真实失败记录为 `FAILED`；只有外部证据尚未成熟才记录为 `PARTIAL`。成本压力同时输出两种证据：同一批交易只增加费用的 `pairedAccounting`（保证成本越高净收益不会反而增加，并用 `observedTradeBaseline` 比较同口径回撤），以及重新执行完整账户路径的 fresh replay（成本改变合约步进或单仓位占用时，交易路径可能变化）。15m 历史无法诚实生成 1～5 分钟延迟价格；延迟 2/3 根 K 线被 5 分钟信号寿命拒绝属于安全规则生效，但亚 K 线延迟证据仍需由带时间戳的 Shadow/Paper 收集，不能伪造。
 
 通用 `validate --selection` 会被拒绝：winner 已经看过完整开发区间，再把该区间切成窗口不能冒充 OOS。若用另一个已被研究读取过的后续目录复核，必须明确声明数据集不同；结果只能叫 follow-up replay，不能叫 untouched Final OOS：
 

@@ -128,27 +128,29 @@ export function evaluateV4RobustnessEvidence({
   base,
   policy = V4_ROBUSTNESS_POLICY
 }) {
-  const gateReasons = [];
+  const failureReasons = [];
+  const blockedReasons = [];
   const warnings = [];
   if (Number(tradeOrderResampling?.lossProbabilityPct ?? 100) > policy.maximumLossProbabilityPct) {
-    gateReasons.push("TRADE_ORDER_LOSS_PROBABILITY_EXCEEDED");
+    failureReasons.push("TRADE_ORDER_LOSS_PROBABILITY_EXCEEDED");
   }
   if (Number(block?.lossProbabilityPct ?? 100) > policy.maximumLossProbabilityPct) {
-    gateReasons.push("BLOCK_BOOTSTRAP_LOSS_PROBABILITY_EXCEEDED");
+    failureReasons.push("BLOCK_BOOTSTRAP_LOSS_PROBABILITY_EXCEEDED");
   }
   for (const [label, stress] of Object.entries(pairedAccounting ?? {})) {
-    if (!(Number(stress?.returnPct) >= policy.minimumStressReturnPct)) gateReasons.push(`PAIRED_STRESS_RETURN_FAILED:${label}`);
-    if (!(Number(stress?.profitFactor) >= policy.minimumStressProfitFactor)) gateReasons.push(`PAIRED_STRESS_PROFIT_FACTOR_FAILED:${label}`);
+    if (label === "observedTradeBaseline") continue;
+    if (!(Number(stress?.returnPct) >= policy.minimumStressReturnPct)) failureReasons.push(`PAIRED_STRESS_RETURN_FAILED:${label}`);
+    if (!(Number(stress?.profitFactor) >= policy.minimumStressProfitFactor)) failureReasons.push(`PAIRED_STRESS_PROFIT_FACTOR_FAILED:${label}`);
   }
   for (const item of parameterPerturbation ?? []) {
     const result = item.result ?? {};
-    if (!result.executable) gateReasons.push(`PARAMETER_PERTURBATION_NOT_EXECUTABLE:${item.label}`);
-    if (!(Number(result.returnPct) >= policy.minimumPerturbationReturnPct)) gateReasons.push(`PARAMETER_PERTURBATION_RETURN_FAILED:${item.label}`);
-    if (!(Number(result.profitFactor) >= policy.minimumPerturbationProfitFactor)) gateReasons.push(`PARAMETER_PERTURBATION_PROFIT_FACTOR_FAILED:${item.label}`);
-    if (!(Number(result.maxDrawdownPct) <= policy.maximumPerturbationDrawdownPct)) gateReasons.push(`PARAMETER_PERTURBATION_DRAWDOWN_FAILED:${item.label}`);
+    if (!result.executable) failureReasons.push(`PARAMETER_PERTURBATION_NOT_EXECUTABLE:${item.label}`);
+    if (!(Number(result.returnPct) >= policy.minimumPerturbationReturnPct)) failureReasons.push(`PARAMETER_PERTURBATION_RETURN_FAILED:${item.label}`);
+    if (!(Number(result.profitFactor) >= policy.minimumPerturbationProfitFactor)) failureReasons.push(`PARAMETER_PERTURBATION_PROFIT_FACTOR_FAILED:${item.label}`);
+    if (!(Number(result.maxDrawdownPct) <= policy.maximumPerturbationDrawdownPct)) failureReasons.push(`PARAMETER_PERTURBATION_DRAWDOWN_FAILED:${item.label}`);
   }
   if (policy.requireDelayedExecutionEvidence && !delayedExecutionEvidence?.available) {
-    gateReasons.push("DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE");
+    blockedReasons.push("DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE");
   }
   if (Number(tradeOrderResampling?.maxDrawdownPct?.p95 ?? 0) > policy.maximumPerturbationDrawdownPct) {
     warnings.push("TRADE_ORDER_P95_DRAWDOWN_ABOVE_DEVELOPMENT_LIMIT");
@@ -165,7 +167,38 @@ export function evaluateV4RobustnessEvidence({
       warnings.push(`FRESH_REPLAY_OUTPERFORMED_AFTER_PATH_CHANGED:${label}`);
     }
   }
-  return { passed: gateReasons.length === 0, policy, gateReasons, warnings };
+  const gateReasons = [...failureReasons, ...blockedReasons];
+  const status = failureReasons.length ? "failed" : blockedReasons.length ? "partial" : "ok";
+  return { passed: status === "ok", status, policy, failureReasons, blockedReasons, gateReasons, warnings };
+}
+
+export function robustnessParameterPerturbations(strategy, parameters) {
+  if (strategy === "breakout-v4") return [
+    { label: "lookback-minus-5pct", patch: { breakoutLookback4h: Math.max(10, Math.round(parameters.breakoutLookback4h * 0.95)) } },
+    { label: "lookback-plus-5pct", patch: { breakoutLookback4h: Math.round(parameters.breakoutLookback4h * 1.05) } },
+    { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },
+    { label: "stop-atr-plus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 1.05 } },
+    { label: "target-rr-minus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 0.95 } },
+    { label: "target-rr-plus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 1.05 } }
+  ];
+  if (strategy === "multi-venue-v3") return [
+    { label: "opportunity-score-minus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 0.95 } },
+    { label: "opportunity-score-plus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 1.05 } },
+    { label: "net-edge-plus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 1.05 } },
+    { label: "runner-break-even-plus-5pct", patch: { breakEvenTargetFraction: parameters.breakEvenTargetFraction * 1.05 } }
+  ];
+  if (strategy === "research-v2") return [
+    { label: "direction-strength-minus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 0.95 } },
+    { label: "direction-strength-plus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 1.05 } },
+    { label: "net-edge-minus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 0.95 } },
+    { label: "extension-plus-5pct", patch: { maximumExtensionAtr1h: parameters.maximumExtensionAtr1h * 1.05 } }
+  ];
+  return [
+    { label: "signal-threshold-minus-5pct", patch: { signalThreshold: parameters.signalThreshold * 0.95 } },
+    { label: "signal-threshold-plus-5pct", patch: { signalThreshold: parameters.signalThreshold * 1.05 } },
+    { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },
+    { label: "target-rr-plus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 1.05 } }
+  ];
 }
 
 export async function runMonteCarloRobustness(dataset, baseReplay, {
@@ -209,27 +242,7 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 2, outputDirectory: outputDirectory ? `${outputDirectory}/delay-2bars` : undefined }),
     runHistoricalReplay(dataset, { ...common, executionDelayBars: 3, outputDirectory: outputDirectory ? `${outputDirectory}/delay-3bars` : undefined })
   ]);
-  const perturbations = strategy === "breakout-v4" ? [
-    { label: "lookback-minus-5pct", patch: { breakoutLookback4h: Math.max(10, Math.round(parameters.breakoutLookback4h * 0.95)) } },
-    { label: "lookback-plus-5pct", patch: { breakoutLookback4h: Math.round(parameters.breakoutLookback4h * 1.05) } },
-    { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },
-    { label: "target-rr-plus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 1.05 } }
-  ] : strategy === "multi-venue-v3" ? [
-    { label: "opportunity-score-minus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 0.95 } },
-    { label: "opportunity-score-plus-5pct", patch: { minimumOpportunityScore: parameters.minimumOpportunityScore * 1.05 } },
-    { label: "net-edge-plus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 1.05 } },
-    { label: "runner-break-even-plus-5pct", patch: { breakEvenTargetFraction: parameters.breakEvenTargetFraction * 1.05 } }
-  ] : strategy === "research-v2" ? [
-    { label: "direction-strength-minus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 0.95 } },
-    { label: "direction-strength-plus-5pct", patch: { minimumDirectionStrength: parameters.minimumDirectionStrength * 1.05 } },
-    { label: "net-edge-minus-5pct", patch: { minimumNetTradableEdgePct: parameters.minimumNetTradableEdgePct * 0.95 } },
-    { label: "extension-plus-5pct", patch: { maximumExtensionAtr1h: parameters.maximumExtensionAtr1h * 1.05 } }
-  ] : [
-    { label: "signal-threshold-minus-5pct", patch: { signalThreshold: parameters.signalThreshold * 0.95 } },
-    { label: "signal-threshold-plus-5pct", patch: { signalThreshold: parameters.signalThreshold * 1.05 } },
-    { label: "stop-atr-minus-5pct", patch: { stopAtrMultiple: parameters.stopAtrMultiple * 0.95 } },
-    { label: "target-rr-plus-5pct", patch: { targetRiskMultiple: parameters.targetRiskMultiple * 1.05 } }
-  ];
+  const perturbations = robustnessParameterPerturbations(strategy, parameters);
   const parameterRuns = [];
   for (const item of perturbations) {
     const perturbed = { ...parameters, ...item.patch, version: `${parameters.version}-${item.label}` };
@@ -258,6 +271,7 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
   const tradeOrderResampling = summarizeDistribution(tradeOrderPaths);
   const blockBootstrapSummary = { blockSize, ...summarizeDistribution(blockPaths) };
   const pairedAccounting = {
+    observedTradeBaseline: repriceObservedTrades(trades, initialCapital),
     costDeterioration150Pct: repriceObservedTrades(trades, initialCapital, { feeMultiplier: 1.5 }),
     slippageDeterioration200Pct: repriceObservedTrades(trades, initialCapital, { slippageMultiplier: 2 })
   };
@@ -278,9 +292,9 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
       deterministicStress,
       base: baseSummary
     })
-    : { passed: true, policy: null, gateReasons: [], warnings: [] };
+    : { passed: true, status: "ok", policy: null, failureReasons: [], blockedReasons: [], gateReasons: [], warnings: [] };
   return {
-    status: gate.passed ? "ok" : "partial",
+    status: gate.status,
     reason: gate.gateReasons.length ? gate.gateReasons.join(", ") : null,
     runType: "MONTE_CARLO_AND_REPLAY_ROBUSTNESS",
     generatedAt: new Date().toISOString(),
@@ -303,6 +317,7 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
     gate,
     modelLimitations: [
       "Trade-order and block-bootstrap paths reuse fixed observed CNY outcomes; they do not dynamically resize after equity changes or stop at zero equity.",
+      "Paired-accounting drawdown is calculated from closed-trade CNY outcomes and must be compared with observedTradeBaseline, not the full replay's intratrade drawdown.",
       "Fresh cost/slippage replays may change contract-step acceptance and single-slot occupancy. Paired accounting is the monotonic same-trade cost stress; fresh replay is path-dependence evidence.",
       "Fifteen-minute history cannot reproduce a one-to-five-minute delayed fill without fabricating sub-bar prices; that evidence must come from timestamped Shadow/Paper observations."
     ],

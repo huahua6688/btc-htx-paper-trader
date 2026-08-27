@@ -317,6 +317,25 @@ test("zero-trade delayed execution evidence records V4 robustness as PARTIAL", (
   assert.match(record.summary.reason, /no trades/);
 });
 
+test("a completed robustness gate failure is recorded as FAILED", () => {
+  const record = robustnessRunRecord({
+    directory: "/tmp/robustness",
+    replay: { tradeCount: 215 },
+    report: {
+      status: "failed",
+      reason: "PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-minus-5pct",
+      gate: {
+        passed: false,
+        status: "failed",
+        failureReasons: ["PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-minus-5pct"],
+        blockedReasons: []
+      }
+    }
+  });
+  assert.equal(record.status, "FAILED");
+  assert.equal(record.summary.robustnessGate.status, "failed");
+});
+
 test("selected V4 robustness preserves winner provenance in the registry", () => {
   const record = robustnessRunRecord({
     directory: "/tmp/robustness",

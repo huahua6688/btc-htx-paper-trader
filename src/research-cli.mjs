@@ -940,7 +940,7 @@ export function researchV2RunRecord(result) {
 
 export function robustnessRunRecord(result) {
   return {
-    status: result?.report?.status === "ok" ? "PASSED" : "PARTIAL",
+    status: result?.report?.status === "ok" ? "PASSED" : result?.report?.status === "failed" ? "FAILED" : "PARTIAL",
     artifactPath: result?.directory ?? null,
     dataManifestHash: dataManifestHashOf(result),
     strategyVersion: result?.selection?.parameters?.version ?? result?.replay?.strategyVersion ?? null,
