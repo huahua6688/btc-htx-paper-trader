@@ -242,3 +242,32 @@ test("exact-Paper selector can invoke the real replay core for a candidate", asy
   assert.equal(result.isolation.holdoutOpened, false);
   assert.equal(result.championChanged, false);
 });
+
+test("exact-Paper winner artifact is hash-verified before downstream research", async () => {
+  const { verifyBreakoutV4SelectionReport } = await import("../src/research-cli.mjs");
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 4);
+  const report = await runBreakoutV4ExactPaperDevelopmentSelection(syntheticCatalog(), {
+    candidates: [candidate],
+    replayRunner: async (dataset, options) => fakePaperReplay(options.parameters)
+  });
+  const selected = verifyBreakoutV4SelectionReport(report);
+  assert.equal(selected.parameterHash, candidate.parameterHash);
+  assert.equal(selected.parameters.targetRiskMultiple, 4);
+  assert.equal(selected.replayOptions.executionDelayBars, 1);
+  assert.deepEqual(selected.replayOptions.portfolio, { maxOpenPositions: 1, positionMode: "NET", allowPyramiding: false });
+  assert.equal(selected.developmentRange.to, "2026-01-17T06:15:00.000Z");
+
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, winner: { ...report.winner, parameterHash: "tampered" } }),
+    /parameterHash/
+  );
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, selectionHash: "tampered" }),
+    /selectionHash/
+  );
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, selectionStatus: "NO_ELIGIBLE_WINNER", winner: null }),
+    /没有通过 eligibility gate/
+  );
+});

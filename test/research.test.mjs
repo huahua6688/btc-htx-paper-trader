@@ -234,11 +234,20 @@ test("robustness runs resampling, block bootstrap, worsened costs/delay and para
   const to = new Date(dataset.candles.at(-1).timestamp).toISOString();
   const parameters = { ...CHALLENGER_BASE_PARAMETERS, version: "test-robust", signalThreshold: 0, immediateThreshold: 0, regimeFilterEnabled: false };
   const replay = await runHistoricalReplay(dataset, { strategy: "challenger", parameters, from, to });
-  const result = await runMonteCarloRobustness(dataset, replay, { parameters, from, to, iterations: 20 });
+  const replayOptions = {
+    eventStride: 1,
+    executionDelayBars: 1,
+    forceCloseAtEnd: true,
+    portfolio: { maxOpenPositions: 1, positionMode: "NET", allowPyramiding: false }
+  };
+  const result = await runMonteCarloRobustness(dataset, replay, { parameters, from, to, iterations: 20, replayOptions });
   assert.equal(result.status, "ok");
   assert.equal(result.tradeOrderResampling.simulations, 20);
   assert.equal(result.blockBootstrap.simulations, 20);
   assert.ok(result.deterministicStress.executionDelay3Bars);
+  assert.equal(result.executionContract.baseExecutionDelayBars, 1);
+  assert.equal(result.executionContract.portfolio.maxOpenPositions, 1);
+  assert.equal(result.deterministicStress.costDeterioration150Pct.portfolioLimits.maxOpenPositions, 1);
   assert.equal(result.parameterPerturbation.length, 4);
 });
 

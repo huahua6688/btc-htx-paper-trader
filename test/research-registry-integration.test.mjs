@@ -317,6 +317,25 @@ test("zero-trade delayed execution evidence records V4 robustness as PARTIAL", (
   assert.match(record.summary.reason, /no trades/);
 });
 
+test("selected V4 robustness preserves winner provenance in the registry", () => {
+  const record = robustnessRunRecord({
+    directory: "/tmp/robustness",
+    dataset: { manifest: { manifestHash: "catalog-hash" } },
+    replay: { tradeCount: 215, strategyVersion: "breakout-challenger-v4.0.0" },
+    selection: { parameters: { version: "breakout-challenger-v4.0.0" } },
+    selectionSource: {
+      parameterHash: "parameter-hash",
+      selectionHash: "selection-hash",
+      datasetBinding: { matchesSelectionDataset: true }
+    },
+    report: { status: "ok", delayedExecutionEvidence: { available: true } }
+  });
+  assert.equal(record.status, "PASSED");
+  assert.equal(record.strategyVersion, "breakout-challenger-v4.0.0");
+  assert.equal(record.summary.selectionSource.parameterHash, "parameter-hash");
+  assert.equal(record.summary.selectionSource.datasetBinding.matchesSelectionDataset, true);
+});
+
 test("a failing invocation records exactly one BLOCKED or FAILED run and rethrows", async () => {
   for (const [error, expected] of [
     [Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }), "BLOCKED"],

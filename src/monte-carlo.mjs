@@ -58,6 +58,7 @@ function scenarioSummary(report) {
     profitFactor: report.performance.profitFactor,
     tradeSharpe: report.performance.tradeSharpe,
     totalCostsCny: report.performance.totalCostsCny,
+    portfolioLimits: report.portfolioLimits,
     executable: report.tradeCount > 0
   };
 }
@@ -69,7 +70,8 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
   to = baseReplay.requestedRange.to,
   iterations = 2_000,
   seed = 20260822,
-  outputDirectory
+  outputDirectory,
+  replayOptions = {}
 } = {}) {
   const trades = baseReplay.trades;
   if (!trades.length) {
@@ -86,6 +88,7 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
   const wins = values.filter((value) => value >= 0);
   const lossStreak = pathMetrics([...losses, ...wins], initialCapital);
   const common = {
+    ...replayOptions,
     strategy,
     parameters,
     from,
@@ -145,6 +148,13 @@ export async function runMonteCarloRobustness(dataset, baseReplay, {
     seed,
     sourceTrades: trades.length,
     base: scenarioSummary(baseReplay),
+    executionContract: {
+      eventStride: replayOptions.eventStride ?? 1,
+      baseExecutionDelayBars: replayOptions.executionDelayBars ?? 1,
+      forceCloseAtEnd: replayOptions.forceCloseAtEnd ?? true,
+      capitalProfile: baseReplay.capital?.capitalProfile ?? replayOptions.capitalProfile ?? null,
+      portfolio: baseReplay.portfolioLimits ?? replayOptions.portfolio ?? null
+    },
     tradeOrderResampling: summarizeDistribution(tradeOrderPaths),
     blockBootstrap: { blockSize, ...summarizeDistribution(blockPaths) },
     deterministicStress: {

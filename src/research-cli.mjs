@@ -20,7 +20,7 @@ import {
 } from "./replay-engine.mjs";
 import { DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
-import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
+import { BAR_MS, hashObject, readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
 import {
   RESEARCH_REGISTRY,
@@ -78,6 +78,76 @@ function range(args, defaults = null) {
   const to = args.to ?? defaults?.to;
   if (!from || !to) throw new Error("Both --from=<ISO> and --to=<ISO> are required. Use the full command for the predeclared multi-regime range.");
   return { from, to };
+}
+
+function enabled(value) {
+  return value !== undefined && !["0", "false", "no"].includes(String(value).toLowerCase());
+}
+
+/**
+ * 验证 exact-Paper 选参产物并提取赢家。
+ *
+ * 后续研究只能读取完整、未被篡改且确实通过 eligibility gate 的赢家；不能从
+ * 日志里手抄四个数字，也不能把 bestObservedCandidate 冒充 winner。
+ */
+export function verifyBreakoutV4SelectionReport(report) {
+  if (!report || typeof report !== "object") throw new Error("--selection 必须指向完整的 V4 exact-Paper selection.json");
+  if (report.runType !== "BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_ONLY_PARAMETER_SELECTION") {
+    throw new Error("--selection 不是 V4 exact-Paper 参数选择产物");
+  }
+  if (report.selectionStatus !== "ELIGIBLE_WINNER_FOUND" || !report.winner?.metrics?.eligible) {
+    throw new Error("V4 selection 没有通过 eligibility gate 的 winner");
+  }
+  if (report.strategyRoleAfterSelection !== "RESEARCH_SHADOW_CANDIDATE" || report.championChanged !== false) {
+    throw new Error("V4 selection 生命周期不安全：必须保持 Research/Shadow Candidate 且 Champion 未改变");
+  }
+  if (report.spec?.executionModel?.strategy !== "breakout-v4") throw new Error("V4 selection 的执行策略不是 breakout-v4");
+  if (!report.winner.parameters?.researchOnly) throw new Error("V4 selection winner 必须保持 researchOnly=true");
+  if (report.specHash !== hashObject(report.spec)) throw new Error("V4 selection specHash 校验失败");
+  if (report.winner.parameterHash !== hashObject(report.winner.parameters)) throw new Error("V4 selection parameterHash 校验失败");
+  if (report.selectionHash !== hashObject({ ...report, selectionHash: undefined })) throw new Error("V4 selection selectionHash 校验失败");
+  const from = new Date(report.spec?.developmentRange?.from).getTime();
+  const cutoff = new Date(report.spec?.developmentRange?.to).getTime();
+  if (!Number.isFinite(from) || !Number.isFinite(cutoff) || cutoff - BAR_MS <= from) {
+    throw new Error("V4 selection developmentRange 无效");
+  }
+  const execution = report.spec.executionModel;
+  return {
+    report,
+    parameters: report.winner.parameters,
+    parameterHash: report.winner.parameterHash,
+    selectionHash: report.selectionHash,
+    datasetManifestHash: report.datasetManifestHash,
+    developmentRange: {
+      from: new Date(from).toISOString(),
+      to: new Date(cutoff - BAR_MS).toISOString()
+    },
+    replayOptions: {
+      eventStride: Number(execution.eventStride),
+      executionDelayBars: Number(execution.executionDelayBars),
+      collectTrace: false,
+      forceCloseAtEnd: execution.forceCloseAtDevelopmentEnd === true,
+      capitalProfile: execution.capitalProfile,
+      portfolio: execution.portfolio
+    }
+  };
+}
+
+export async function loadBreakoutV4Selection(path) {
+  if (!path || path === true) throw new Error("--selection=<selection.json> 必须提供文件路径");
+  const report = await readJson(String(path));
+  if (!report) throw Object.assign(new Error(`ENOENT: V4 selection file not found: ${path}`), { code: "ENOENT" });
+  return verifyBreakoutV4SelectionReport(report);
+}
+
+function assertSelectionDataset(selection, dataset, { allowDifferent = false } = {}) {
+  const actual = dataset?.manifest?.manifestHash ?? null;
+  const expected = selection?.datasetManifestHash ?? null;
+  const matchesSelectionDataset = Boolean(actual && expected && actual === expected);
+  if (!matchesSelectionDataset && !allowDifferent) {
+    throw new Error(`V4 selection dataset manifest mismatch: expected ${expected}, received ${actual}. Only a declared follow-up replay may use --allow-different-dataset=true.`);
+  }
+  return { expectedManifestHash: expected, actualManifestHash: actual, matchesSelectionDataset };
 }
 
 function runId(prefix) { return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`; }
@@ -462,19 +532,27 @@ function defaultParametersFor(strategy) {
 async function replay(args) {
   // 先校验参数再加载数据集：未知策略是用法/逻辑错误（FAILED），
   // 不能因为数据集恰好也不存在而被误判成外部前置条件缺失（BLOCKED）。
-  const strategy = strategyOption(args, "strategy", "challenger");
+  const selection = args.selection ? await loadBreakoutV4Selection(args.selection) : null;
+  const strategy = strategyOption(args, "strategy", selection ? "breakout-v4" : "challenger");
+  if (selection && strategy !== "breakout-v4") throw new Error("--selection 只允许 strategy=breakout-v4");
   let dataset = await load(args);
   if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
-  const selected = range(args, dataset.manifest.requestedCoverage);
+  const datasetBinding = selection
+    ? assertSelectionDataset(selection, dataset, { allowDifferent: enabled(args["allow-different-dataset"]) })
+    : null;
+  const selected = range(args, selection?.developmentRange ?? dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId(`replay-${strategy}`));
   await mkdir(directory, { recursive: true });
-  const capital = capitalOptions(args);
+  if (selection && (args.capital !== undefined || args["reference-capital"] !== undefined || portfolioOptions(args))) {
+    throw new Error("--selection 回放固定沿用选参时的资金与组合执行契约，不能覆盖 capital/portfolio");
+  }
+  const capital = selection ? {} : capitalOptions(args);
   const report = await runHistoricalReplay(dataset, {
     strategy,
-    parameters: defaultParametersFor(strategy),
+    parameters: selection?.parameters ?? defaultParametersFor(strategy),
     ...selected,
     ...capital,
-    portfolio: portfolioOptions(args),
+    ...(selection?.replayOptions ?? { portfolio: portfolioOptions(args) }),
     outputDirectory: directory
   });
   const path = await save(join(directory, `${strategy}-replay.json`), report);
@@ -485,12 +563,23 @@ async function replay(args) {
     // 仓位上限直接决定成交笔数的上限，必须和收益一起显示，
     // 否则「两年只有二十几笔」会被误读成策略的自然频率。
     portfolioLimits: report.portfolioLimits,
-    entryRejections: report.entryRejections
+    entryRejections: report.entryRejections,
+    selectionSource: selection ? {
+      parameterHash: selection.parameterHash,
+      selectionHash: selection.selectionHash,
+      datasetBinding,
+      interpretation: datasetBinding.matchesSelectionDataset
+        ? "exact development replay"
+        : "declared follow-up replay on a different catalog; not untouched Final OOS"
+    } : null
   }, null, 2)}\n`);
-  return { dataset, report, directory };
+  return { dataset, report, directory, selection, datasetBinding };
 }
 
 async function validation(args) {
+  if (args.selection) {
+    throw new Error("Generic validate --selection is forbidden: this winner was selected on the full development interval, so reusing those windows would not be honest OOS. Use robustness --selection, then a declared follow-up replay or a matured untouched Final OOS.");
+  }
   const baselineStrategy = strategyOption(args, "baseline-strategy", "challenger");
   const candidateStrategy = strategyOption(args, "candidate-strategy", "challenger");
   let dataset = await load(args);
@@ -523,22 +612,34 @@ async function similarity(args) {
 }
 
 async function robustness(args) {
-  const strategy = strategyOption(args, "strategy", "challenger");
+  const selection = args.selection ? await loadBreakoutV4Selection(args.selection) : null;
+  const strategy = strategyOption(args, "strategy", selection ? "breakout-v4" : "challenger");
+  if (selection && strategy !== "breakout-v4") throw new Error("--selection 只允许 strategy=breakout-v4");
   let dataset = await load(args);
   if (strategy === "multi-venue-v3") dataset = await attachMultiVenue(dataset, args);
-  const selected = range(args, dataset.manifest.requestedCoverage);
+  const datasetBinding = selection ? assertSelectionDataset(selection, dataset) : null;
+  const selected = range(args, selection?.developmentRange ?? dataset.manifest.requestedCoverage);
   const directory = resolveOutputPath(runId("robustness"));
-  const parameters = defaultParametersFor(strategy);
-  const capital = capitalOptions(args);
+  if (selection && (args.capital !== undefined || args["reference-capital"] !== undefined || portfolioOptions(args))) {
+    throw new Error("--selection robustness 固定沿用选参时的资金与组合执行契约，不能覆盖 capital/portfolio");
+  }
+  const parameters = selection?.parameters ?? defaultParametersFor(strategy);
+  const capital = selection ? {} : capitalOptions(args);
+  const replayOptions = selection?.replayOptions ?? {};
   const replay = await runHistoricalReplay(dataset, {
-    strategy, parameters, ...selected, ...capital, outputDirectory: join(directory, "base")
+    ...replayOptions, strategy, parameters, ...selected, ...capital, outputDirectory: join(directory, "base")
   });
   const report = await runMonteCarloRobustness(dataset, replay, {
-    strategy, parameters, ...selected, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios")
+    strategy, parameters, ...selected, replayOptions, iterations: Number(args.iterations ?? 2_000), outputDirectory: join(directory, "scenarios")
   });
   const path = await save(join(directory, "robustness-report.json"), report);
-  process.stdout.write(`${JSON.stringify({ path, report }, null, 2)}\n`);
-  return { dataset, replay, report, directory };
+  const selectionSource = selection ? {
+    parameterHash: selection.parameterHash,
+    selectionHash: selection.selectionHash,
+    datasetBinding
+  } : null;
+  process.stdout.write(`${JSON.stringify({ path, selectionSource, report }, null, 2)}\n`);
+  return { dataset, replay, report, directory, selection, selectionSource };
 }
 
 async function counterfactual(args) {
@@ -842,9 +943,11 @@ export function robustnessRunRecord(result) {
     status: result?.report?.status === "ok" ? "PASSED" : "PARTIAL",
     artifactPath: result?.directory ?? null,
     dataManifestHash: dataManifestHashOf(result),
+    strategyVersion: result?.selection?.parameters?.version ?? result?.replay?.strategyVersion ?? null,
     summary: {
       status: result?.report?.status ?? null,
       reason: result?.report?.reason ?? null,
+      selectionSource: result?.selectionSource ?? null,
       delayedExecutionEvidence: result?.report?.delayedExecutionEvidence ?? null,
       stages: { baseTrades: result?.replay?.tradeCount ?? null, scenarios: result?.report?.scenarios?.length ?? null }
     }
