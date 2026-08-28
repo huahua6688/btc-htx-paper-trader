@@ -46,6 +46,7 @@
     "research:v4-resilient-select": "node src/research-cli.mjs research:v4-resilient-select",
     "research:v4-shadow-activate": "node src/research-cli.mjs research:v4-shadow-activate",
     "research:v4-shadow-status": "node src/research-cli.mjs research:v4-shadow-status",
+    "research:v12-v4-fusion-shadow-activate": "node src/research-cli.mjs research:v12-v4-fusion-shadow-activate",
     "research:v4-lookahead": "node src/research-cli.mjs research:v4-lookahead",
     "research:runs": "node src/research-cli.mjs research:runs",
     "research:register-candidate": "node src/research-cli.mjs research:register-candidate",

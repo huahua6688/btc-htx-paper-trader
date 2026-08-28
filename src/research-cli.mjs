@@ -41,6 +41,8 @@ import {
 } from "./multi-venue-catalog.mjs";
 import { MULTI_VENUE_CHALLENGER_PARAMETERS } from "./multi-venue-challenger.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "./breakout-challenger.mjs";
+import { V12_V4_FUSION_PARAMETERS } from "./v12-v4-fusion.mjs";
+import { activateV12V4FusionShadow } from "./v12-v4-fusion.mjs";
 import {
   defaultHtxDownloadCenterDirectory,
   fetchHtxDownloadCenterOnDemand,
@@ -477,6 +479,43 @@ async function breakoutV4ShadowStatus() {
   return status;
 }
 
+async function v12V4FusionShadowActivate(args) {
+  if (!args.replay || args.replay === true) throw new Error("research:v12-v4-fusion-shadow-activate requires --replay=<fusion replay.json>");
+  if (!args.robustness || args.robustness === true) throw new Error("research:v12-v4-fusion-shadow-activate requires --robustness=<fusion robustness-report.json>");
+  const replay = await readJson(String(args.replay));
+  if (!replay) throw Object.assign(new Error(`ENOENT: fusion replay not found: ${args.replay}`), { code: "ENOENT" });
+  const robustnessReport = await readJson(String(args.robustness));
+  if (!robustnessReport) throw Object.assign(new Error(`ENOENT: fusion robustness report not found: ${args.robustness}`), { code: "ENOENT" });
+  const activation = await activateV12V4FusionShadow({
+    replay,
+    replayPath: String(args.replay),
+    robustnessReport,
+    robustnessPath: String(args.robustness),
+    databasePath: args["shadow-db"] && args["shadow-db"] !== true ? String(args["shadow-db"]) : null,
+    replaceActive: enabled(args["replace-active"])
+  });
+  process.stdout.write(`${JSON.stringify({
+    activated: activation.activated,
+    idempotent: activation.idempotent,
+    replaced: activation.replaced,
+    activeConfigPath: activation.activeConfigPath,
+    archivedConfigPath: activation.archivedConfigPath,
+    shadow: {
+      status: activation.config.status,
+      strategyHash: activation.config.strategyHash,
+      databasePath: activation.config.databasePath,
+      paperOnly: activation.config.paperOnly,
+      numericalRobustnessPassed: activation.config.numericalRobustnessPassed,
+      pendingEvidence: activation.config.pendingEvidence,
+      shadowPolicy: activation.config.shadowPolicy,
+      automaticPromotion: activation.config.automaticPromotion
+    },
+    restartRequired: activation.activated,
+    championChanged: false
+  }, null, 2)}\n`);
+  return activation;
+}
+
 async function breakoutV4Lookahead(args) {
   const dataset = await load(args);
   const spec = breakoutV4SpecOption(args);
@@ -641,6 +680,7 @@ function defaultParametersFor(strategy) {
   if (strategy === "anti-chase") return ANTI_CHASE_PARAMETERS;
   if (strategy === "multi-venue-v3") return MULTI_VENUE_CHALLENGER_PARAMETERS;
   if (strategy === "breakout-v4") return BREAKOUT_V4_PARAMETERS;
+  if (strategy === "v12-v4-fusion") return V12_V4_FUSION_PARAMETERS;
   return CHALLENGER_BASE_PARAMETERS;
 }
 
@@ -1172,6 +1212,27 @@ const COMMANDS = {
     })
   },
   "research:v4-shadow-status": { exempt: true, handler: () => breakoutV4ShadowStatus() },
+  "research:v12-v4-fusion-shadow-activate": {
+    handler: (args) => v12V4FusionShadowActivate(args),
+    runType: "V12_V4_FUSION_SHADOW_ACTIVATION",
+    record: (result) => ({
+      status: "PARTIAL",
+      artifactPath: result?.activeConfigPath ?? null,
+      strategyVersion: result?.config?.version ?? null,
+      summary: {
+        activated: result?.activated ?? false,
+        idempotent: result?.idempotent ?? false,
+        replaced: result?.replaced ?? false,
+        strategyHash: result?.config?.strategyHash ?? null,
+        robustnessHash: result?.config?.robustnessHash ?? null,
+        shadowDatabasePath: result?.config?.databasePath ?? null,
+        pendingEvidence: result?.config?.pendingEvidence ?? [],
+        paperOnly: result?.config?.paperOnly ?? false,
+        automaticPromotion: false,
+        championChanged: false
+      }
+    })
+  },
   "data:download-center": {
     handler: (args) => downloadCenterUpdate(args),
     runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_CATALOG_UPDATE",

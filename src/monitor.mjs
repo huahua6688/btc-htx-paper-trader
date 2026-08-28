@@ -17,14 +17,22 @@ import { analyzeBreakoutChallenger } from "./breakout-challenger.mjs";
 import { resolveNextMonitorWake } from "./monitor-schedule.mjs";
 import { collectMarketSnapshot } from "./market-data.mjs";
 import { verifyBreakoutV4ActiveShadowConfiguration } from "./breakout-v4-shadow.mjs";
+import { analyzeV12V4Fusion, V12_V4_FUSION_PARAMETERS, verifyV12V4FusionActiveShadowConfiguration } from "./v12-v4-fusion.mjs";
 
 const once = process.argv.includes("--once");
+const mainStrategy = String(process.env.PAPER_MAIN_STRATEGY ?? "champion").trim() || "champion";
+if (!["champion", "v12-v4-fusion"].includes(mainStrategy)) {
+  throw new Error(`Unsupported PAPER_MAIN_STRATEGY: ${mainStrategy}`);
+}
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
-if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2", "multi-venue-v3", "breakout-v4"].includes(activeShadow.strategyType))) {
+if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2", "multi-venue-v3", "breakout-v4", "v12-v4-fusion"].includes(activeShadow.strategyType))) {
   throw new Error("Active Shadow strategy is not an approved Paper-only research configuration");
 }
 if (activeShadow?.strategyType === "breakout-v4") {
   verifyBreakoutV4ActiveShadowConfiguration(activeShadow);
+}
+if (activeShadow?.strategyType === "v12-v4-fusion") {
+  verifyV12V4FusionActiveShadowConfiguration(activeShadow);
 }
 const activeEdgeModel = activeShadow?.strategyType === "tradable-edge"
   ? await readJson(activeShadow.modelPath)
@@ -51,6 +59,8 @@ const shadowAnalyze = activeShadow
       })
     : activeShadow.strategyType === "breakout-v4"
     ? (market) => analyzeBreakoutChallenger(market, activeShadow.parameters)
+    : activeShadow.strategyType === "v12-v4-fusion"
+    ? (market) => analyzeV12V4Fusion(market, activeShadow.parameters)
     : activeShadow.strategyType === "anti-chase"
     ? (market) => analyzeAntiChaseChallenger(market, activeShadow.parameters)
     : activeShadow.strategyType === "tradable-edge"
@@ -62,7 +72,7 @@ const shadowAnalyze = activeShadow
     : (market) => analyzeHistoricalCompatible(market, activeShadow.parameters)
   : analyzeChallenger;
 const db = openPaperDatabase();
-const shadowDb = SHADOW_CONFIG.enabled
+const shadowDb = SHADOW_CONFIG.enabled && mainStrategy !== "v12-v4-fusion"
   ? openPaperDatabase(shadowDatabasePath, {
       ...PAPER_CONFIG,
       databasePath: shadowDatabasePath,
@@ -93,7 +103,7 @@ let databaseClosed = false;
 // marketSnapshot 为 null 表示这一轮是研究边界唤醒：主 Champion 没有跑，
 // Shadow 自己采集一次只读行情，绝不复用上一轮的旧快照。
 async function shadowCycle(marketSnapshot) {
-  if (!shadowDb) return;
+  if (!shadowDb || mainStrategy === "v12-v4-fusion") return;
   try {
     const shadow = await runMonitorCycle(shadowDb, {
       collect: async () => {
@@ -128,6 +138,9 @@ async function cycle({ shadowOnly = false } = {}) {
       return;
     }
     const result = await runMonitorCycle(db, {
+      analyze: mainStrategy === "v12-v4-fusion"
+        ? (market) => analyzeV12V4Fusion(market, V12_V4_FUSION_PARAMETERS)
+        : undefined,
       archive: marketArchive
         ? (market, { observedAt }) => marketArchive.archiveSnapshot(market, {
             observedAt,

@@ -6,6 +6,7 @@ import { openPaperDatabase } from "./db.mjs";
 import { evaluateV4RobustnessEvidence } from "./monte-carlo.mjs";
 import { calculatePerformance } from "./paper-engine.mjs";
 import { hashObject, readJson, resolveResearchPath, round, writeJsonAtomic } from "./research-utils.mjs";
+import { evaluateV12V4FusionShadowEvidence, verifyV12V4FusionActiveShadowConfiguration } from "./v12-v4-fusion.mjs";
 
 export const BREAKOUT_V4_SHADOW_POLICY = Object.freeze({
   minimumCalendarDays: 30,
@@ -286,7 +287,35 @@ export function inspectBreakoutV4Shadow({
   try {
     const config = JSON.parse(readFileSync(activeConfigPath, "utf8"));
     if (config.strategyType !== "breakout-v4") {
-      return { available: true, strategyType: config.strategyType ?? "unknown", config, evidence: null, activeConfigPath };
+      if (config.strategyType !== "v12-v4-fusion") {
+        return { available: true, strategyType: config.strategyType ?? "unknown", config, evidence: null, activeConfigPath };
+      }
+      verifyV12V4FusionActiveShadowConfiguration(config);
+      if (!existsSync(config.databasePath)) {
+        return {
+          available: true,
+          strategyType: config.strategyType,
+          config,
+          evidence: evaluateV12V4FusionShadowEvidence({ config, snapshots: [], performance: null }),
+          databaseAvailable: false,
+          activeConfigPath
+        };
+      }
+      const fusionDb = openPaperDatabase(config.databasePath, undefined, { readOnly: true });
+      try {
+        const snapshots = fusionDb.getSnapshots();
+        const performance = calculatePerformance(fusionDb);
+        return {
+          available: true,
+          strategyType: config.strategyType,
+          config,
+          evidence: evaluateV12V4FusionShadowEvidence({ config, snapshots, performance }),
+          databaseAvailable: true,
+          activeConfigPath
+        };
+      } finally {
+        fusionDb.close();
+      }
     }
     verifyBreakoutV4ActiveShadowConfiguration(config);
     if (!existsSync(config.databasePath)) {

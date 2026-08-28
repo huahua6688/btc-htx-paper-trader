@@ -30,6 +30,7 @@ import {
   BREAKOUT_V4_PARAMETERS,
   resolveBreakoutV4Execution
 } from "./breakout-challenger.mjs";
+import { analyzeV12V4Fusion, V12_V4_FUSION_PARAMETERS } from "./v12-v4-fusion.mjs";
 
 /**
  * 研究资金视角。两者必须分开报告，绝不能混为一谈：
@@ -110,7 +111,7 @@ export function summarizeEntryRejections(rejectionCounts) {
  */
 export const REPLAY_STRATEGIES = Object.freeze([
   "champion", "challenger", "historical-compatible",
-  "tradable-edge", "anti-chase", "research-v2", "data-tiered", "multi-venue-v3", "breakout-v4"
+  "tradable-edge", "anti-chase", "research-v2", "data-tiered", "multi-venue-v3", "breakout-v4", "v12-v4-fusion"
 ]);
 
 export const REPLAY_ASSUMPTIONS = Object.freeze({
@@ -331,6 +332,8 @@ function buildReport(strategy, market, parameters, config) {
           ? analyzeMultiVenueChallenger(market, parameters, config)
         : strategy === "breakout-v4"
           ? analyzeBreakoutChallenger(market, parameters, config)
+        : strategy === "v12-v4-fusion"
+          ? analyzeV12V4Fusion(market, parameters, config)
       : analyzeChallenger(market, parameters, config);
   const candle = market.replay.eventCandle;
   report.latest15mBar = {
@@ -502,6 +505,7 @@ export async function runHistoricalReplay(dataset, {
   if (strategy === "data-tiered" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = DATA_TIERED_PARAMETERS;
   if (strategy === "multi-venue-v3" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = MULTI_VENUE_CHALLENGER_PARAMETERS;
   if (strategy === "breakout-v4" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = BREAKOUT_V4_PARAMETERS;
+  if (strategy === "v12-v4-fusion" && parameters === CHALLENGER_BASE_PARAMETERS) parameters = V12_V4_FUSION_PARAMETERS;
   const rangeStart = new Date(from).getTime();
   const rangeEnd = new Date(to).getTime();
   // Multi-scale research profiles need more than the frozen engine's 60 daily
@@ -713,6 +717,11 @@ export async function runHistoricalReplay(dataset, {
         "Signals use completed 4h candles only, enter at the next 15m open, and re-anchor the 2.5 ATR stop and fixed 4R target to that simulated fill.",
         "HARD_BRACKET_HOLD_V1 preserves the original hard SL/TP and disables break-even, trailing, target extension, and short-horizon signal exits.",
         "Funding is included as timestamp-visible carrying cost only; derivatives and cross-venue observations are not directional triggers."
+      ] : strategy === "v12-v4-fusion" ? [
+        "The V1.2 + V4 fusion is one research-only decision stream: V1.2 supplies short-term entry quality and V4 supplies the completed-4h direction guard.",
+        "A position is opened only when V1.2 has an immediate LONG/SHORT decision and the V4 4h structure supports the same direction; no two positions or two equity curves are combined.",
+        "When a same-direction V4 breakout is also confirmed, the single fused position uses the V4 hard bracket; otherwise it uses the V1.2 plan.",
+        "The frozen V1.2 Champion remains unchanged and unavailable historical fields are never synthesized."
       ] : [
         "Challenger uses only timestamp-valid candle and Funding fields; it is a research strategy and does not replace Champion."
       ]
