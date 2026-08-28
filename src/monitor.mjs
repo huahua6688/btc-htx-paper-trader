@@ -16,11 +16,15 @@ import { collectCurrentMultiVenueFunding } from "./multi-venue-catalog.mjs";
 import { analyzeBreakoutChallenger } from "./breakout-challenger.mjs";
 import { resolveNextMonitorWake } from "./monitor-schedule.mjs";
 import { collectMarketSnapshot } from "./market-data.mjs";
+import { verifyBreakoutV4ActiveShadowConfiguration } from "./breakout-v4-shadow.mjs";
 
 const once = process.argv.includes("--once");
 const activeShadow = await readJson(resolveResearchPath("active-shadow-strategy.json"));
 if (activeShadow && (activeShadow.paperOnly !== true || !["historical-compatible", "tradable-edge", "anti-chase", "research-v2", "multi-venue-v3", "breakout-v4"].includes(activeShadow.strategyType))) {
   throw new Error("Active Shadow strategy is not an approved Paper-only research configuration");
+}
+if (activeShadow?.strategyType === "breakout-v4") {
+  verifyBreakoutV4ActiveShadowConfiguration(activeShadow);
 }
 const activeEdgeModel = activeShadow?.strategyType === "tradable-edge"
   ? await readJson(activeShadow.modelPath)

@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   BREAKOUT_V4_DEVELOPMENT_SPEC,
+  BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC,
   BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   breakoutV4CandidateGrid,
+  runBreakoutV4ExactPaperDevelopmentSelection,
+  runBreakoutV4LocalResilienceSelection,
   runBreakoutV4DevelopmentSelection
 } from "../src/breakout-v4-selection.mjs";
 import { BREAKOUT_V4_PARAMETERS } from "../src/breakout-challenger.mjs";
@@ -30,7 +33,60 @@ function syntheticCatalog() {
     });
     prior = close;
   }
-  return { manifest: { manifestHash: "synthetic-development-catalog" }, candles };
+  return {
+    manifest: {
+      manifestHash: "synthetic-development-catalog",
+      datasetId: "synthetic-development-catalog",
+      requestedCoverage: {
+        from: BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.from,
+        to: BREAKOUT_V4_DEVELOPMENT_SPEC.developmentRange.to
+      }
+    },
+    candles,
+    funding: [],
+    series: {}
+  };
+}
+
+function fakePaperReplay(parameters) {
+  const start = new Date("2024-11-01T00:00:00.000Z").getTime();
+  const end = new Date(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+  const width = (end - start + 1) / 4;
+  const unstable = parameters.targetRiskMultiple === 5;
+  const segmentNet = unstable ? [-10, 1_000, 10, -10] : [20, 20, 20, 20];
+  const trades = [];
+  for (let segment = 0; segment < 4; segment += 1) {
+    const positiveGross = segmentNet[segment] > 0 ? segmentNet[segment] + 10 : 10;
+    const negativeGross = positiveGross - segmentNet[segment];
+    for (let index = 0; index < 10; index += 1) {
+      const net = index < 5 ? positiveGross / 5 : -negativeGross / 5;
+      trades.push({
+        opened_at: new Date(start + segment * width + (index + 1) * 60_000).toISOString(),
+        net_pnl_cny: net,
+        gross_pnl_cny: net + 0.1
+      });
+    }
+  }
+  const netPnlCny = segmentNet.reduce((sum, value) => sum + value, 0);
+  return {
+    effectiveRange: { from: new Date(start).toISOString(), to: new Date(end).toISOString() },
+    capital: { initialCapitalCny: 1_000 },
+    trades,
+    tradeCount: trades.length,
+    performance: {
+      totalTrades: trades.length,
+      wins: 20,
+      cumulativePnlCny: netPnlCny,
+      cumulativeReturnPct: netPnlCny / 10,
+      profitFactor: unstable ? 2.5 : 1.5,
+      expectancyCny: netPnlCny / trades.length,
+      maxDrawdownPct: unstable ? 20 : 8,
+      tradeSharpe: unstable ? 1.8 : 1.1,
+      totalCostsCny: 4
+    },
+    entryRejections: { total: 0 },
+    portfolioLimits: { maxOpenPositions: 1, positionMode: "NET", allowPyramiding: false }
+  };
 }
 
 test("V4 development grid and selection are reproducible without post-cutoff outcomes", () => {
@@ -125,4 +181,159 @@ test("--retry-unavailable 只清掉保留窗口拒绝的完成标记", async () 
   }
   assert.deepEqual(Object.keys(cleared).sort(), ["funding", "kline"]);
   assert.equal(cleared.kline.records, 67104);
+});
+
+test("exact-Paper selector prefers cross-segment stability over one concentrated profit period", async () => {
+  const dataset = syntheticCatalog();
+  const grid = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC);
+  const stable = grid.find((item) => item.parameters.targetRiskMultiple === 4);
+  const unstable = grid.find((item) => item.parameters.targetRiskMultiple === 5);
+  let calls = 0;
+  const replayRunner = async (cutoffDataset, options) => {
+    calls += 1;
+    const cutoff = new Date(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+    assert.ok(cutoffDataset.candles.every((item) => Number(item.timestamp) + BAR_MS <= cutoff));
+    assert.ok(cutoffDataset.funding.every((item) => Number(item.timestamp) <= cutoff));
+    return fakePaperReplay(options.parameters);
+  };
+  const result = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates: [unstable, stable],
+    replayRunner
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.search.candidateCount, 2);
+  assert.equal(result.search.exactPaperCandidateCount, 2);
+  assert.equal(result.winner.parameterHash, stable.parameterHash);
+  assert.equal(result.winner.metrics.positiveSegments, 4);
+  assert.equal(result.bestObservedCandidate.parameterHash, stable.parameterHash);
+  const rejected = result.candidates.find((item) => item.parameterHash === unstable.parameterHash);
+  assert.equal(rejected.metrics.eligible, false);
+  assert.ok(rejected.metrics.eligibilityReasons.includes("MINIMUM_POSITIVE_SEGMENTS_NOT_MET"));
+  assert.ok(rejected.metrics.eligibilityReasons.includes("SINGLE_SEGMENT_PROFIT_CONCENTRATION_EXCEEDED"));
+  assert.equal(result.isolation.holdoutOpened, false);
+});
+
+test("exact-Paper selector excludes poisoned post-cutoff rows before every replay", async () => {
+  const dataset = syntheticCatalog();
+  const cutoff = new Date(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC.developmentRange.to).getTime();
+  dataset.funding.push({ timestamp: cutoff + 1, rate: 999 });
+  dataset.series.markPrice = [{ eventTime: cutoff + 1, visibleAt: cutoff + 1, close: 999_999 }];
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 4);
+  const result = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates: [candidate],
+    replayRunner: async (cutoffDataset, options) => {
+      assert.equal(cutoffDataset.funding.length, 0);
+      assert.equal(cutoffDataset.series.markPrice.length, 0);
+      return fakePaperReplay(options.parameters);
+    }
+  });
+  assert.equal(result.isolation.postCutoffOutcomeFieldsRead, false);
+  assert.ok(new Date(result.isolation.maximumCandleVisibleAtRead).getTime() <= cutoff);
+  assert.equal(result.winner.parameterHash, candidate.parameterHash);
+});
+
+test("exact-Paper selector can invoke the real replay core for a candidate", async () => {
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 5 && item.parameters.stopAtrMultiple === 1.5);
+  const result = await runBreakoutV4ExactPaperDevelopmentSelection(syntheticCatalog(), { candidates: [candidate] });
+  assert.equal(result.search.exactPaperCandidateCount, 1);
+  assert.equal(result.bestObservedCandidate.metrics.executionMode, "EXACT_PAPER");
+  assert.ok(result.bestObservedCandidate.metrics.entryRejections);
+  assert.equal(result.isolation.holdoutOpened, false);
+  assert.equal(result.championChanged, false);
+});
+
+test("exact-Paper winner artifact is hash-verified before downstream research", async () => {
+  const { verifyBreakoutV4SelectionReport } = await import("../src/research-cli.mjs");
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 4);
+  const report = await runBreakoutV4ExactPaperDevelopmentSelection(syntheticCatalog(), {
+    candidates: [candidate],
+    replayRunner: async (dataset, options) => fakePaperReplay(options.parameters)
+  });
+  const selected = verifyBreakoutV4SelectionReport(report);
+  assert.equal(selected.parameterHash, candidate.parameterHash);
+  assert.equal(selected.parameters.targetRiskMultiple, 4);
+  assert.equal(selected.replayOptions.executionDelayBars, 1);
+  assert.deepEqual(selected.replayOptions.portfolio, { maxOpenPositions: 1, positionMode: "NET", allowPyramiding: false });
+  assert.equal(selected.developmentRange.to, "2026-01-17T06:15:00.000Z");
+
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, winner: { ...report.winner, parameterHash: "tampered" } }),
+    /parameterHash/
+  );
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, selectionHash: "tampered" }),
+    /selectionHash/
+  );
+  assert.throws(
+    () => verifyBreakoutV4SelectionReport({ ...report, selectionStatus: "NO_ELIGIBLE_WINNER", winner: null }),
+    /没有通过 eligibility gate/
+  );
+});
+
+test("local-resilience selection rejects an isolated winner and advances to the first stable candidate", async () => {
+  const dataset = syntheticCatalog();
+  const candidates = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .filter((item) => item.parameters.targetRiskMultiple === 4
+      && item.parameters.stopAtrMultiple === 1.5
+      && item.parameters.trendFilter === "EMA50_PRICE_ALIGNMENT")
+    .slice(0, 2);
+  const source = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates,
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay(options.parameters)
+  });
+  const ordered = source.candidates.filter((item) => item.metrics.eligible);
+  assert.equal(ordered.length, 2);
+  const isolatedLookback = Math.round(ordered[0].parameters.breakoutLookback4h * 0.95);
+  const calls = [];
+  const report = await runBreakoutV4LocalResilienceSelection(dataset, source, {
+    replayRunner: async (cutoffDataset, options) => {
+      calls.push(options.parameters.version);
+      const isolated = options.parameters.version.endsWith("lookback-minus-5pct")
+        && options.parameters.breakoutLookback4h === isolatedLookback;
+      return isolated
+        ? fakePaperReplay({ ...options.parameters, targetRiskMultiple: 5 })
+        : fakePaperReplay(options.parameters);
+    }
+  });
+  assert.equal(calls.length, 7);
+  assert.equal(report.selectionStatus, "LOCAL_RESILIENCE_WINNER_FOUND");
+  assert.equal(report.evaluatedCandidates.length, 2);
+  assert.equal(report.evaluatedCandidates[0].passed, false);
+  assert.equal(report.evaluatedCandidates[0].perturbations.length, 1);
+  assert.equal(report.evaluatedCandidates[0].unrunPerturbations.length, 5);
+  assert.equal(report.winner.sourceRank, ordered[1].rank);
+  assert.equal(report.winner.perturbations.length, 6);
+  assert.ok(report.winner.perturbations.every((item) => item.metrics.eligible));
+  assert.equal(report.isolation.holdoutOpened, false);
+  assert.equal(report.championChanged, false);
+
+  const { verifyBreakoutV4ResilienceReport } = await import("../src/research-cli.mjs");
+  const selected = verifyBreakoutV4ResilienceReport(report);
+  assert.equal(selected.parameterHash, report.winner.parameterHash);
+  assert.equal(selected.replayOptions.executionDelayBars, 1);
+  assert.throws(
+    () => verifyBreakoutV4ResilienceReport({ ...report, resilienceSelectionHash: "tampered" }),
+    /selectionHash/
+  );
+});
+
+test("local-resilience selection returns no winner instead of promoting a least-bad candidate", async () => {
+  const dataset = syntheticCatalog();
+  const candidate = breakoutV4CandidateGrid(BREAKOUT_V4_EXACT_PAPER_DEVELOPMENT_SPEC)
+    .find((item) => item.parameters.targetRiskMultiple === 4);
+  const source = await runBreakoutV4ExactPaperDevelopmentSelection(dataset, {
+    candidates: [candidate],
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay(options.parameters)
+  });
+  const report = await runBreakoutV4LocalResilienceSelection(dataset, source, {
+    replayRunner: async (cutoffDataset, options) => fakePaperReplay({ ...options.parameters, targetRiskMultiple: 5 })
+  });
+  assert.equal(report.selectionStatus, "NO_LOCAL_RESILIENCE_WINNER");
+  assert.equal(report.winner, null);
+  assert.equal(report.search.evaluatedCandidateCount, 1);
+  assert.equal(report.search.perturbationReplayCount, 1);
+  assert.equal(report.strategyRoleAfterSelection, "NO_CANDIDATE");
 });

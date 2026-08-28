@@ -12,6 +12,7 @@ import {
 // 也绝不因为查看页面而写入研究数据库。
 import { RESEARCH_REGISTRY, researchRegistrySnapshot, researchRunsByType } from "./research-registry.mjs";
 import { formatDataInfrastructureStatus, readDataInfrastructureStatusSync } from "./data-infrastructure-status.mjs";
+import { inspectBreakoutV4Shadow } from "./breakout-v4-shadow.mjs";
 
 // Champion 的身份以冻结源码为准，即使登记簿还没建立也必须显示得出来。
 const FROZEN_CHAMPION = Object.freeze({
@@ -302,8 +303,22 @@ function registryFooter(registry) {
 function shadowText(registryPath) {
   const registry = researchRegistrySnapshot({ runLimit: 1, path: registryPath });
   const challengers = registry.strategyVersions.filter((item) => item.role === "CHALLENGER");
+  const active = inspectBreakoutV4Shadow();
+  const v4 = active.strategyType === "breakout-v4" ? active.evidence : null;
   return [
     "👥 Challenger / Shadow",
+    ...(v4 ? [
+      `当前：Breakout V4 ${String(active.config.strategyHash).slice(0, 16)}… / ${v4.status}`,
+      `观察：${v4.calendarDays}/${v4.policy.minimumCalendarDays} 天；方向信号 ${v4.directionalSignals}/${v4.policy.minimumDirectionalSignals}`,
+      `执行时延：已记录 ${v4.timingObservedSignals}；超出 5 分钟 ${v4.staleTimingSignals}；缺失率 ${(Number(v4.missingTimingRate) * 100).toFixed(2)}%`,
+      `Shadow 净收益：${v4.performance?.cumulativeReturnPct ?? "—"}%；PF：${v4.performance?.profitFactor ?? "—"}`,
+      `数据库：${active.config.databasePath}`,
+      "状态只会进入人工晋级审核，不会自动替换 Champion。"
+    ] : active.available ? [
+      `当前 active Shadow：${active.strategyType ?? "unknown"}`
+    ] : [
+      `当前没有可验证的 active Shadow：${active.error ?? active.reason}`
+    ]),
     ...(challengers.length
       ? challengers.slice(0, 6).map((item) => `- ${item.version}：${item.lifecycle_status} / ${String(item.strategy_hash ?? "").slice(0, 16)}…`)
       : ["尚无研究记录：还没有登记任何 Challenger。"]),

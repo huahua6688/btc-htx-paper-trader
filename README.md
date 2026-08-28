@@ -224,6 +224,7 @@ npm run data:inspect
 
 # V4 参数选择和前视审计只使用固定 development cutoff，不读取未成熟 holdout
 npm run research:v4-select
+npm run research:v4-paper-select -- --catalog=/path/to/pre-cutoff-long-history-catalog
 npm run research:v4-lookahead
 
 # 查看 HTX CLI 身份、只检查官方 Release、受控更新，以及自建归档覆盖
@@ -268,6 +269,43 @@ npm run edge:pipeline -- --diagnosis=<challenger-diagnosis.json> --ablation=<fea
 
 # 使用源码中预先声明的完整连续区间运行整套研究验收
 npm run research:run
+```
+
+`research:v4-paper-select` 会让固定网格的 128 组参数逐一经过与 Paper 相同的手续费、滑点、Funding、合约步进、仓位槽和入场时序，并在一次连续回放内按交易时间划分四段。候选必须至少 40 笔、每段至少 8 笔、至少三段净盈利、全段 PF 不低于 1.05、最大回撤不高于 25%，且单一盈利段占全部正段利润不得超过 70%。没有候选通过时输出 `NO_ELIGIBLE_WINNER`，不会把排名第一但不合格的参数冒充 winner；该命令始终只产生 Research/Shadow Candidate，不修改 Champion。
+
+基础 winner 还必须经过局部稳定性筛选。`research:v4-resilient-select` 按原 exact-Paper 排名依次测试合格候选，对回看周期、止损 ATR 和目标 RR 分别执行真实 Paper `±5%` 回放。任一扰动未通过完整的分段、PF、回撤和利润集中度门槛，就立即淘汰该候选并检查下一名；只有本身和六个附近参数都合格的第一名才能成为 local-resilience winner。全部失败时输出 `NO_LOCAL_RESILIENCE_WINNER`，表示当前 V4 参数结构没有可靠赢家。这个阶段仍只读 development 数据，不打开 holdout，也不替换 Champion。
+
+```bash
+npm run research:v4-resilient-select -- --selection=/path/to/exact-paper-selection.json --catalog=/path/to/the-same-catalog
+```
+
+局部稳定赢家只有在完整 robustness 的数值门槛全部通过、唯一剩余原因确实为
+`DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE` 时，才允许进入实时 Shadow。激活命令会重新核对本体和六个扰动的参数哈希、
+回放指标及执行契约，为候选创建独立 SQLite；已有另一套 Shadow 时默认拒绝覆盖，只有显式
+`--replace-active=true` 才会先归档旧配置。monitor 重启时还会再次核对 active config，任何篡改都会安全停止
+Shadow 启动。Shadow 至少收集 30 天和 100 个方向信号，始终 Paper-only，永不自动晋级。
+
+```bash
+npm run research:v4-shadow-activate -- --selection=/path/to/resilience-selection.json --robustness=/path/to/robustness-report.json
+npm run research:v4-shadow-status
+```
+
+相同状态会显示在 Telegram 的“👥 Challenger / Shadow”页面，包括观察天数、唯一方向信号数、
+1～5 分钟时延记录、缺失率、成本后收益和 PF。达到门槛后也只会变成“可提交人工晋级审核”，
+不会自动修改 Champion。
+
+选出 winner 后，后续压力测试必须传入该次完整 `selection.json`，CLI 会同时校验 selection、spec 和参数哈希，并沿用选参时的资金、单槽位、成本和入场时序。直接运行不带 `--selection` 的 `robustness` 仍然测试源码中已提交的旧参数。
+
+```bash
+npm run robustness -- --selection=/path/to/selection.json --catalog=/path/to/the-same-catalog --iterations=2000
+```
+
+V4 robustness 的正式 gate 会把选参前已经声明的完整候选 PF≥1.05、回撤≤25% 和现有 Promotion Gate 的 Monte Carlo 亏损概率≤50% 继续用于局部稳定性检查，并对回看周期、止损 ATR 和目标 RR 分别执行对称的 ±5% 扰动。真实失败记录为 `FAILED`；只有外部证据尚未成熟才记录为 `PARTIAL`。成本压力同时输出两种证据：同一批交易只增加费用的 `pairedAccounting`（保证成本越高净收益不会反而增加，并用 `observedTradeBaseline` 比较同口径回撤），以及重新执行完整账户路径的 fresh replay（成本改变合约步进或单仓位占用时，交易路径可能变化）。15m 历史无法诚实生成 1～5 分钟延迟价格；延迟 2/3 根 K 线被 5 分钟信号寿命拒绝属于安全规则生效，但亚 K 线延迟证据仍需由带时间戳的 Shadow/Paper 收集，不能伪造。
+
+通用 `validate --selection` 会被拒绝：winner 已经看过完整开发区间，再把该区间切成窗口不能冒充 OOS。若用另一个已被研究读取过的后续目录复核，必须明确声明数据集不同；结果只能叫 follow-up replay，不能叫 untouched Final OOS：
+
+```bash
+npm run replay -- --selection=/path/to/selection.json --catalog=/path/to/follow-up-catalog --from=<ISO> --to=<ISO> --allow-different-dataset=true
 ```
 
 ### Tradable Edge（可交易优势）

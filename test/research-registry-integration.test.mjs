@@ -249,7 +249,7 @@ test("every research command is registered and only pure queries are exempt", ()
   const mustRecord = [
     "backtest", "replay", "validate", "similarity", "robustness", "counterfactual",
     "external:audit", "optimize", "diagnose", "ablation", "edge:pipeline",
-    "tradable-edge", "anti-chase", "full", "research:v2"
+    "tradable-edge", "anti-chase", "full", "research:v2", "research:v4-shadow-activate"
   ];
   for (const name of mustRecord) {
     assert.ok(RESEARCH_COMMANDS.includes(name), `${name} 必须在命令表中`);
@@ -257,7 +257,7 @@ test("every research command is registered and only pure queries are exempt", ()
   }
   assert.deepEqual(
     [...EXEMPT_RESEARCH_COMMANDS].sort(),
-    ["data:inspect", "multi-venue:inspect", "research:register-candidate", "research:runs"]
+    ["data:inspect", "multi-venue:inspect", "research:register-candidate", "research:runs", "research:v4-shadow-status"]
   );
 });
 
@@ -315,6 +315,44 @@ test("zero-trade delayed execution evidence records V4 robustness as PARTIAL", (
   assert.equal(record.status, "PARTIAL");
   assert.equal(record.summary.delayedExecutionEvidence.available, false);
   assert.match(record.summary.reason, /no trades/);
+});
+
+test("a completed robustness gate failure is recorded as FAILED", () => {
+  const record = robustnessRunRecord({
+    directory: "/tmp/robustness",
+    replay: { tradeCount: 215 },
+    report: {
+      status: "failed",
+      reason: "PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-minus-5pct",
+      gate: {
+        passed: false,
+        status: "failed",
+        failureReasons: ["PARAMETER_PERTURBATION_DRAWDOWN_FAILED:lookback-minus-5pct"],
+        blockedReasons: []
+      }
+    }
+  });
+  assert.equal(record.status, "FAILED");
+  assert.equal(record.summary.robustnessGate.status, "failed");
+});
+
+test("selected V4 robustness preserves winner provenance in the registry", () => {
+  const record = robustnessRunRecord({
+    directory: "/tmp/robustness",
+    dataset: { manifest: { manifestHash: "catalog-hash" } },
+    replay: { tradeCount: 215, strategyVersion: "breakout-challenger-v4.0.0" },
+    selection: { parameters: { version: "breakout-challenger-v4.0.0" } },
+    selectionSource: {
+      parameterHash: "parameter-hash",
+      selectionHash: "selection-hash",
+      datasetBinding: { matchesSelectionDataset: true }
+    },
+    report: { status: "ok", delayedExecutionEvidence: { available: true } }
+  });
+  assert.equal(record.status, "PASSED");
+  assert.equal(record.strategyVersion, "breakout-challenger-v4.0.0");
+  assert.equal(record.summary.selectionSource.parameterHash, "parameter-hash");
+  assert.equal(record.summary.selectionSource.datasetBinding.matchesSelectionDataset, true);
 });
 
 test("a failing invocation records exactly one BLOCKED or FAILED run and rethrows", async () => {
