@@ -54,6 +54,7 @@ import {
   BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC,
   runBreakoutV4DevelopmentSelection
 } from "./breakout-v4-selection.mjs";
+import { activateBreakoutV4Shadow, inspectBreakoutV4Shadow } from "./breakout-v4-shadow.mjs";
 
 export const PREDECLARED_RESEARCH_RANGE = Object.freeze({
   from: "2024-09-01T00:00:00.000Z",
@@ -423,6 +424,57 @@ async function breakoutV4ResilientSelect(args) {
     resilienceSelectionHash: report.resilienceSelectionHash
   }, null, 2)}\n`);
   return { dataset, report, directory, reportPath };
+}
+
+async function breakoutV4ShadowActivate(args) {
+  if (!args.selection || args.selection === true) {
+    throw new Error("research:v4-shadow-activate requires --selection=<local-resilience selection.json>");
+  }
+  if (!args.robustness || args.robustness === true) {
+    throw new Error("research:v4-shadow-activate requires --robustness=<robustness-report.json>");
+  }
+  const selection = await loadBreakoutV4Selection(args.selection);
+  if (selection.report.runType !== "BREAKOUT_V4_LOCAL_RESILIENCE_DEVELOPMENT_ONLY_SELECTION") {
+    throw new Error("V4 Shadow activation only accepts a local-resilience winner");
+  }
+  const robustnessReport = await readJson(String(args.robustness));
+  if (!robustnessReport) {
+    throw Object.assign(new Error(`ENOENT: robustness report not found: ${args.robustness}`), { code: "ENOENT" });
+  }
+  const activation = await activateBreakoutV4Shadow({
+    selection,
+    robustnessReport,
+    selectionPath: String(args.selection),
+    robustnessPath: String(args.robustness),
+    databasePath: args["shadow-db"] && args["shadow-db"] !== true ? String(args["shadow-db"]) : null,
+    replaceActive: enabled(args["replace-active"])
+  });
+  process.stdout.write(`${JSON.stringify({
+    activated: activation.activated,
+    idempotent: activation.idempotent,
+    replaced: activation.replaced,
+    activeConfigPath: activation.activeConfigPath,
+    archivedConfigPath: activation.archivedConfigPath,
+    shadow: {
+      status: activation.config.status,
+      strategyHash: activation.config.strategyHash,
+      databasePath: activation.config.databasePath,
+      paperOnly: activation.config.paperOnly,
+      numericalRobustnessPassed: activation.config.numericalRobustnessPassed,
+      pendingEvidence: activation.config.pendingEvidence,
+      shadowPolicy: activation.config.shadowPolicy,
+      automaticPromotion: activation.config.automaticPromotion
+    },
+    restartRequired: activation.activated,
+    championChanged: false
+  }, null, 2)}\n`);
+  return activation;
+}
+
+async function breakoutV4ShadowStatus() {
+  const status = inspectBreakoutV4Shadow();
+  process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+  return status;
 }
 
 async function breakoutV4Lookahead(args) {
@@ -1097,6 +1149,29 @@ const COMMANDS = {
       }
     })
   },
+  "research:v4-shadow-activate": {
+    handler: (args) => breakoutV4ShadowActivate(args),
+    runType: "BREAKOUT_V4_SHADOW_ACTIVATION",
+    record: (result) => ({
+      status: "PARTIAL",
+      artifactPath: result?.activeConfigPath ?? null,
+      strategyVersion: result?.config?.version ?? null,
+      summary: {
+        activated: result?.activated ?? false,
+        idempotent: result?.idempotent ?? false,
+        replaced: result?.replaced ?? false,
+        strategyHash: result?.config?.strategyHash ?? null,
+        selectionHash: result?.config?.selectionHash ?? null,
+        robustnessHash: result?.config?.robustnessHash ?? null,
+        shadowDatabasePath: result?.config?.databasePath ?? null,
+        pendingEvidence: result?.config?.pendingEvidence ?? [],
+        paperOnly: result?.config?.paperOnly ?? false,
+        automaticPromotion: false,
+        championChanged: false
+      }
+    })
+  },
+  "research:v4-shadow-status": { exempt: true, handler: () => breakoutV4ShadowStatus() },
   "data:download-center": {
     handler: (args) => downloadCenterUpdate(args),
     runType: "HTX_OFFICIAL_DOWNLOAD_CENTER_CATALOG_UPDATE",

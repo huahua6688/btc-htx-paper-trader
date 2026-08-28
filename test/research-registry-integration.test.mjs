@@ -249,7 +249,7 @@ test("every research command is registered and only pure queries are exempt", ()
   const mustRecord = [
     "backtest", "replay", "validate", "similarity", "robustness", "counterfactual",
     "external:audit", "optimize", "diagnose", "ablation", "edge:pipeline",
-    "tradable-edge", "anti-chase", "full", "research:v2"
+    "tradable-edge", "anti-chase", "full", "research:v2", "research:v4-shadow-activate"
   ];
   for (const name of mustRecord) {
     assert.ok(RESEARCH_COMMANDS.includes(name), `${name} 必须在命令表中`);
@@ -257,7 +257,7 @@ test("every research command is registered and only pure queries are exempt", ()
   }
   assert.deepEqual(
     [...EXEMPT_RESEARCH_COMMANDS].sort(),
-    ["data:inspect", "multi-venue:inspect", "research:register-candidate", "research:runs"]
+    ["data:inspect", "multi-venue:inspect", "research:register-candidate", "research:runs", "research:v4-shadow-status"]
   );
 });
 

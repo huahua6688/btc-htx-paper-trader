@@ -279,6 +279,21 @@ npm run research:run
 npm run research:v4-resilient-select -- --selection=/path/to/exact-paper-selection.json --catalog=/path/to/the-same-catalog
 ```
 
+局部稳定赢家只有在完整 robustness 的数值门槛全部通过、唯一剩余原因确实为
+`DELAYED_EXECUTION_EVIDENCE_UNAVAILABLE` 时，才允许进入实时 Shadow。激活命令会重新核对本体和六个扰动的参数哈希、
+回放指标及执行契约，为候选创建独立 SQLite；已有另一套 Shadow 时默认拒绝覆盖，只有显式
+`--replace-active=true` 才会先归档旧配置。monitor 重启时还会再次核对 active config，任何篡改都会安全停止
+Shadow 启动。Shadow 至少收集 30 天和 100 个方向信号，始终 Paper-only，永不自动晋级。
+
+```bash
+npm run research:v4-shadow-activate -- --selection=/path/to/resilience-selection.json --robustness=/path/to/robustness-report.json
+npm run research:v4-shadow-status
+```
+
+相同状态会显示在 Telegram 的“👥 Challenger / Shadow”页面，包括观察天数、唯一方向信号数、
+1～5 分钟时延记录、缺失率、成本后收益和 PF。达到门槛后也只会变成“可提交人工晋级审核”，
+不会自动修改 Champion。
+
 选出 winner 后，后续压力测试必须传入该次完整 `selection.json`，CLI 会同时校验 selection、spec 和参数哈希，并沿用选参时的资金、单槽位、成本和入场时序。直接运行不带 `--selection` 的 `robustness` 仍然测试源码中已提交的旧参数。
 
 ```bash
