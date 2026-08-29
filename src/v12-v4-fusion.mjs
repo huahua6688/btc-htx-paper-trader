@@ -11,7 +11,7 @@ import { dirname, resolve, join } from "node:path";
  * changes the frozen Champion and it produces one report/one position only.
  */
 export const V12_V4_FUSION_PARAMETERS = Object.freeze({
-  version: "v1.2-v4-fusion-v1",
+  version: "v1.2-v4-fusion-v2",
   baseStrategy: "V1.2",
   structureStrategy: "breakout-v4",
   v4Parameters: Object.freeze({
@@ -21,7 +21,7 @@ export const V12_V4_FUSION_PARAMETERS = Object.freeze({
     stopAtrMultiple: 1.5,
     targetRiskMultiple: 4
   }),
-  policy: "V1.2_ENTRY_WITH_V4_4H_DIRECTION_GUARD",
+  policy: "V1.2_OR_V4_ENTRY_WITH_UNIFIED_RISK_GATE",
   useV4BracketOnConfirmedBreakout: true,
   researchOnly: true
 });
@@ -240,44 +240,78 @@ function combinedOpportunity(base, v4, side, trendDirection, decision) {
   };
 }
 
+function usableEntry(report) {
+  return SIDES.includes(report?.decision)
+    && report?.entryAssessment?.enterNow === true
+    && report?.dataQuality?.validForEntry !== false
+    && !(report?.dataQuality?.failures?.length);
+}
+
 /**
  * Pure report combiner.  Analyzer injection keeps the fusion policy testable
  * without fabricating an entire market dataset in every unit test.
  */
 export function combineV12V4Reports(base, v4, parameters = V12_V4_FUSION_PARAMETERS, now = Date.now()) {
   const baseDecision = SIDES.includes(base?.decision) ? base.decision : "WAIT";
+  const baseCandidate = usableEntry(base) ? baseDecision : "WAIT";
+  const v4Candidate = usableEntry(v4) ? v4.decision : "WAIT";
   const trendDirection = sideFromV4Trend(v4);
   const dataFailures = [
     ...(base?.dataQuality?.failures ?? []),
     ...(v4?.dataQuality?.failures ?? [])
   ];
   const uniqueFailures = [...new Set(dataFailures)];
-  const dataReady = uniqueFailures.length === 0
-    && base?.dataQuality?.validForEntry !== false
-    && v4?.dataQuality?.validForEntry !== false;
-  const aligned = dataReady && baseDecision !== "WAIT" && trendDirection === baseDecision;
-  const breakoutConfirmed = aligned && v4?.decision === baseDecision && v4?.entryAssessment?.enterNow === true;
-  const decision = aligned ? baseDecision : "WAIT";
+  const aligned = baseCandidate !== "WAIT" && v4Candidate === baseCandidate;
+  const breakoutConfirmed = v4Candidate !== "WAIT" && v4?.entryAssessment?.enterNow === true;
+  let decision = "WAIT";
+  let decisionSource = "NONE";
+  if (breakoutConfirmed) {
+    decision = v4Candidate;
+    decisionSource = "V4_CONFIRMED_BREAKOUT";
+  } else if (baseCandidate !== "WAIT") {
+    decision = baseCandidate;
+    decisionSource = "V12_ENTRY";
+  } else if (v4Candidate !== "WAIT") {
+    decision = v4Candidate;
+    decisionSource = "V4_ENTRY";
+  }
   const selectedPlan = decision === "WAIT"
     ? emptyPlan()
-    : breakoutConfirmed && parameters.useV4BracketOnConfirmedBreakout
+    : decisionSource === "V4_CONFIRMED_BREAKOUT" && parameters.useV4BracketOnConfirmedBreakout
       ? v4.plan
-      : base.plan;
+      : decisionSource === "V4_ENTRY" ? v4.plan : base.plan;
   const signalKey = fusionSignalKey(parameters, base, v4, decision, breakoutConfirmed);
   const execution = timing(base, now);
+  const selectedFailures = decisionSource.startsWith("V4")
+    ? (v4?.dataQuality?.failures ?? [])
+    : decisionSource === "V12_ENTRY"
+      ? (base?.dataQuality?.failures ?? [])
+      : uniqueFailures;
   const longOpportunity = combinedOpportunity(base, v4, "LONG", trendDirection, decision);
   const shortOpportunity = combinedOpportunity(base, v4, "SHORT", trendDirection, decision);
   const reasons = decision === "WAIT"
     ? [
-        baseDecision === "WAIT" ? "V1.2 当前没有达到立即入场质量" : `V1.2 ${baseDecision} 与 V4 4h 方向未形成一致`,
-        `V1.2 当前方向：${baseDecision}`,
-        `V4 4h 结构方向：${trendDirection}`
+        "V1.2 和 V4 当前都没有达到立即入场条件",
+        `V1.2 当前方向：${baseCandidate}`,
+        `V4 当前方向：${v4Candidate}; 4h 结构方向：${trendDirection}`
       ]
-    : [
-        `V1.2 ${decision} 入场质量通过`,
-        `V4 4h 结构支持${decision === "LONG" ? "多头" : "空头"}`,
-        ...(breakoutConfirmed ? ["V4 同方向突破确认，采用 V4 硬止损/止盈框架"] : ["未发生同方向新突破，采用 V1.2 风险计划"])
-      ];
+    : decisionSource === "V4_CONFIRMED_BREAKOUT"
+      ? [
+          `V4 ${decision} 确认突破，允许独立触发入场`,
+          baseCandidate === decision ? `V1.2 也支持${decision === "LONG" ? "多头" : "空头"}` : `V1.2 当前方向：${baseCandidate}`,
+          "采用 V4 硬止损/止盈框架"
+        ]
+      : decisionSource === "V12_ENTRY"
+        ? [
+            `V1.2 ${decision} 入场质量通过，允许独立触发入场`,
+            v4Candidate === decision ? `V4 也支持${decision === "LONG" ? "多头" : "空头"}` : `V4 当前方向：${v4Candidate}`,
+            "采用 V1.2 风险计划"
+          ]
+        : [
+            `V4 ${decision} 入场条件通过，允许独立触发入场`,
+            `V1.2 当前方向：${baseCandidate}`,
+            "采用 V4 风险计划"
+          ];
   const report = {
     ...base,
     version: parameters.version,
@@ -297,7 +331,7 @@ export function combineV12V4Reports(base, v4, parameters = V12_V4_FUSION_PARAMET
     },
     entryAssessment: {
       enterNow: decision !== "WAIT",
-      method: decision === "WAIT" ? "WAIT_V12_V4_ALIGNMENT" : breakoutConfirmed ? "V12_V4_BREAKOUT_CONFIRMATION" : "V12_V4_4H_DIRECTION_GUARD",
+      method: decision === "WAIT" ? "WAIT_NO_VALID_COMPONENT_ENTRY" : decisionSource,
       methodLabel: reasons[0],
       reasons,
       missingConditions: decision === "WAIT" ? [...uniqueFailures, ...reasons] : [],
@@ -318,13 +352,14 @@ export function combineV12V4Reports(base, v4, parameters = V12_V4_FUSION_PARAMET
       version: parameters.version,
       bias: decision,
       state: decision === "WAIT" ? "WAIT" : "ENTER_NOW",
-      hardBlocks: uniqueFailures,
+      hardBlocks: selectedFailures,
       softWarnings: reasons,
-      entryMethod: decision === "WAIT" ? "WAIT_V12_V4_ALIGNMENT" : breakoutConfirmed ? "V12_V4_BREAKOUT_CONFIRMATION" : "V12_V4_4H_DIRECTION_GUARD",
+      entryMethod: decision === "WAIT" ? "WAIT_NO_VALID_COMPONENT_ENTRY" : decisionSource,
       positionManagementProfile: selectedPlan?.managementContract?.profile ?? null,
       managementContract: selectedPlan?.managementContract ?? null,
       fusionPolicy: parameters.policy,
-      v12Decision: baseDecision,
+      v12Decision: baseCandidate,
+      v4Decision: v4Candidate,
       v4TrendDirection: trendDirection,
       v4BreakoutConfirmed: breakoutConfirmed,
       frozenChampionModified: false
@@ -334,19 +369,24 @@ export function combineV12V4Reports(base, v4, parameters = V12_V4_FUSION_PARAMET
       longOpportunity: longOpportunity.score,
       shortOpportunity: shortOpportunity.score,
       scoreGap: round(Math.abs(longOpportunity.score - shortOpportunity.score), 2),
-      fusion: { v12: base?.scores ?? null, v4: v4?.scores ?? null, trendDirection, aligned, breakoutConfirmed }
+      fusion: { v12: base?.scores ?? null, v4: v4?.scores ?? null, trendDirection, aligned, breakoutConfirmed, decisionSource }
     },
     dataQuality: {
-      validForEntry: uniqueFailures.length === 0 && Boolean(base?.dataQuality?.validForEntry) && Boolean(v4?.dataQuality?.validForEntry),
-      failures: uniqueFailures
+      validForEntry: decision !== "WAIT"
+        ? (decisionSource.startsWith("V4") ? v4?.dataQuality?.validForEntry !== false : base?.dataQuality?.validForEntry !== false)
+        : uniqueFailures.length === 0,
+      failures: selectedFailures
     },
     fusion: {
       policy: parameters.policy,
-      directionSource: "V1.2_DECISION_GUARDED_BY_V4_4H_TREND",
+      directionSource: "V12_OR_V4_ENTRY_WITH_UNIFIED_RISK_GATE",
       baseDecision,
+      baseCandidate,
+      v4Candidate,
       trendDirection,
       aligned,
       breakoutConfirmed,
+      decisionSource,
       components: { v12: base, v4 }
     },
     safety: {

@@ -48,34 +48,42 @@ function reports({ baseDecision = "LONG", trend = "LONG", breakout = false } = {
   return { base, v4 };
 }
 
-test("fusion emits one LONG decision only when V1.2 and V4 agree", () => {
+test("fusion emits one LONG decision when both components agree", () => {
   const { base, v4 } = reports({ breakout: true });
   const report = combineV12V4Reports(base, v4, V12_V4_FUSION_PARAMETERS, Date.UTC(2026, 0, 1));
   assert.equal(report.decision, "LONG");
   assert.equal(report.entryAssessment.enterNow, true);
   assert.equal(report.plan.stopLoss, 97, "confirmed breakout uses the one selected V4 bracket");
   assert.equal(report.strategy.positionManagementProfile, "HARD_BRACKET_HOLD_V1");
-  assert.match(report.entryAssessment.method, /BREAKOUT_CONFIRMATION/);
+  assert.match(report.entryAssessment.method, /V4_CONFIRMED_BREAKOUT/);
   assert.equal(report.fusion.components.v12, base);
   assert.equal(report.fusion.components.v4, v4);
 });
 
-test("fusion waits on disagreement and never creates an opposite trade", () => {
+test("fusion keeps a valid V1.2 entry when V4 has no entry", () => {
   const { base, v4 } = reports({ trend: "SHORT" });
   const report = combineV12V4Reports(base, v4, V12_V4_FUSION_PARAMETERS, Date.UTC(2026, 0, 1));
-  assert.equal(report.decision, "WAIT");
-  assert.equal(report.candidateDecision, "WAIT");
-  assert.equal(report.entryAssessment.enterNow, false);
-  assert.equal(report.plan.entryPrice, null);
-  assert.equal(report.entryAssessment.signalKey, null);
+  assert.equal(report.decision, "LONG");
+  assert.equal(report.candidateDecision, "LONG");
+  assert.equal(report.entryAssessment.enterNow, true);
+  assert.equal(report.plan.stopLoss, 98);
+  assert.match(report.entryAssessment.method, /V12_ENTRY/);
 });
 
-test("fusion keeps V1.2's single plan when V4 only supplies the 4h guard", () => {
-  const { base, v4 } = reports({ breakout: false });
+test("fusion allows V4 to trigger when V1.2 is waiting", () => {
+  const { base, v4 } = reports({ baseDecision: "WAIT", breakout: true });
   const report = combineV12V4Reports(base, v4, V12_V4_FUSION_PARAMETERS, Date.UTC(2026, 0, 1));
   assert.equal(report.decision, "LONG");
-  assert.equal(report.plan.stopLoss, 98);
-  assert.match(report.entryAssessment.method, /DIRECTION_GUARD/);
+  assert.equal(report.plan.stopLoss, 97);
+  assert.match(report.entryAssessment.method, /V4_CONFIRMED_BREAKOUT/);
+});
+
+test("fusion uses the confirmed V4 breakout when valid entries disagree", () => {
+  const { base, v4 } = reports({ trend: "SHORT", breakout: true });
+  const report = combineV12V4Reports(base, v4, V12_V4_FUSION_PARAMETERS, Date.UTC(2026, 0, 1));
+  assert.equal(report.decision, "SHORT");
+  assert.equal(report.plan.stopLoss, 97);
+  assert.match(report.entryAssessment.method, /V4_CONFIRMED_BREAKOUT/);
 });
 
 test("fusion is a first-class replay strategy without replacing existing strategies", async () => {
