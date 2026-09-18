@@ -20,6 +20,7 @@ import {
 } from "./replay-engine.mjs";
 import { DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
 import { analyzeFundingCarry } from "./funding-carry.mjs";
+import { auditSignalEdge } from "./signal-audit.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
 import { BAR_MS, hashObject, readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
@@ -373,6 +374,56 @@ async function fundingCarry(args) {
   const reportPath = await save(join(directory, "funding-carry.json"), report);
   // path 是逐次结算的累计曲线，几千条，不往终端刷；要看曲线去读文件。
   process.stdout.write(`${JSON.stringify({ reportPath, ...report, path: undefined }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
+}
+
+const SIGNAL_AUDIT_VERDICT_TEXT = Object.freeze({
+  TRADABLE_CANDIDATE: "有特征通过族系检验，且扣成本后仍为正 —— 这是唯一值得据此写策略的情形",
+  STATISTICAL_ONLY_NOT_TRADABLE: "有特征统计上显著，但扣掉手续费滑点资金费后为负 —— 关系是真的，钱赚不到",
+  NO_DETECTABLE_EDGE: "这些特征、这个时间尺度、这个成本水平下，测不到可交易的方向性信息",
+  UNDERPOWERED_NULL_SAMPLING: "采样次数不足以分辨族系 p 值，本次审计没有判定能力 —— 加大 --null-samples 重跑"
+});
+
+async function signalAudit(args) {
+  const dataset = await load(args);
+  const report = auditSignalEdge(dataset, {
+    nullSamples: Number(args["null-samples"] ?? 3000),
+    seed: Number(args.seed ?? 20260918),
+    buckets: Number(args.buckets ?? 10),
+    alpha: Number(args.alpha ?? 0.05)
+  });
+  report.dataManifestHash = dataset.manifest.manifestHash;
+  const directory = resolveOutputPath(runId("signal-audit"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "signal-audit.json"), report);
+
+  // 终端只打结论和最强的几个检验：44 次检验各带 10 个分位，全刷出来没人会读。
+  // 完整结果在 reportPath 里。
+  const strongest = [...report.tests]
+    .sort((a, b) => a.familywisePValue - b.familywisePValue || Math.abs(b.ic) - Math.abs(a.ic))
+    .slice(0, 8)
+    .map((item) => ({
+      特征: item.feature,
+      周期: item.horizon,
+      IC: item.ic,
+      族系p值: item.familywisePValue,
+      多头净优势百分比: item.economics.longNetEdgePct,
+      空头净优势百分比: item.economics.shortNetEdgePct,
+      负对照: item.directional ? undefined : true
+    }));
+  process.stdout.write(`${JSON.stringify({
+    reportPath,
+    结论: report.verdict,
+    结论说明: SIGNAL_AUDIT_VERDICT_TEXT[report.verdict],
+    覆盖: report.coverage,
+    方法: report.method,
+    族系: report.familywise,
+    负对照: report.negativeControls,
+    通过且可交易: report.survivors.length,
+    仅统计显著: report.statisticalOnly.length,
+    最强的几个检验: strongest,
+    诚实边界: report.limitations
+  }, null, 2)}\n`);
   return { dataset, report, directory, reportPath };
 }
 
@@ -1163,6 +1214,33 @@ const COMMANDS = {
         negativeSettlementPct: result?.report?.risk?.negativeSettlementPct ?? null,
         worstCumulativeDrawdownPct: result?.report?.risk?.worstCumulativeDrawdownPct ?? null,
         upperBoundOnly: true
+      }
+    })
+  },
+  "research:signal-audit": {
+    handler: (args) => signalAudit(args),
+    runType: "SIGNAL_INFORMATION_AUDIT",
+    record: (result) => ({
+      // 只有「显著且扣成本后为正」才算 PASSED。统计显著但赚不到钱记 PARTIAL，
+      // 采样不足记 BLOCKED —— 那不是一个结论，是一次没做成的检验。
+      status: result?.report?.verdict === "TRADABLE_CANDIDATE"
+        ? "PASSED"
+        : result?.report?.verdict === "UNDERPOWERED_NULL_SAMPLING"
+          ? "BLOCKED"
+          : "PARTIAL",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      summary: {
+        verdict: result?.report?.verdict ?? null,
+        totalTests: result?.report?.method?.totalTests ?? 0,
+        bestFeature: result?.report?.familywise?.bestFeature ?? null,
+        bestHorizon: result?.report?.familywise?.bestHorizon ?? null,
+        bestIc: result?.report?.familywise?.bestIc ?? null,
+        familywisePValue: result?.report?.familywise?.familywisePValue ?? null,
+        tradableSurvivors: result?.report?.survivors?.length ?? 0,
+        negativeControlsFlagged: result?.report?.negativeControls?.flaggedSignificant ?? 0,
+        // 这不是策略回测，任何人都不能拿它当「可以上线」的证据。
+        notAStrategyBacktest: true
       }
     })
   },

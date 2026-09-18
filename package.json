@@ -51,7 +51,8 @@
     "research:runs": "node src/research-cli.mjs research:runs",
     "research:register-candidate": "node src/research-cli.mjs research:register-candidate",
     "replay": "node src/research-cli.mjs replay",
-    "research:funding-carry": "node src/research-cli.mjs research:funding-carry"
+    "research:funding-carry": "node src/research-cli.mjs research:funding-carry",
+    "research:signal-audit": "node src/research-cli.mjs research:signal-audit"
   },
   "engines": {
     "node": ">=24"
