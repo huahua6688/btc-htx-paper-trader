@@ -45,7 +45,8 @@
     "research:v4-lookahead": "node src/research-cli.mjs research:v4-lookahead",
     "research:runs": "node src/research-cli.mjs research:runs",
     "research:register-candidate": "node src/research-cli.mjs research:register-candidate",
-    "replay": "node src/research-cli.mjs replay"
+    "replay": "node src/research-cli.mjs replay",
+    "research:funding-carry": "node src/research-cli.mjs research:funding-carry"
   },
   "engines": {
     "node": ">=24"

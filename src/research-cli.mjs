@@ -19,6 +19,7 @@ import {
   runHistoricalReplay
 } from "./replay-engine.mjs";
 import { DATA_TIERED_PARAMETERS } from "./data-tiered-strategy.mjs";
+import { analyzeFundingCarry } from "./funding-carry.mjs";
 import { buildHistoricalFeatureMatrix, queryHistoricalSimilarity } from "./similarity-engine.mjs";
 import { readJson, resolveOutputPath, writeJsonAtomic } from "./research-utils.mjs";
 import { PAPER_CONFIG } from "./config.mjs";
@@ -242,6 +243,22 @@ export function breakoutV4SpecOption(args) {
     && !["0", "false", "no"].includes(String(args["long-history"]).toLowerCase())
     ? BREAKOUT_V4_LONG_HISTORY_DEVELOPMENT_SPEC
     : BREAKOUT_V4_DEVELOPMENT_SPEC;
+}
+
+async function fundingCarry(args) {
+  const dataset = await load(args);
+  const report = analyzeFundingCarry(dataset.funding, {
+    perpFeeRatePerSide: Number(args["perp-fee"] ?? PAPER_CONFIG.feeRatePerSide),
+    spotFeeRatePerSide: Number(args["spot-fee"] ?? PAPER_CONFIG.feeRatePerSide),
+    slippageRatePerSide: Number(args.slippage ?? PAPER_CONFIG.slippageRate)
+  });
+  report.dataManifestHash = dataset.manifest.manifestHash;
+  const directory = resolveOutputPath(runId("funding-carry"));
+  await mkdir(directory, { recursive: true });
+  const reportPath = await save(join(directory, "funding-carry.json"), report);
+  // path 是逐次结算的累计曲线，几千条，不往终端刷；要看曲线去读文件。
+  process.stdout.write(`${JSON.stringify({ reportPath, ...report, path: undefined }, null, 2)}\n`);
+  return { dataset, report, directory, reportPath };
 }
 
 async function breakoutV4Select(args) {
@@ -845,6 +862,21 @@ const COMMANDS = {
         checksRun: result?.report?.checksRun ?? 0,
         developmentCutoff: result?.report?.developmentCutoff ?? null,
         holdoutOpened: false
+      }
+    })
+  },
+  "research:funding-carry": {
+    handler: (args) => fundingCarry(args),
+    runType: "FUNDING_CARRY_UPPER_BOUND",
+    record: (result) => ({
+      status: result?.report?.netPct?.positive ? "PASSED" : "PARTIAL",
+      artifactPath: result?.reportPath ?? null,
+      dataManifestHash: result?.dataset?.manifest?.manifestHash ?? null,
+      summary: {
+        netAnnualizedPct: result?.report?.netPct?.annualized ?? null,
+        negativeSettlementPct: result?.report?.risk?.negativeSettlementPct ?? null,
+        worstCumulativeDrawdownPct: result?.report?.risk?.worstCumulativeDrawdownPct ?? null,
+        upperBoundOnly: true
       }
     })
   },
